@@ -30,7 +30,11 @@ struct DeviceKernelArguments {
     HIPRT_GLOBAL_STACK,
   };
 
-  static const int MAX_ARGS = 19;
+  /* The DLSS-RR guiding preprocess takes the most: one per guide surface, plus
+   * the pass offset of each guide in the render buffer. Note the assert below is
+   * compiled out in release builds, so overflowing this silently smashes the
+   * stack. */
+  static const int MAX_ARGS = 32;
   Type types[MAX_ARGS];
   void *values[MAX_ARGS];
   size_t sizes[MAX_ARGS];

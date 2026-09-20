@@ -148,7 +148,8 @@ ccl_device_forceinline void integrator_split_shadow_catcher(
   const int flags = kernel_data_fetch(shaders, shader).flags;
   const bool use_caustics = kernel_data.integrator.use_caustics &&
                             (object_flags & SD_OBJECT_CAUSTICS_RECEIVER);
-  const bool use_raytrace_kernel = (flags & SD_HAS_RAYTRACE);
+  const bool use_raytrace_kernel = (flags & SD_HAS_RAYTRACE) ||
+                                     kernel_data.integrator.falcon_lt_visibility;
 
   if (use_caustics) {
     integrator_path_init(state, DEVICE_KERNEL_INTEGRATOR_INTERSECT_MNEE);
@@ -177,7 +178,8 @@ ccl_device_forceinline void integrator_intersect_next_kernel_after_shadow_catche
   const uint object_flags = intersection_get_object_flags(kg, &isect);
   const bool use_caustics = kernel_data.integrator.use_caustics &&
                             (object_flags & SD_OBJECT_CAUSTICS_RECEIVER);
-  const bool use_raytrace_kernel = (flags & SD_HAS_RAYTRACE);
+  const bool use_raytrace_kernel = (flags & SD_HAS_RAYTRACE) ||
+                                     kernel_data.integrator.falcon_lt_visibility;
 
   if (use_caustics) {
     integrator_path_next(state, current_kernel, DEVICE_KERNEL_INTEGRATOR_INTERSECT_MNEE);
@@ -261,7 +263,8 @@ ccl_device_forceinline void integrator_intersect_next_kernel(
         const uint object_flags = intersection_get_object_flags(kg, isect);
         const bool use_caustics = kernel_data.integrator.use_caustics &&
                                   (object_flags & SD_OBJECT_CAUSTICS_RECEIVER);
-        const bool use_raytrace_kernel = (flags & SD_HAS_RAYTRACE);
+        const bool use_raytrace_kernel = (flags & SD_HAS_RAYTRACE) ||
+                                     kernel_data.integrator.falcon_lt_visibility;
         if (use_caustics) {
           integrator_path_next(state, current_kernel, DEVICE_KERNEL_INTEGRATOR_INTERSECT_MNEE);
         }
@@ -319,7 +322,8 @@ ccl_device_forceinline void integrator_intersect_next_kernel_after_volume(
     const uint object_flags = intersection_get_object_flags(kg, isect);
     const bool use_caustics = kernel_data.integrator.use_caustics &&
                               (object_flags & SD_OBJECT_CAUSTICS_RECEIVER);
-    const bool use_raytrace_kernel = (flags & SD_HAS_RAYTRACE);
+    const bool use_raytrace_kernel = (flags & SD_HAS_RAYTRACE) ||
+                                     kernel_data.integrator.falcon_lt_visibility;
 
     if (use_caustics) {
       integrator_path_next(state, current_kernel, DEVICE_KERNEL_INTEGRATOR_INTERSECT_MNEE);

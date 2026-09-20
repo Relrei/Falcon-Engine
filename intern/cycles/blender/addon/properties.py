@@ -276,6 +276,18 @@ def enum_openimagedenoise_denoiser(self, context):
     return []
 
 
+def enum_dlss_denoiser(self, context):
+    import _cycles
+    from . import falcon_plugins
+    # Falcon: DLSS is off until its add-on is enabled (falcon_plugins.DLSS_ADDON). The add-on is only
+    # listed once the NVIDIA runtime, which is not shipped, is in a Falcon plugin folder.
+    if (_cycles.with_dlss and falcon_plugins.dlss_allowed() and
+            (not context or bool(context.preferences.addons[__package__].preferences.get_devices_for_type('CUDA')))):
+        return [('DLSS', "DLSS",
+                 n_("Use NVIDIA DLSS Ray Reconstruction"), 8)]
+    return []
+
+
 def enum_optix_denoiser(self, context):
     if not context or bool(context.preferences.addons[__package__].preferences.get_devices_for_type('OPTIX')):
         return [('OPTIX', "OptiX", n_(
@@ -286,11 +298,14 @@ def enum_optix_denoiser(self, context):
 def enum_preview_denoiser(self, context):
     optix_items = enum_optix_denoiser(self, context)
     oidn_items = enum_openimagedenoise_denoiser(self, context)
+    dlss_items = enum_dlss_denoiser(self, context)
 
-    if len(optix_items) or len(oidn_items):
+    if len(optix_items) or len(oidn_items) or len(dlss_items):
         items = [
             ('AUTO',
              "Automatic",
+             n_("Use GPU accelerated denoising if supported, for the best performance. "
+                "Prefer DLSS Ray Reconstruction, then OpenImageDenoise, then OptiX") if dlss_items else
              n_("Use GPU accelerated denoising if supported, for the best performance. "
                 "Prefer OpenImageDenoise over OptiX"),
              0)]
@@ -299,6 +314,7 @@ def enum_preview_denoiser(self, context):
 
     items += optix_items
     items += oidn_items
+    items += dlss_items
     return items
 
 
@@ -306,6 +322,7 @@ def enum_denoiser(self, context):
     items = []
     items += enum_optix_denoiser(self, context)
     items += enum_openimagedenoise_denoiser(self, context)
+    items += enum_dlss_denoiser(self, context)  # 実験: 最終レンダーでもDLSS-RRを選べるように
     return items
 
 
@@ -344,6 +361,28 @@ enum_denoising_quality = (
      "High performance",
      3),
 )
+enum_denoising_upscale_quality = (
+    ('NONE',
+     "None",
+     "Highest quality without upscaling",
+     0),
+    ('QUALITY',
+     "Quality",
+     "Offers higher image quality than balanced mode",
+     1),
+    ('BALANCED',
+     "Balanced",
+     "Offers both optimized performance and image quality",
+     2),
+    ('PERF',
+     "Performance",
+     "Offers a higher performance boost than balanced mode",
+     3),
+    ('ULTRA_PERF',
+     "Ultra Performance",
+     "Offers the highest performance boost",
+     4),
+)
 
 enum_direct_light_sampling_type = (
     ('MULTIPLE_IMPORTANCE_SAMPLING',
@@ -381,6 +420,52 @@ def update_pause(self, context):
     context.area.tag_redraw()
 
 
+# 簡単表示のチェックボックス「コースティクス」の中身。
+# ON  = cycles.falcon_auto_caustics と同じ処理(ガラス+ライトを検出して焼く)
+# OFF = cycles.falcon_photon_clear と同じ処理(合成を外す。キャッシュは残す)
+#
+# ★プロパティの update から直接オペレータを呼ばない。falcon_photon_bake は
+#   ベイク中に RENDERED ビューポートを SOLID へ落とす(2026-07-12 の CUDA
+#   illegal-address 対策)ので、UI の更新中に走らせると同じ空間を二重に触る。
+#   タイマーで一度だけ後回しにして、通常のオペレータ実行と同じ土俵に置く。
+_falcon_caustics_syncing = [False]
+
+
+def _falcon_caustics_on_update(self, context):
+    if _falcon_caustics_syncing[0]:
+        return
+    want = bool(self.falcon_caustics_on)
+
+    def _run():
+        from . import operators as _fops
+        try:
+            if want:
+                bpy.ops.cycles.falcon_auto_caustics()
+            else:
+                bpy.ops.cycles.falcon_photon_clear()
+        except RuntimeError:
+            pass
+        # 焼けなかった時にチェックだけ ON で残さない(実体は環境変数側)。
+        active = _fops._falcon_caustics_active()
+        if active != want:
+            _falcon_caustics_syncing[0] = True
+            try:
+                for scene in bpy.data.scenes:
+                    scene.cycles.falcon_caustics_on = active
+            finally:
+                _falcon_caustics_syncing[0] = False
+        return None
+
+    if bpy.app.background:
+        # 画面が無いので後回しにする理由が無く、タイマーも回らない
+        _run()
+        return
+    try:
+        bpy.app.timers.register(_run, first_interval=0.0)
+    except Exception:
+        _run()
+
+
 class CyclesRenderSettings(bpy.types.PropertyGroup):
     __slots__ = ()
 
@@ -388,7 +473,11 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
         name="Device",
         description="Device to use for rendering",
         items=enum_devices,
-        default='CPU',
+        # CyclesF: default GPU (stock: CPU). The device is scene data, so a file
+        # saved without touching it keeps rendering on the CPU forever -- 5 of 24
+        # of the local .blend files were in that state. Falls back to the CPU on
+        # its own when no compatible GPU is configured.
+        default='GPU',
         update=update_render_passes,
     )
     shading_system: BoolProperty(
@@ -438,7 +527,11 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
     denoising_use_gpu: BoolProperty(
         name="Denoise on GPU",
         description="Perform denoising on GPU devices configured in the system tab in the user preferences. This is significantly faster than on CPU, but requires additional GPU memory. When large scenes need more GPU memory, this option can be disabled",
-        default=False,
+        # CyclesF: default True (stock: False). Measured 2026-07-02: OIDN CPU
+        # dominates total render time at low spp (5.3x slower overall at
+        # 720p/16spp), so the fast path is the default and OOM-constrained
+        # scenes opt out instead of everyone paying the CPU price.
+        default=True,
     )
 
     use_preview_denoising: BoolProperty(
@@ -479,6 +572,128 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
     preview_denoising_use_gpu: BoolProperty(
         name="Denoise Preview on GPU",
         description="Perform denoising on GPU devices configured in the system tab in the user preferences. This is significantly faster than on CPU, but requires additional GPU memory. When large scenes need more GPU memory, this option can be disabled",
+        default=True,
+    )
+    preview_denoising_upscale_quality: EnumProperty(
+        name="Viewport Denoising Upscale Quality",
+        description="Overall quality when using DLSS",
+        items=enum_denoising_upscale_quality,
+        default='QUALITY',
+    )
+    denoising_upscale_quality: EnumProperty(
+        name="Denoising Upscale Quality",
+        description="Overall quality when using DLSS for final renders. Modes other "
+        "than None render internally at a reduced resolution and upscale to the "
+        "output size (faster, experimental)",
+        items=enum_denoising_upscale_quality,
+        default='NONE',
+    )
+    denoising_carry_history: BoolProperty(
+        name="Carry History",
+        description="Carry the DLSS temporal history from frame to frame in animation renders "
+        "(the way games do). Reduces flicker and stays stable at fewer samples. "
+        "Off resets the history every frame, as before",
+        default=True,
+    )
+    preview_denoising_carry_history: BoolProperty(
+        name="Carry Navigation History",
+        description="Keep the DLSS temporal history across viewport navigation, aligned with "
+        "motion vectors, and accumulate samples while the view is still. "
+        "Removes the wobble of re-converging after every reset and lets a still image converge "
+        "up to the maximum samples. "
+        "When off, every update redraws a one-sample image, so edges stay sharp but grain remains. "
+        "The low-resolution preview during navigation is disabled, so navigating is heavier. "
+        "Volumes have no motion vectors and smear while moving "
+        "(turning it off is recommended for scenes with volumes)",
+        default=True,
+    )
+    denoising_preroll_passes: IntProperty(
+        name="First Frame Pre-Roll Passes",
+        description="For the first frame of an animation only, re-render the same frame this "
+        "many times to build up independent estimates in the DLSS temporal history before the "
+        "real frame is output. "
+        "Not used by default: it was replaced by a warm-up that renders and discards the two "
+        "frames before the first one with the real motion "
+        "(re-rendering the same frame builds a history without motion and made the first frame "
+        "noisier; the warm-up gives a better first frame and is 30 seconds faster over 8 frames). "
+        "To use this count, turn the warm-up off with the environment variable "
+        "FALCON_DLSS_ANIM_WARMUP=0. "
+        "0 disables it. A still (a single F12 frame) has no following frames, so its count is set "
+        "separately with FALCON_DLSS_STILL_PREROLL "
+        "(the number of passes run is shown in the render progress and in the image metadata "
+        "cycles.dlss.preroll_passes)",
+        min=0, max=16, default=2,
+    )
+    denoising_preroll_passes_cut: IntProperty(
+        name="Pre-Roll Passes at Cuts",
+        description="Re-render the frame where a cut happens this many times. "
+        "The history is discarded at a cut too, so the same problem as the first frame occurs, "
+        "but cuts are far more frequent, so the count can be set separately. "
+        "0 uses the same count as the first frame",
+        min=0, max=16, default=0,
+    )
+    denoising_cut_warmup: BoolProperty(
+        name="Pre-Render at Camera Switches",
+        description="Detect the frames where timeline markers switch the camera and rebuild the "
+        "DLSS temporal history there. "
+        "Motion vectors do not connect the frames across a cut, so the history cannot be "
+        "carried over, but final renders did not detect the switch and the previous shot bled "
+        "into the new one for about 5 frames "
+        "(measured: brightness of the cut frame 0.246, expected 0.169). "
+        "Off restores the behavior before 2026-09-04. "
+        "No extra render time (only the denoiser state is swapped)",
+        default=True,
+    )
+    denoising_warmup_frames: IntProperty(
+        name="Warm-Up Frames",
+        description="Render and discard this many real frames before the start frame of the "
+        "animation and before each cut. "
+        "The DLSS history only builds up from real frames seen from other viewpoints, so this "
+        "fills in the extra noise of the cold first frame and of the frames right after a cut "
+        "(2 frames mostly fill it, 4 is the ceiling; re-rendering the same image or adding "
+        "samples does not warm it up). "
+        "Used by \"Render with Warm-Up\"",
+        min=0, max=16, default=4,
+    )
+    # ★フレーム補間(2026-09-13)。UI に出る言葉は**仮**(作者が決める)。
+    #   中身の根拠 = (internal notes)。
+    #   焼かないコマを決めるのは C++ (pipeline.cc の falcon_frame_interp_plan)、
+    #   間を埋めるのは falcon_interp.py。環境変数 FALCON_FRAME_INTERP が在れば
+    #   そちらが勝つ(0 も 2 も)。
+    falcon_frame_interp: EnumProperty(
+        name="AI Frame Interpolation",
+        description="Render every other frame and create the frames in between with AI "
+        "interpolation (RIFE). Takes about half the time. "
+        "The frames around cuts and the last frame are always rendered. "
+        "Interpolated frames look slightly soft in fast motion. Image sequence output only",
+        items=(
+            ('OFF', "None", "Render every frame"),
+            ('X2', "2x (Render Every Other Frame, RIFE In Between)",
+             "Render every other frame and create the frames in between with RIFE"),
+        ),
+        default='OFF',
+    )
+    preview_denoising_carry_motion_limit: IntProperty(
+        name="History Motion Limit",
+        description="Discard the history on frames where the camera moved more than this many "
+        "pixels. "
+        "DLSS assumes the small per-frame motion of a game running at 60 frames per second; "
+        "a path-traced viewport is slow per frame, so moving the mouse makes the motion too "
+        "large, the history no longer lines up and ghosting appears. "
+        "Smaller values reduce ghosting but also the smoothness while navigating "
+        "(0 always resets on navigation, the same as turning Carry Navigation History off)",
+        min=0, max=1024, default=48,
+        subtype='PIXEL',
+    )
+    preview_denoising_bypass_dof: BoolProperty(
+        name="No Depth of Field in Preview",
+        description="Close the camera aperture during the DLSS viewport preview only. "
+        "Lens depth of field is a stochastic blur where the ray direction changes every "
+        "sample, which DLSS does not expect, so it turns into blotches "
+        "(the reason only the camera view looks noisy). "
+        "The walk view has no depth of field to begin with, so with this the camera view looks "
+        "the same. "
+        "Check depth of field with OIDN or a final render",
         default=True,
     )
 
@@ -1138,6 +1353,349 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
         min=0,
         default=0)
 
+    # Falcon SHARC (experimental spatial hash radiance cache) UI controls.
+    # Bridged to the FALCON_SHARC_* env vars by CyclesRender in __init__.py.
+    falcon_sharc_mode: EnumProperty(
+        name="SHARC Mode",
+        description="Falcon spatial hash radiance cache mode. Warmup renders at high "
+                    "samples and bakes a radiance cache to disk; Blend renders at low "
+                    "samples and blends that cache in-kernel to cut noise",
+        items=(
+            ('OFF', "Off", "Normal Cycles, no radiance cache (identical to stock)"),
+            ('WARMUP', "Warmup (bake cache)", "Deposit converged radiance into the cache and save it"),
+            ('BLEND', "Blend (use cache)", "Load the cache and blend it in-kernel at the camera hit"),
+            ('LIVE', "Live (viewport accumulate)",
+             "Accumulate the radiance cache across frames while blending it in-kernel. "
+             "Best in the viewport with denoising on: GI keeps converging the longer the "
+             "camera holds still. Most effective on GI-heavy interiors"),
+        ),
+        default='OFF',
+    )
+    falcon_sharc_alpha: FloatProperty(
+        name="SHARC Blend",
+        description="How strongly the cached radiance is blended in (0 = pure path trace, "
+                    "1 = pure cache). The optimum is scene-dependent",
+        min=0.0, max=1.0, default=0.7,
+    )
+    falcon_sharc_keep: FloatProperty(
+        name="SHARC Keep",
+        description="Live mode only: how much of the accumulated cache survives each frame "
+                    "(0 = forget instantly, 1 = never forget). Higher keeps more history so a "
+                    "still camera converges further, but adapts slower when the view changes",
+        min=0.0, max=1.0, default=0.95,
+    )
+    falcon_sharc_cache: StringProperty(
+        name="SHARC Cache File",
+        description="Cache file written by Warmup and read by Blend. Leave empty for the "
+                    "default (/tmp/falcon_sharc_cache.bin)",
+        subtype='FILE_PATH', default="",
+    )
+    falcon_photon_photons: IntProperty(
+        name="Photons",
+        description="Photon count for the caustics bake. More photons = smoother "
+                    "caustics and less chroma sparkle with dispersion. The bake "
+                    "runs on the GPU (~20s for a billion); the old 20M default "
+                    "came from the CPU tracer and leaves a wide receiver full of "
+                    "holes -- measured on the ocean scene at 1280x720, 20M gives "
+                    "2973 one-pixel dark specks and 3x the error of 2B",
+        min=10000, max=2000000000, default=1000000000,
+    )
+    falcon_photon_cell: FloatProperty(
+        name="Cell Size",
+        description="Photon cache cell size in meters. Smaller = sharper caustic "
+                    "detail but needs more photons to stay smooth (0.025-0.05 for "
+                    "tabletop/pool scale, 0.1+ for rooms)",
+        min=0.001, max=1.0, default=0.05,
+    )
+    falcon_photon_dispersion: FloatProperty(
+        name="Dispersion",
+        description="Chromatic dispersion: per-wavelength IOR spread for refracted "
+                    "photons (0 = off, 0.02 = subtle rainbow fringes, glass-like)",
+        min=0.0, max=0.1, default=0.0,
+    )
+    falcon_photon_radius: FloatProperty(
+        name="Caustic Smoothness",
+        description="Grid-cache density-estimation radius in cells. Larger spreads "
+                    "each photon over a wider disk, which used to be how you bought "
+                    "smoothness from fewer photons. With enough photons it no longer "
+                    "buys anything and costs a lot: each step widens the disk by "
+                    "r^2 cells, so the hash table fills up and starts colliding. "
+                    "Measured at 2e9 photons -- glasszoo error 0.1690 at 1 vs 0.1695 "
+                    "at 3, pabellon 0.1174 vs 0.1178, while table occupancy goes "
+                    "37% -> 70% and 33% -> 82%. Raise it only when baking few photons",
+        min=1.0, max=8.0, default=1.0,
+    )
+    falcon_photon_gpu: BoolProperty(
+        name="GPU",
+        description="Trace the photon pass on the GPU (renders a one-sample photon "
+                    "frame) instead of the CPU Python tracer: ~100x+ faster, matches "
+                    "the CPU cache. Dispersion works on the GPU too (the Dispersion "
+                    "value drives per-wavelength photon refraction). The light must "
+                    "be visible to the camera-side emission",
+        default=False,
+    )
+    falcon_photon_point: BoolProperty(
+        name="Point Map",
+        description="Keep every photon as a point and search the neighbours at "
+                    "render time, instead of adding it into the fixed-size grid. "
+                    "Its one advantage is that radius and gain can be changed "
+                    "without rebaking. It pays for that everywhere else: memory "
+                    "and render time both grow with the photon count, so the "
+                    "GPU's ability to fire billions cannot be spent. Measured "
+                    "against the same 1024spp references, the grid wins on all "
+                    "three test scenes -- error 0.1755 vs 0.1690 (glasszoo), "
+                    "0.1187 vs 0.1174 (pabellon), 0.8028 vs 0.1642 (ocean) -- "
+                    "and at 2e9 photons renders in 3.8s where the point map "
+                    "needs 122s. Left in for A/B and for the no-rebake knobs",
+        default=False,
+    )
+    falcon_photon_point_maxpts: IntProperty(
+        name="Point Cap",
+        description="Max photon points kept by the bake (432 bytes/point). Higher "
+                    "= smoother/sharper caustics at the same photon count, more "
+                    "VRAM and slower gather at render time. Quality-first (FQ) "
+                    "default is generous since bake time isn't the bottleneck",
+        min=1000000, max=200000000, default=40000000,
+    )
+    falcon_photon_point_radius_auto: BoolProperty(
+        name="Auto Radius",
+        description="On every bake, trace rays out to the surfaces the caustics land on, "
+        "measure how many meters one pixel covers there and use that as the radius. "
+        "The radius is the size of the blur: in meters the right value changes by orders of "
+        "magnitude with the field of view and distance and has to be retuned for every scene, "
+        "but in pixels there is one answer (keep it just below what the frame can show). "
+        "The render resolution is taken into account too, so baking for 4K shrinks the radius "
+        "and sharpens the result automatically. "
+        "Off uses the value below as is",
+        default=True,
+    )
+    falcon_photon_point_radius_px: FloatProperty(
+        name="Radius (Pixels)",
+        description="Target used by Auto Radius: the radius given as the number of pixels of "
+        "blur it amounts to. "
+        "1 roughly matches the hand-tuned value. "
+        "Larger values stay smooth with fewer photons, at the cost of thicker filaments",
+        min=0.25, max=8.0, default=1.0,
+    )
+    falcon_photon_point_radius: FloatProperty(
+        name="Radius (m)",
+        description="Point-map lookup radius in meters. Smaller = crisper caustic "
+                    "filaments but needs more photons to stay solid; larger = "
+                    "smoother/softer. Takes effect on the next render, WITHOUT "
+                    "rebaking (0.008-0.015 tabletop, 0.03+ rooms)",
+        min=0.001, max=0.5, default=0.010,
+    )
+    falcon_photon_point_gain: FloatProperty(
+        name="Gain",
+        description="Caustic brightness multiplier applied at lookup time (labeled "
+                    "artistic knob: 1 = physically calibrated). Takes effect on the "
+                    "next render, WITHOUT rebaking",
+        min=0.0, max=32.0, default=1.0,
+    )
+    falcon_lt_blur: FloatProperty(
+        name="LT Blur",
+        description="Light-tracing splat reconstruction width in pixels. The "
+                    "photons land as a scatter of single points, so what a pixel "
+                    "gets is a random count: the shot noise this leaves is the "
+                    "main reason light-traced caustics look grainy. Spreading "
+                    "each splat over a small energy-preserving Gaussian averages "
+                    "that away without moving any light -- brightness is "
+                    "unchanged to four decimals, only detail below a pixel is "
+                    "given up. 0 is one photon per pixel, which is the raw form "
+                    "and also the noisiest; 4 is the kernel's 9x9 limit. Measured "
+                    "on ocean at 64spp (error against a 1024spp reference): "
+                    "0 = 0.219, 2 = 0.093, 4 = 0.077, and 64spp at 2 beats "
+                    "512spp at 0",
+        min=0.0, max=4.0, default=2.0,
+    )
+    falcon_lt_gain: FloatProperty(
+        name="LT Gain",
+        description="Light-traced caustic brightness multiplier (labeled artistic "
+                    "knob: 1 = physically calibrated against E*albedo/pi)",
+        min=0.0, max=32.0, default=1.0,
+    )
+    falcon_lt_visibility: BoolProperty(
+        name="LT Visibility",
+        description="Occlusion-test each caustic splat against the camera "
+                    "(vertex->camera shadow ray). Needed when anything sits "
+                    "between the caustic and the camera; also correctly removes "
+                    "through-glass splats light tracing cannot place. Small cost, "
+                    "keep on unless chasing raw speed on open scenes",
+        default=True,
+    )
+    falcon_lt_world: BoolProperty(
+        name="LT World Photons",
+        description="Add a world photon pass to the LT composite: a uniform "
+                    "(non-textured) background emits photons so world->glass->"
+                    "shadow embedded caustics appear. The exclusive separation "
+                    "turns PT caustics off in beauty, so without this pass that "
+                    "component is in no layer (LuxCore parity gap #2). Skipped "
+                    "automatically for HDRI/textured or black worlds",
+        default=True,
+    )
+    falcon_sharc_gate: BoolProperty(
+        name="Auto GI Gate",
+        description="Automatically scale the SHARC blend by how much the scene is dominated by "
+                    "indirect light, measured during Warmup. SHARC helps GI-heavy scenes but "
+                    "hurts direct-lit ones, so a direct-lit scene disables it on its own. Turn "
+                    "off to always blend at the full amount",
+        default=True,
+    )
+    falcon_caustics_photon: BoolProperty(
+        name="Caustics",
+        description="Caustics from photons shot from the lights. Like Photon path tracing "
+                    "in Octane, it only works once enabled. While off, its settings are "
+                    "hidden and no photon passes run (the same image as plain Cycles)",
+        default=True,
+    )
+    falcon_lt_mode: EnumProperty(
+        name="Mode",
+        description="How the caustics are produced: Auto, Accumulate or Approximate",
+        items=(
+            ('AUTO', "Auto", "Choose the photon count from the scene and produce the caustics "
+                             "in a single render. No knobs needed. The photons, 20% of the "
+                             "final sample count, are shared by all lights"),
+            ('ACCURATE', "Accumulate", "The same approach as LuxCore (default). Shoots a full "
+                                       "sample count of photons per light and adds them up. "
+                                       "The most accurate and the heaviest. Pressing Esc "
+                                       "midway composites the layers done so far"),
+            ('FAST', "Approximate", "Looks and speed. Uses 1/8 of the photons, widens the "
+                                    "blur and skips the visibility test. Less accurate"),
+        ),
+        default='ACCURATE',
+    )
+    falcon_lt_guide_tiles: EnumProperty(
+        name="LT Emission Guiding",
+        description="Split the light's emission into tiles, measure which ones feed the parts of "
+                    "the caustic that are still noisy, and spend the sample budget there instead "
+                    "of spreading it evenly. Costs a probe pass (kept -- it is part of the result) "
+                    "and needs enough samples to pay for it: 4x4 wants more than 18",
+        items=(
+            ('1', "Off", "Spread the photons evenly over the light's whole emission "
+                         "(previous behavior)"),
+            ('2', "2x2", "Improved only the tails and made the whole worse (measured "
+                         "2026-07-29: tails -14.3%, overall +4.4%). The split is too coarse "
+                         "to cut out the directions that hit nothing"),
+            ('4', "4x4", "Recommended. Measured 2026-07-29: overall -9.6%, tails -17.5%. "
+                         "5 of the 16 tiles are found to carry no transport and their budget "
+                         "goes to the directions that matter"),
+            ('8', "8x8", "Finer still, not measured yet. The probe cost grows with n^2, so "
+                         "only when many samples are available"),
+        ),
+        default='1',
+    )
+    falcon_sharc_gate_low: FloatProperty(
+        name="Gate Low",
+        description="GI dominance (indirect / (direct + indirect), measured during Warmup) below "
+                    "which the auto gate disables SHARC entirely",
+        min=0.0, max=1.0, default=0.15,
+    )
+    falcon_sharc_gate_high: FloatProperty(
+        name="Gate High",
+        description="GI dominance at and above which the auto gate lets SHARC blend at the full "
+                    "amount. Between Low and High the blend ramps smoothly",
+        min=0.0, max=1.0, default=0.40,
+    )
+    falcon_lt_direct: BoolProperty(
+        name="LT Direct Floor",
+        description="Also splat the bounce-0 direct diffuse hit, which is not a caustic. "
+                    "Calibration aid: it lets the light-traced floor radiance be matched against "
+                    "E*albedo/pi. Keep off for real caustic renders",
+        default=False,
+    )
+    falcon_photon_point_normal_deg: FloatProperty(
+        name="Normal Cone",
+        description="Point-map lookup rejects photons whose surface normal differs from the "
+                    "shading point's by more than this angle, so caustics do not bleed around "
+                    "corners or through thin walls",
+        min=0.0, max=90.0, default=30.0,
+    )
+    falcon_das_map: StringProperty(
+        name="DAS Map",
+        description="Denoiser-aware sampling: per-pixel threshold-scale map written by the OIDN "
+                    "probe. Only valid for a full-frame render at exactly the map's resolution. "
+                    "Leave empty to disable",
+        subtype='FILE_PATH', default="",
+    )
+    falcon_error_map: StringProperty(
+        name="Error Field",
+        description="Measured relative error per world cell, written by the probe tools. With a "
+                    "threshold above zero, a camera-visible cell whose error is at or below it is "
+                    "taken from the radiance cache and the path stops there instead of tracing "
+                    "bounces the cache already answers. Cells the probe never reached are never "
+                    "treated as converged",
+        subtype='FILE_PATH', default="",
+    )
+    falcon_error_cell: FloatProperty(
+        name="Error Cell Size",
+        description="Cell size the error field was measured at, in meters. Deliberately coarser "
+                    "than the radiance cache's cell: the per-cell statistics need pixels to "
+                    "average over (0.8 m measured 2026-07-29, 0.2 m gave 6 pixels per cell)",
+        min=0.05, max=8.0, default=0.8,
+    )
+    falcon_error_threshold: FloatProperty(
+        name="Stop Below Error",
+        description="Relative error at or below which a path is finished from the cache. 0 = off. "
+                    "Higher stops more paths and renders faster, at the cost of trusting cells "
+                    "the measurement says are less settled",
+        min=0.0, max=1.0, default=0.0,
+    )
+    falcon_error_raise_alpha: BoolProperty(
+        name="Trust The Cache Where Measured",
+        description="Let the error field decide that the radiance cache may answer a path in "
+                    "full, not just that an already-decided substitution can skip the rest of "
+                    "the trace. Only meaningful with a field that measures the CACHE's accuracy "
+                    "(the warmup spread sidecar, gated on samples per cell) -- pointing it at "
+                    "the light tracer's error field instead cost 29% of an image's energy",
+        default=False,
+    )
+    falcon_das_strength: FloatProperty(
+        name="DAS Strength",
+        description="How strongly the DAS map scales the adaptive sampling threshold "
+                    "(0 = map loaded but inert)",
+        min=0.0, max=8.0, default=1.0,
+    )
+    # コースティクス自動化(Octane式: ガラス+ライトを置くだけで出す)。
+    # AUTO=CyclesFパネル上部に「検出→ワンクリックで焼く」導線を出す。レシピ
+    # (点マップGPU・実証済み既定値)は falcon_photon_* の既定がそのまま効くので、
+    # 触る人以外は強さ以外のツマミを見なくてよい。OFF=従来どおり手動パネルのみ。
+    falcon_auto_caustics: EnumProperty(
+        name="Automatic Caustics",
+        description="Make caustics (focused light patterns) possible without any recipe "
+                    "knowledge in scenes with glass or refractive materials and lights. "
+                    "Auto: when detected, a one-click entry appears at the top of the "
+                    "F-Cycles panel. Off: no detection (manual, with the Photon/LT panels "
+                    "below)",
+        items=(
+            ('AUTO', "Auto", "When glass and a light are detected, make the caustics "
+                             "bakeable with one click (default)"),
+            ('OFF', "Off", "Do not detect automatically"),
+        ),
+        default='AUTO',
+    )
+    # --- 簡単表示(Caustica の形)で使う2つ ---------------------------------
+    #  CyclesF パネルの「機能1つ・チェックボックス1つ」の形。既定 OFF の
+    #  falcon_simple_panel(CyclesPreferences)がこの2つを見せるかを決める。
+    falcon_caustics_on: BoolProperty(
+        name="Caustics",
+        description="Produce the caustics (focused light patterns) of glass or refraction "
+                    "and lights. On bakes them with proven settings and composites them into "
+                    "the following renders. Off removes them from the composite (the cache "
+                    "is kept)",
+        default=False,
+        update=_falcon_caustics_on_update,
+    )
+    falcon_caustics_quality: EnumProperty(
+        name="Quality",
+        description="Quick: composite the baked photons into the render as they are. "
+                    "Clean: make smooth caustics converged with light tracing (a few minutes)",
+        items=(
+            ('FAST', "Quick", "Composite the baked photons as they are (default)"),
+            ('CLEAN', "Clean (Minutes)", "Make smooth caustics converged with light tracing"),
+        ),
+        default='FAST',
+    )
+
     @classmethod
     def register(cls):
         bpy.types.Scene.cycles = PointerProperty(
@@ -1692,6 +2250,39 @@ class CyclesPreferences(bpy.types.AddonPreferences):
         default=True,
     )
 
+    # ★フレーム補間で使う RIFE の置き場(2026-09-13)。既定は空 = 自動で探す。
+    #   空の時の順番は ①$FALCON_RIFE_DIR ②<blender の bin>/falcon/rife ③PATH。
+    #   RIFE (rife-ncnn-vulkan・MIT) は Blender に同梱していないので、
+    #   別に置いた所をここで指す。UI の言葉は**仮**。
+    # Falcon plugin folder (falcon_plugins.py): ids of plugins turned off by the user, ';' separated.
+    falcon_plugins_disabled: StringProperty(
+        name="Disabled Plugins",
+        description="Plugins in the Falcon plugin folder that are turned off",
+        default="",
+    )
+
+    falcon_rife_dir: StringProperty(
+        name="RIFE Folder",
+        description="Folder containing rife-ncnn-vulkan, used for frame interpolation. "
+        "When empty, it is searched for in the environment variable FALCON_RIFE_DIR, "
+        "in falcon/rife next to Blender, then in PATH",
+        subtype='DIR_PATH',
+        default="",
+    )
+
+    # CyclesF パネルを「機能1つ・チェックボックス1つ」の形にするかどうか。
+    # ★既定 False = いままでのパネルがそのまま出る(見た目は1画素も変わらない)。
+    #   True で、親は[コースティクス]/[強さ]/[品質]だけになり、今までの子パネルは
+    #   「詳細」の下へそのまま移る。値は1つも消えない。
+    # ★ここは画面に出る言葉なので、作者の Yes が出るまで既定は False のまま。
+    #   倒す時に変えるのはこの1行の default だけ。
+    falcon_simple_panel: BoolProperty(
+        name="Simple F-Cycles Panel",
+        description="Reduce the F-Cycles panel to a single Caustics checkbox and fold the "
+                    "other controls under \"Details\"",
+        default=False,
+    )
+
     kernel_optimization_level: EnumProperty(
         name="Kernel Optimization",
         description="Kernels can be optimized based on scene content. Optimized kernels are requested at the start of a render. "
@@ -1822,6 +2413,22 @@ class CyclesPreferences(bpy.types.AddonPreferences):
 
                 has_device_oidn_support = device[5]
                 if has_device_oidn_support and self.find_existing_device_entry(device).use:
+                    return True
+
+        return False
+
+    def has_dlss_gpu_devices(self):
+        compute_device_type = self.get_compute_device_type()
+
+        # We need non-CPU devices, used for rendering and supporting DLSS
+        if compute_device_type != 'NONE':
+            for device in self.get_device_list(compute_device_type):
+                device_type = device[1]
+                if device_type == 'CPU':
+                    continue
+
+                has_device_dlss_support = device[9]
+                if has_device_dlss_support and self.find_existing_device_entry(device).use:
                     return True
 
         return False
@@ -2006,6 +2613,15 @@ class CyclesPreferences(bpy.types.AddonPreferences):
 
     def draw(self, context):
         self.draw_impl(self.layout, context)
+        # ★フレーム補間で使う RIFE の置き場(仮の言葉)。デバイスの種類に依らないので
+        # draw_impl(NONE で早く抜ける)ではなくここに出す。
+        col = self.layout.column()
+        col.use_property_split = True
+        col.prop(self, "falcon_rife_dir")
+        from . import falcon_plugins
+        box = self.layout.box()
+        box.label(text="Falcon Plugins")
+        falcon_plugins.draw_plugins(box, context)
 
 
 class CyclesView3DShadingSettings(bpy.types.PropertyGroup):

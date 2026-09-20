@@ -148,7 +148,13 @@ if(EXISTS ${SOURCE_DIR}/.git)
   )
 
   execute_process(
-    COMMAND git diff-index --name-only HEAD --
+    # ★2026-09-16: `--ignore-submodules=all` を足した。この木では `lib/linux_x64` が
+    #   submodule(160000)の場所に **symlink** で置かれている(20GB 超の prebuilt を
+    #   worktree 間で共有するため)ので、git は常に「変更あり」と答える。
+    #   その結果 `--version` の branch が **永久に `(modified)`** になり、
+    #   本当にソースを触っているかの区別が付かなくなっていた((internal tracker))。
+    #   submodule の差だけを無視する = 本物のソース編集は今までどおり拾う。
+    COMMAND git diff-index --ignore-submodules=all --name-only HEAD --
     WORKING_DIRECTORY ${SOURCE_DIR}
     OUTPUT_VARIABLE _git_changed_files
     OUTPUT_STRIP_TRAILING_WHITESPACE

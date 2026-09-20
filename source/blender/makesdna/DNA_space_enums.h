@@ -638,6 +638,17 @@ enum eFileSel_Params_Flag : short {
 };
 ENUM_OPERATORS(eFileSel_Params_Flag);
 
+/** Falcon: #FileSelectParams.group_sequences. */
+enum eFileSel_Params_GroupSequences : char {
+  /** Fold numbered image sequences into one entry ("Group Image Sequences"). */
+  FILE_GROUP_SEQUENCES = (1 << 0),
+  /**
+   * The value was picked by hand (the toggle), so it is this browser's setting: it is kept when
+   * the file is read again instead of taking the browser's default.
+   */
+  FILE_GROUP_SEQUENCES_CHOSEN = (1 << 1),
+};
+
 enum eFileSel_Params_AssetCatalogVisibility : short {
   FILE_SHOW_ASSETS_ALL_CATALOGS,
   FILE_SHOW_ASSETS_FROM_CATALOG,
@@ -687,6 +698,13 @@ enum eFileSel_File_Types : int {
   FILE_TYPE_OBJECT_IO = (1 << 17),
   FILE_TYPE_USD = (1 << 18),
   FILE_TYPE_VOLUME = (1 << 19),
+  /**
+   * Falcon: a *virtual* entry standing for a whole numbered image sequence
+   * (`name0001.png` ... `name1351.png`), folded into a single item by the file browser.
+   * Always set together with #FILE_TYPE_IMAGE; #FileDirEntry::relpath still points at the
+   * first real frame on disk.
+   */
+  FILE_TYPE_IMAGE_SEQUENCE = (1 << 20),
 
   FILE_TYPE_ASSET = (1 << 28),
   /** Set together with #FILE_TYPE_ASSET when the asset is hosted online, not on disk. */

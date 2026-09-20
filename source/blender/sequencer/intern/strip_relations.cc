@@ -8,13 +8,21 @@
  * \ingroup sequencer
  */
 
+#include <algorithm>
+#include <atomic>
+#include <cstdlib>
+
 #include "DNA_scene_types.h"
 #include "DNA_sequence_types.h"
 
 #include "BLI_listbase.h"
 #include "BLI_math_base.h"
+#include "BLI_system.h"
+#include "BLI_time.h"
 #include "BLI_session_uid.h"
 #include "BLI_string.h"
+
+#include "IMB_imbuf.hh"
 
 #include "BKE_layer.hh"
 #include "BKE_main.hh"
@@ -76,11 +84,158 @@ void cache_settings_changed(Scene *scene)
   }
 }
 
+/**
+ * 空きメモリがこれを割ったら、設定した上限に達していなくてもキャッシュを手放す (MB)。
+ * `FALCON_VSE_MEM_FLOOR_MB=0` で無効(従来どおり上限だけで判断する)。
+ *
+ * ★なぜ要るか: `U.memcachelimit` は「VSE のキャッシュがどこまで太ってよいか」しか見ておらず、
+ * **機械の空きメモリを誰も見ていない**。設定値を大きくすると、空きが尽きかけていても
+ * 1枚も捨てないので、他の作業(モデリング・アニメーション)ごと機械が溢れる。
+ * しかも同じ `U.memcachelimit` は ImBuf のキャッシュ制限と汎用メモリキャッシュにも
+ * 別々に渡されているので、実際の天井は設定値の数倍になりうる。
+ */
+static size_t seq_cache_memory_floor_bytes()
+{
+  static const size_t floor_bytes = []() -> size_t {
+    const char *env = getenv("FALCON_VSE_MEM_FLOOR_MB");
+    int mb = 1024;
+    if (env != nullptr) {
+      mb = std::max(0, atoi(env));
+    }
+    return size_t(mb) * 1024 * 1024;
+  }();
+  return floor_bytes;
+}
+
+/**
+ * 「まだ捨てはしないが、これ以上は太らせない」帯の下限 (MB)。
+ * `FALCON_VSE_MEM_SOFT_MB=0` で無効(2026-09-09 以前の挙動 = 崖だけ)。
+ *
+ * ★なぜ要るか (2026-09-10 実測): 上の非常ブレーキは「空き 1GB」まで**一切効かない**。
+ * 400 コマ・1080p の 2 周目の中央値で
+ *   圧力なし 2.17ms/コマ (461fps) 対 常時圧力 6.42ms/コマ (156fps)
+ * = 掛かった瞬間に **3 倍遅くなる崖**。作者「VSE 再生時なぜか FPS 低下、
+ * またメモリ管理がおかしい挙動をしてる、安定しない」の形はこれ。
+ *
+ * 崖の手前に1段置く: 空きがこの値を割ったら**新しくキャッシュへ入れるのをやめる**
+ * (既に入っている物は捨てない)。太るのが止まるだけなので、
+ * 既に温まっている再生は速度を保ったまま頭打ちになる。
+ */
+static size_t seq_cache_soft_floor_bytes()
+{
+  static const size_t soft_bytes = []() -> size_t {
+    const char *env = getenv("FALCON_VSE_MEM_SOFT_MB");
+    int mb = 4096;
+    if (env != nullptr) {
+      mb = std::max(0, atoi(env));
+    }
+    return size_t(mb) * 1024 * 1024;
+  }();
+  return soft_bytes;
+}
+
+/**
+ * 機械の空きメモリが下限を割っているか。分からない時は false。
+ *
+ * ⚠**「分からない」を「空きが無い」と読まないこと。**
+ * #BLI_system_memory_available_in_bytes は対応していないプラットフォームで 0 を返す。
+ * そこで真を返すと、そのプラットフォームでは常時キャッシュが空になる。
+ *
+ * `/proc/meminfo` の読み出しは 100ms に1回までに間引く。この関数は追い出しのループの中から
+ * 呼ばれるので、1回の追い出しの間は同じ答えを返す = 「下限を割っていたら、下の keep 分まで
+ * 縮めて止まる」という決まった動きになる。
+ */
+static size_t seq_system_memory_available_throttled()
+{
+  static std::atomic<double> last_check_time{-1.0};
+  static std::atomic<size_t> last_available{0};
+  const double now = BLI_time_now_seconds();
+  const double last = last_check_time.load(std::memory_order_relaxed);
+  if (last >= 0.0 && now - last < 0.1) {
+    return last_available.load(std::memory_order_relaxed);
+  }
+  const size_t available = BLI_system_memory_available_in_bytes();
+  last_available.store(available, std::memory_order_relaxed);
+  last_check_time.store(now, std::memory_order_relaxed);
+  return available;
+}
+
+static bool seq_system_memory_is_below(const size_t floor_bytes)
+{
+  if (floor_bytes == 0) {
+    return false;
+  }
+  const size_t available = seq_system_memory_available_throttled();
+  /* 0 = 取れなかった。「空きが無い」ではない。 */
+  return (available != 0) && (available < floor_bytes);
+}
+
+static bool seq_system_memory_is_low()
+{
+  return seq_system_memory_is_below(seq_cache_memory_floor_bytes());
+}
+
+size_t caches_calc_memory_size_unique(const Scene *scene)
+{
+  Set<const ImBuf *> seen;
+  source_image_cache_collect_images(scene, seen);
+  final_image_cache_collect_images(scene, seen);
+  size_t size = 0;
+  for (const ImBuf *ibuf : seen) {
+    size += IMB_get_size_in_memory(ibuf);
+  }
+  return size;
+}
+
+/* ★素材と仕上がりが同じ絵を共有している分を二重に数えない(既定)。
+ * `FALCON_VSE_CACHE_DEDUP=0` で今までどおりの足し算に戻る。 */
+static bool cache_dedup_enabled()
+{
+  static const bool enabled = []() {
+    const char *env = std::getenv("FALCON_VSE_CACHE_DEDUP");
+    return env == nullptr || env[0] != '0';
+  }();
+  return enabled;
+}
+
+static size_t caches_calc_memory_size(const Scene *scene)
+{
+  if (cache_dedup_enabled()) {
+    return caches_calc_memory_size_unique(scene);
+  }
+  return source_image_cache_calc_memory_size(scene) +
+         final_image_cache_calc_memory_size(scene);
+}
+
 bool is_cache_full(const Scene *scene)
 {
-  size_t cache_limit = size_t(U.memcachelimit) * 1024 * 1024;
-  return source_image_cache_calc_memory_size(scene) + final_image_cache_calc_memory_size(scene) >
-         cache_limit;
+  const size_t cache_limit = size_t(U.memcachelimit) * 1024 * 1024;
+  const size_t used = caches_calc_memory_size(scene);
+  if (used > cache_limit) {
+    return true;
+  }
+  /* 空きが下限を割っている間は、設定した上限に達していなくても手放す。
+   * ただし丸ごと空にはしない: ここまでは残す、という下駄を履かせて追い出しのループを止める
+   * (全部捨てると、圧力が一瞬かすめただけで再生が最初からやり直しになる)。 */
+  const size_t keep = std::max<size_t>(cache_limit / 8, 64 * 1024 * 1024);
+  if (used > keep && seq_system_memory_is_low()) {
+    return true;
+  }
+  return false;
+}
+
+bool cache_should_stop_growing(const Scene * /*scene*/)
+{
+  /* ★崖の手前の1段。「捨てる」でなく「これ以上入れない」。
+   *
+   * `is_cache_full()` は上限(`U.memcachelimit`)か空き 1GB のどちらかに当たるまで
+   * 一切効かない。32GB の機械に 16384MB × 3 系統が通っている今の設定では、
+   * 先に当たるのは空きの側で、当たった瞬間に追い出しが走って再生が 3 倍遅くなる
+   * (2026-09-10 実測: 461fps -> 156fps)。
+   *
+   * ここで太るのを止めておくと、既に入っている分はそのまま効くので、
+   * 温まっている再生は**速度を保ったまま頭打ちになる**。 */
+  return seq_system_memory_is_below(seq_cache_soft_floor_bytes());
 }
 
 bool evict_caches_if_full(Scene *scene)
@@ -284,7 +439,10 @@ void relations_invalidate_movieclip_strips(Main *bmain, MovieClip *clip_target)
   }
 }
 
-void relations_free_imbuf(Scene *scene, ListBaseT<Strip> *seqbase, bool for_render)
+void relations_free_imbuf(Scene *scene,
+                          ListBaseT<Strip> *seqbase,
+                          bool for_render,
+                          const Set<std::string> *only_movie_paths)
 {
   if (scene->ed == nullptr) {
     return;
@@ -299,14 +457,18 @@ void relations_free_imbuf(Scene *scene, ListBaseT<Strip> *seqbase, bool for_rend
 
     if (strip.data) {
       if (strip.type == STRIP_TYPE_MOVIE) {
-        strip_free_movie_readers(&strip);
+        if (only_movie_paths == nullptr ||
+            only_movie_paths->contains(strip_movie_source_path_get(scene, &strip)))
+        {
+          strip_free_movie_readers(&strip);
+        }
       }
       if (strip.type == STRIP_TYPE_SPEED) {
         strip_effect_speed_rebuild_map(scene, &strip);
       }
     }
     if (strip.type == STRIP_TYPE_META) {
-      relations_free_imbuf(scene, &strip.seqbase, for_render);
+      relations_free_imbuf(scene, &strip.seqbase, for_render, only_movie_paths);
     }
     if (strip.type == STRIP_TYPE_SCENE) {
       /* FIXME: recurse downwards,

@@ -168,6 +168,11 @@ enum eFFMpegCodec_Flag : int {
   FFMPEG_AUTOSPLIT_OUTPUT = (1 << 1),
   FFMPEG_LOSSLESS_OUTPUT = (1 << 2),
   FFMPEG_USE_MAX_B_FRAMES = (1 << 3),
+  /* CyclesF: GPU のエンコーダ(NVENC)を「使わない」。既定(0)は使う側。
+   * 意味を反転させてあるのは、既定 ON をサブバージョンを上げずに全ファイルへ
+   * 届けるため。旗を持たない既存の .blend も startup.blend もそのまま GPU を使う。
+   * 無い時は自動でソフトウェアへ落ちるので、旗を立てるのは意図して切る時だけ。 */
+  FFMPEG_NO_HARDWARE_ENCODER = (1 << 4),
 };
 ENUM_OPERATORS(eFFMpegCodec_Flag)
 
@@ -891,12 +896,16 @@ struct RenderData {
   /**
    * Flags for render settings. Use bit-masking to access the settings.
    */
-  int scemode = R_DOCOMP | R_DOSEQ | R_EXTENSION | R_USE_TEXTURE_CACHE;
+  /* Falcon: also auto-generate the texture cache .tx files by default. */
+  int scemode = R_DOCOMP | R_DOSEQ | R_EXTENSION | R_USE_TEXTURE_CACHE |
+                R_TEXTURE_CACHE_AUTO_GENERATE;
 
   /**
    * Flags for render settings. Use bit-masking to access the settings.
    */
-  int mode = R_SAVE_OUTPUT;
+  /* Falcon: persistent data on by default (measured 07-11: classroom frame 2
+   * drops 1.33 -> 0.45 s with no VRAM growth). */
+  int mode = R_SAVE_OUTPUT | R_PERSISTENT_DATA;
 
   short frs_sec = 24;
 

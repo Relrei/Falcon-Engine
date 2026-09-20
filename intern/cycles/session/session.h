@@ -137,14 +137,43 @@ class Session {
   void draw();
   void wait();
 
+  /* Drop the DLSS-RR carried temporal history (viewport). Called by the
+   * engine integration on hard cuts -- bound-camera switches and timeline
+   * jumps -- which motion vectors cannot explain. */
+  void clear_denoiser_temporal_history();
+
+  /* Frame number the following renders belong to (DLSS-RR frame transitions). */
+  void set_denoiser_frame(int frame);
+
   bool ready_to_reset();
   void reset(const SessionParams &session_params, const BufferParams &buffer_params);
 
   void set_pause(bool pause);
   void set_navigating(bool navigating);
 
+  /* The viewport is playing the timeline. Appearance edits during playback are
+   * animation (an animated material re-syncs its shader every frame), not the
+   * user changing the look, so the DLSS-RR history is carried across them. */
+  void set_playback(bool playback);
+
   void set_samples(const int samples);
   void set_time_limit(const double time_limit);
+
+  /* Tell the DLSS-RR scheduler that this render is part of an animation, which
+   * enables the first-frame history pre-roll (see RenderScheduler). */
+  void set_is_animation(bool is_animation);
+
+  /* Tell the DLSS-RR scheduler that history was already warmed up by a
+   * previous frame of this job, even though this Session was just freshly
+   * constructed (see RenderScheduler::set_dlss_history_warm). */
+  void set_dlss_history_warm();
+
+  /* What the DLSS-RR pre-roll did on the frame that was just rendered, for the
+   * render-result metadata (cycles.dlss.*). Same numbers as the render status
+   * line and the stderr trace. passes = pre-roll passes run for this frame
+   * (0 = none, -1 = never decided, e.g. no DLSS), history_was_cold = whether
+   * this frame started with an empty RR history. */
+  void get_dlss_preroll_info(int &passes, bool &history_was_cold) const;
 
   void set_output_driver(unique_ptr<OutputDriver> driver);
   void set_display_driver(unique_ptr<DisplayDriver> driver);
@@ -245,6 +274,9 @@ class Session {
 
   /* Manages when image cache eviction happens. */
   CacheEvictionManager eviction_manager_;
+
+  /* See set_playback(). */
+  bool playback_ = false;
 
   /* Render scheduler is used to get work to be rendered with the current big tile. */
   RenderScheduler render_scheduler_;

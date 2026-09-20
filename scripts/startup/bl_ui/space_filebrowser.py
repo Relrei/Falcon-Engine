@@ -191,6 +191,7 @@ class FILEBROWSER_PT_filter(FileBrowserPanel, Panel):
 
                 col.separator()
 
+        layout.prop(params, "use_group_sequences", text="Group Image Sequences")
         layout.prop(params, "show_hidden")
 
 
@@ -463,6 +464,12 @@ class FILEBROWSER_PT_directory_path(Panel):
         subsubrow = subrow.row(align=True)
         subsubrow.prop(params, "display_type", expand=True, icon_only=True)
         subsubrow.popover("FILEBROWSER_PT_display", text="")
+
+        # Falcon: fold numbered image sequences into one item, switched right here.
+        # Grayed out when the filter hides image files (nothing to fold then).
+        subsubrow = subrow.row(align=True)
+        subsubrow.active = (not params.use_filter) or params.use_filter_image or bool(params.filter_glob)
+        subsubrow.prop(params, "use_group_sequences", toggle=True, icon='FILE_MOVIE', icon_only=True)
 
         subsubrow = subrow.row(align=True)
         subsubrow.prop(params, "use_filter", toggle=True, icon=(

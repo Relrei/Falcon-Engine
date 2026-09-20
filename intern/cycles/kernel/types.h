@@ -83,6 +83,8 @@ enum PathTraceDimension {
   PRNG_SURFACE_AO = 4,
   PRNG_SURFACE_BEVEL = 5,
   PRNG_SURFACE_BSDF_GUIDING = 6,
+  /* Falcon Dispersion wavelength sample (free slot in the surface block). */
+  PRNG_SURFACE_DISPERSION = 7,
 
   /* Guiding RIS */
   PRNG_SURFACE_RIS_GUIDING_0 = 10,
@@ -277,6 +279,10 @@ enum PathRayFlag : uint32_t {
 
   /* The current shadow ray is a light linking (forward) and not next-event shadow ray. */
   PATH_RAY_SHADOW_FOR_LIGHT_LINKING = (1U << 25U),
+
+  /* Primary surface replacement: the camera hit a delta mirror, so the denoising guides were
+   * held back and get written for the virtual image behind it instead. */
+  PATH_RAY_PSR = (1U << 26U),
 };
 
 // 8bit enum, just in case we need to move more variables in it
@@ -428,6 +434,13 @@ enum PassType {
   PASS_DENOISING_ROUGHNESS,
   PASS_DENOISING_DEPTH,
   PASS_DENOISING_BACKWARD_MOTION,
+  PASS_DENOISING_SPECULAR_MOTION,
+  /* World-space distance from the primary surface to what its specular lobe hit,
+   * for DLSS-RR (Integration Guide 3.4.9). RR reconstructs the specular motion
+   * from it, so it needs the camera matrices alongside. Two components: the
+   * summed distance of the samples whose primary bounce was glossy, and how
+   * many there were, so the mean is over those samples alone. */
+  PASS_DENOISING_SPECULAR_HIT_DISTANCE,
   PASS_CATEGORY_DENOISING_END = 95,
 
   PASS_BAKE_PRIMITIVE,
@@ -461,6 +474,9 @@ enum DenoisingPassFlag {
   DENOISING_PASS_FOLLOW_REFLECTIONS = (1 << 0),
   /* Whether to use roughness-based weighting for the albedo or split by the BSDF type. */
   DENOISING_PASS_USE_ALBEDO_ROUGHNESS_WEIGHTING = (1 << 1),
+  /* Primary surface replacement: describe the virtual image behind a delta mirror rather than the
+   * mirror itself. */
+  DENOISING_PASS_PSR = (1 << 2),
 };
 
 /* Closure Filter */
@@ -1807,9 +1823,12 @@ enum DeviceKernel : int {
   DEVICE_KERNEL_ADAPTIVE_SAMPLING_CONVERGENCE_FILTER_Y,
 
   DEVICE_KERNEL_FILTER_GUIDING_PREPROCESS,
+  DEVICE_KERNEL_FILTER_GUIDING_PREPROCESS_TO_SURFACE,
   DEVICE_KERNEL_FILTER_GUIDING_SET_FAKE_ALBEDO,
   DEVICE_KERNEL_FILTER_COLOR_PREPROCESS,
+  DEVICE_KERNEL_FILTER_COLOR_PREPROCESS_TO_SURFACE,
   DEVICE_KERNEL_FILTER_COLOR_POSTPROCESS,
+  DEVICE_KERNEL_FILTER_COLOR_POSTPROCESS_FROM_SURFACE,
   DEVICE_KERNEL_FILTER_COLOR_FLIP_Y,
 
   DEVICE_KERNEL_VOLUME_GUIDING_FILTER_X,

@@ -81,7 +81,24 @@ ccl_device bool film_adaptive_sampling_convergence_check(KernelGlobals kg,
 
   /* A small epsilon is added to the divisor to prevent division by zero. */
   const float error = error_difference / (0.0001f + error_normalize);
-  const bool did_converge = (error < threshold);
+
+  float local_threshold = threshold;
+#ifdef WITH_FALCON_SHARC
+  /* Falcon DAS: scale the threshold per pixel by the host-built map (from an
+   * OIDN probe residual). scale < 1 = denoiser-hard pixel, keep sampling;
+   * scale > 1 = the denoiser reconstructs this pixel fine, stop early.
+   * strength lerps the map toward identity so it is tunable at runtime. */
+  /* falcon_das_active is the map's element count (0 = off). The fetch has no
+   * bounds check on CUDA, and the map's size comes from a file whose path is
+   * stored in the .blend, so the index is checked here as well as on the host
+   * (2026-08-21). A correctly sized map never takes the else branch. */
+  const int das_count = kernel_data.integrator.falcon_das_active;
+  if (das_count > 0 && render_pixel_index >= 0 && render_pixel_index < das_count) {
+    const float s = kernel_data_fetch(falcon_das_scale, render_pixel_index);
+    local_threshold *= 1.0f + (s - 1.0f) * kernel_data.integrator.falcon_das_strength;
+  }
+#endif
+  const bool did_converge = (error < local_threshold);
 
   const uint aux_w_offset = kernel_data.film.pass_adaptive_aux_buffer + 3;
   buffer[aux_w_offset] = did_converge;

@@ -41,6 +41,18 @@ void timeline_expand_boundbox(const Scene *scene, const ListBaseT<Strip> *seqbas
  */
 void timeline_boundbox(const Scene *scene, const ListBaseT<Strip> *seqbase, rctf *r_rect);
 /**
+ * Falcon (2026-09-20): how many channels the timeline shows (1 = channel 1 only).
+ * Stored per scene in the system property `falcon_vse_channels` (default 10), saved in the .blend.
+ * Channels above it are only shown when they hold strips. Returns 0 when switched off with
+ * `FALCON_VSE_CHANNELS=0` (the timeline then behaves as before: 7 channels plus the used ones).
+ */
+int falcon_timeline_channels(const Scene *scene);
+/** Channels the timeline shows: #falcon_timeline_channels or the highest used channel, whichever
+ * is larger. 0 when switched off. */
+int falcon_timeline_channels_shown(const Scene *scene, const ListBaseT<Strip> *seqbase);
+/** Set the number of channels the timeline shows (clamped to 1 .. #MAX_CHANNELS). */
+void falcon_timeline_channels_set(Scene *scene, int count);
+/**
  * Find start or end position of next or previous strip.
  * \param scene: Video editing scene
  * \param timeline_frame: reference frame for searching

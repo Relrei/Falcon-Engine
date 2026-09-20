@@ -26,6 +26,16 @@ class RenderWork {
    * baking target. */
   bool init_render_buffers = false;
 
+  /* The sample count restarted but the frame did not change (a DLSS-RR pre-roll
+   * pass), so the temporal history lines up with the frame as it is: keep it,
+   * and do not warp it by the frame's motion vectors. */
+  bool denoise_same_frame_restart = false;
+
+  /* This pass is a DLSS-RR pre-roll pass whose image is thrown away: only the
+   * history it leaves behind is wanted. False on the pass that is kept as the
+   * frame. */
+  bool denoise_preroll_pass = false;
+
   /* Path tracing samples information. */
   struct {
     int start_sample = 0;
@@ -106,6 +116,86 @@ class RenderScheduler {
 
   void set_denoiser_params(const DenoiseParams &params);
   bool is_denoiser_gpu_used() const;
+
+  /* Rendering a frame of an animation, which enables the DLSS-RR first-frame
+   * history pre-roll. */
+  void set_is_animation(bool is_animation);
+
+  /* The viewport is playing the timeline. Playback gives the renderer roughly
+   * one display frame's worth of time, which is not enough for a single
+   * sampling pass at the navigation resolution, so playback frames are
+   * rendered smaller and DLSS upscales the rest of the way. */
+  void set_playback(bool playback);
+
+  /* Tell the scheduler that DLSS-RR history was already warmed up by a
+   * previous frame of this same animation job, even though this Session (and
+   * therefore this RenderScheduler) was just freshly constructed -- e.g.
+   * because Persistent Data is off and the engine tears the Session down
+   * and rebuilds it between frames. Without this, every frame looks cold and
+   * re-runs the pre-roll pass count instead of just the first one. */
+  void set_dlss_history_warm();
+
+  /* A cut threw the RR history away, so the next frame starts cold again and
+   * wants the pre-roll a second time. */
+  void set_dlss_history_cold();
+
+  /* Extra renders of the frame that starts with no DLSS-RR history, used to
+   * fill that history with independent estimates before the kept pass (0 when
+   * there is nothing to pre-roll). */
+  int get_dlss_preroll_passes() const;
+
+  /* Samples the pass currently being rendered stops at: the frame's count,
+   * except for DLSS-RR pre-roll passes which may render fewer. */
+  int get_pass_num_samples() const;
+
+  /* Default cap on samples per pre-roll pass (0 = the frame's own count). */
+  static const int DLSS_PREROLL_SPP_DEFAULT = 0;
+
+  /* Pre-roll passes a *still* render (F12 on one frame, not an animation) gets.
+   * A still has no following frames to feed the RR history, so without this it
+   * denoises once from an empty history -- which is what "the still render
+   * cannot denoise, it stops after one render" means. 0 = the behaviour before
+   * 2026-09-06; FALCON_DLSS_STILL_PREROLL overrides it. */
+  static const int DLSS_STILL_PREROLL_DEFAULT = 0;
+
+  /* ★The number of frames RE_RenderAnim renders and throws away before the
+   * first frame of an animation, to warm the DLSS-RR history
+   * (FALCON_DLSS_ANIM_WARMUP, 2026-09-13). Cycles only reads it to know
+   * whether the pre-roll is still wanted; the loop itself lives in
+   * pipeline.cc, whose falcon_anim_warmup_frames() must carry the same
+   * default. */
+  static const int DLSS_ANIM_WARMUP_DEFAULT = 2;
+
+  /* --- What the pre-roll actually did, for the three places that report it
+   * (render status, render-result metadata, stderr). All three must show the
+   * same numbers, so they all read them from here. --- */
+
+  /* Pre-roll passes decided for the frame being rendered (-1 = not decided
+   * yet: the count is only known once the first work is scheduled, because the
+   * denoiser parameters are synced after reset()). */
+  int get_dlss_preroll_passes_total() const;
+
+  /* Pre-roll passes still to come, of that total. */
+  int get_dlss_preroll_passes_left() const;
+
+  /* Whether the RR history was cold when this frame's work was first scheduled
+   * (i.e. whether this frame is one that pre-rolls at all). */
+  bool get_dlss_history_was_cold() const;
+  bool use_dlss_stream_final() const;
+
+  /* Whether the DLSS stream mode is running: every update is an independent frame that RR
+   * converges through its history, instead of Cycles accumulating into the buffer. */
+  bool use_dlss_stream() const;
+
+  /* Extra factor the path trace resolution is divided by while the timeline is
+   * playing (1.0 = off). See the definition for why. */
+  float playback_upscale_factor() const;
+
+  /* Where in the sample sequence the current stream frame starts. Plays the same role for the
+   * stream as preroll_sample_base_ does for the pre-roll passes: without it every stream frame
+   * re-renders the same sample indices, so RR is shown the same noise over and over. */
+  int stream_sample_base() const;
+  static bool dlss_final_denoise_only();
 
   void set_adaptive_sampling(const AdaptiveSampling &adaptive_sampling);
   bool is_adaptive_sampling_used() const;
@@ -380,6 +470,17 @@ class RenderScheduler {
     /* Number of rendered samples on top of the start sample. */
     int num_rendered_samples = 0;
 
+    /* Total samples pushed through the continuous DLSS viewport stream since
+     * the last reset. The per-work counter above is rewound for every DLSS
+     * update, so this is the only record of overall progress; done() uses it
+     * to honor the viewport sample limit for DLSS. */
+    int num_dlss_stream_samples = 0;
+
+    /* Sample count at the last DLSS denoise of the accumulating viewport
+     * (carry ON). Used to re-denoise only when the buffer changed enough
+     * (samples doubled); see work_need_denoise. */
+    int last_dlss_denoise_samples = 0;
+
     /* Point in time the latest PathTraceDisplay work has been scheduled. */
     double last_display_update_time = 0.0;
     /* Value of -1 means display was never updated. */
@@ -465,6 +566,35 @@ class RenderScheduler {
 
   /* Background (offline) rendering. */
   bool background_;
+
+  /* The viewport is playing the timeline (see set_playback). */
+  bool playback_ = false;
+
+  /* This render is a frame of an animation, so the DLSS-RR history from the
+   * previous frame carries into this one -- except on the very first frame. */
+  bool is_animation_ = false;
+
+  /* No DLSS-RR history has been built yet in this render job: the first frame
+   * of an animation gets none of the temporal accumulation that later frames
+   * inherit, and comes out visibly noisier. Cleared once a frame has been
+   * rendered. */
+  bool dlss_history_cold_ = true;
+  /* Survives the reset() that runs between the cut being noticed and the frame
+   * being scheduled -- that reset would otherwise declare the history warm
+   * again, on the strength of the shot we just threw away. */
+  bool dlss_history_cut_pending_ = false;
+
+  /* Pre-roll of the first frame: extra renders of it, each from a different
+   * part of the sample sequence, that only exist to fill the RR history. */
+  int preroll_passes_left_ = 0;
+  int preroll_sample_base_ = 0;
+  bool preroll_same_frame_restart_ = false;
+
+  /* The count decided for this frame, kept after preroll_passes_left_ has been
+   * counted down, so the status line and the metadata can report "k/N" and the
+   * final image can say how many passes went into its history. */
+  int preroll_passes_total_ = -1;
+  bool preroll_history_was_cold_ = false;
 
   /* Pixel size is used to force lower resolution render for final pass. Useful for retina or other
    * types of hi-dpi displays. */

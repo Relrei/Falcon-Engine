@@ -45,11 +45,42 @@ _stale_filename = ".~stale~"
 # See #71486 and follow up discussion on #151863.
 _addons_hidden_core = {
     "bl_pkg",
+    # Falcon Render: レンダーの出力先を VSE へ渡す(既定で有効)。
+    "falcon_vse_bridge",
+    # Falcon Engine: 上の帯の EN / JA と Ctrl+Shift+L で言語を切り替える(既定で有効)。
+    "falcon_language",
     "io_anim_bvh",
     "io_curve_svg",
     "io_mesh_uv_layout",
     "io_scene_fbx",
 }
+
+
+def _falcon_dlss_listed():
+    # Falcon Engine: the NVIDIA DLSS runtime is not shipped, so the add-on that turns DLSS on is only
+    # listed once the runtime is in a Falcon plugin folder (checked by Cycles, `cycles/falcon_plugins.py`).
+    import sys
+    plugins = sys.modules.get("cycles.falcon_plugins")
+    return (plugins is not None) and plugins.dlss_addon_listed()
+
+
+# Falcon Engine: add-ons that are only listed while what they need is present. They are always listed
+# while enabled (so they can be turned off). `{module_name: callable}`, the callable returns a bool and
+# must be cheap, it runs every time the add-on list is read.
+_addons_listed_if = {
+    "falcon_dlss": _falcon_dlss_listed,
+}
+
+
+def _addon_listed(module_name):
+    if (is_listed := _addons_listed_if.get(module_name)) is None:
+        return True
+    if module_name in _preferences.addons:
+        return True
+    try:
+        return bool(is_listed())
+    except Exception:
+        return False
 
 
 # Called only once at startup, avoids calling 'reset_all', correct but slower.
@@ -268,6 +299,9 @@ def modules(*, module_cache=addons_fake_modules, refresh=True):
         module_cache.clear()
         module_cache.update((key, value) for key, value in module_cache_items)
 
+    # Falcon Engine: leave out the add-ons whose requirement is missing (`_addons_listed_if`).
+    if any(module_name in module_cache for module_name in _addons_listed_if):
+        return [mod for module_name, mod in module_cache.items() if _addon_listed(module_name)]
     return module_cache.values()
 
 
@@ -652,6 +686,28 @@ def reset_all(*, reload_scripts=False):
             elif is_loaded:
                 print("\taddon_utils.reset_all unloading", mod_name)
                 disable(mod_name)
+
+    _falcon_hidden_core_ensure()
+
+
+def _falcon_hidden_core_ensure():
+    # Falcon Engine: `disable_all()` runs before an app template is loaded ("New File > Video Editing"),
+    # before factory settings / preferences are loaded and before scripts are reloaded. It also turns off
+    # the "core" add-ons, and the loop in `reset_all()` only brings back the ones in the preferences'
+    # add-on list. Upstream's core add-ons are in that list (`BKE_blendfile_userdef_from_defaults`),
+    # Falcon's (`falcon_vse_bridge`) are not, so they stayed off until Blender was restarted.
+    # Enable them again the way `_initialize_once()` does. `FALCON_HIDDEN_CORE_RESET=0`: previous behavior.
+    import os
+    import sys
+    if os.environ.get("FALCON_HIDDEN_CORE_RESET", "1").strip().lower() in {"", "0", "off", "false", "no"}:
+        return
+    for module_name in sorted(_addons_hidden_core):
+        if module_name in _preferences.addons:
+            continue  # The loop in `reset_all()` handles these.
+        mod = sys.modules.get(module_name)
+        if (mod is not None) and mod.__dict__.get("__addon_enabled__"):
+            continue
+        enable(module_name, refresh_handled=True, default_set=False, persistent=True)
 
 
 def disable_all():

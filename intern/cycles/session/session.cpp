@@ -320,6 +320,13 @@ RenderWork Session::run_update_for_next_iteration()
   /* Update scene */
   const bool reset_scene = update_scene(delayed_reset_.do_reset);
 
+  /* An error raised while updating the scene means the render is refused, not
+   * merely interrupted: the device was never brought up for it, so the camera
+   * and buffer updates below would talk to an unloaded module. */
+  if (progress.get_cancel()) {
+    return RenderWork();
+  }
+
   /* Update buffers for new parameters. After scene update which influences the passes used. */
   bool have_tiles = true;
   bool switched_to_new_tile = false;
@@ -584,6 +591,23 @@ void Session::update_buffers_for_params()
 
 void Session::reset(const SessionParams &session_params, const BufferParams &buffer_params)
 {
+  /* A final render restarts here once per frame, which is where the DLSS-RR
+   * sub-pixel jitter should move to its next position -- and stay there for all
+   * of that frame's samples. See Integrator::pin_pixel_jitter_per_frame. */
+  if (scene && scene->integrator) {
+    /* The stream mode wants a fresh jitter for every one-sample iteration, which
+     * is the free-running behaviour; everything else wants one position held for
+     * the whole frame. FALCON_DLSS_NO_JITTER_PIN restores the old free-running
+     * jitter for A/B: it violates the RR contract (the batches average several
+     * sub-pixel positions), but that averaging acted as a slight blur that some
+     * shots read as smoother. */
+    const bool stream_final = getenv("FALCON_DLSS_STREAM_FINAL") != nullptr;
+    const bool no_pin = getenv("FALCON_DLSS_NO_JITTER_PIN") != nullptr;
+    scene->integrator->pin_pixel_jitter_per_frame(session_params.background && !stream_final &&
+                                                  !no_pin);
+    scene->integrator->advance_pixel_jitter();
+  }
+
   {
     const thread_scoped_lock reset_lock(delayed_reset_.mutex);
     const thread_scoped_lock pause_lock(pause_mutex_);
@@ -598,6 +622,22 @@ void Session::reset(const SessionParams &session_params, const BufferParams &buf
   }
 
   pause_cond_.notify_all();
+}
+
+void Session::set_is_animation(bool is_animation)
+{
+  render_scheduler_.set_is_animation(is_animation);
+}
+
+void Session::set_dlss_history_warm()
+{
+  render_scheduler_.set_dlss_history_warm();
+}
+
+void Session::get_dlss_preroll_info(int &passes, bool &history_was_cold) const
+{
+  passes = render_scheduler_.get_dlss_preroll_passes_total();
+  history_was_cold = render_scheduler_.get_dlss_history_was_cold();
 }
 
 void Session::set_samples(const int samples)
@@ -660,6 +700,15 @@ void Session::set_navigating(bool navigating)
   eviction_manager_.set_navigating(navigating);
 }
 
+void Session::set_playback(bool playback)
+{
+  playback_ = playback;
+  /* The scheduler renders playback frames smaller: at 24 fps a timeline frame
+   * does not last long enough for one sampling pass at the navigation
+   * resolution. See RenderScheduler::playback_upscale_factor. */
+  render_scheduler_.set_playback(playback);
+}
+
 void Session::set_output_driver(unique_ptr<OutputDriver> driver)
 {
   path_trace_->set_output_driver(std::move(driver));
@@ -703,6 +752,26 @@ void Session::wait()
   }
 }
 
+void Session::set_denoiser_frame(const int frame)
+{
+  if (path_trace_) {
+    path_trace_->set_denoiser_frame(frame);
+  }
+}
+
+void Session::clear_denoiser_temporal_history()
+{
+  if (path_trace_) {
+    path_trace_->clear_denoiser_temporal_history();
+  }
+
+  /* The pre-roll exists because a cold history makes the frame visibly noisier,
+   * and a cut leaves exactly that: an empty history. It only ever ran on the
+   * first frame of the render, so every shot after the first opened noisy.
+   * Arm it again here so each shot gets the same start as the first one. */
+  render_scheduler_.set_dlss_history_cold();
+}
+
 bool Session::update_scene(const bool reset_samples)
 {
   /* Update number of samples in the integrator.
@@ -722,7 +791,84 @@ bool Session::update_scene(const bool reset_samples)
    * tile results. */
   scene->film->set_use_sample_count(tile_manager_.has_multiple_tiles());
 
+  /* DLSS-RR upscaling does not survive tiling: the denoiser works on the whole
+   * frame, so with the frame split up (which is what happens at 4K, where the
+   * buffers no longer fit in memory) the result is written back at the wrong
+   * stride and the image comes out as repeated, mostly black strips. Fall back
+   * to native resolution there rather than produce a broken frame. */
+  if (tile_manager_.has_multiple_tiles() && scene->integrator->get_use_denoise() &&
+      scene->integrator->get_denoiser_type() == DENOISER_DLSS &&
+      scene->integrator->get_denoiser_upscale_factor() != 1.0f)
+  {
+    LOG_WARNING << "DLSS upscaling is not supported when the frame is rendered in tiles "
+                   "(too large to fit in memory); rendering at native resolution instead.";
+    scene->integrator->set_denoiser_upscale_factor(1.0f);
+  }
+
+  /* Falcon safety guard: at native resolution DLSS still denoises the whole
+   * frame at once, so a tiled frame is written back at the wrong stride whatever
+   * the upscale factor is. Refuse rather than hand back repeated black strips.
+   * Resolution itself is not the condition -- what matters is whether the frame
+   * fits in one tile, which depends on the GPU and the passes in use.
+   * FALCON_DLSS_ALLOW_HIGHRES=1 lifts the guard for development. */
+  if (params.background && tile_manager_.has_multiple_tiles() &&
+      scene->integrator->get_use_denoise() &&
+      scene->integrator->get_denoiser_type() == DENOISER_DLSS &&
+      getenv("FALCON_DLSS_ALLOW_HIGHRES") == nullptr)
+  {
+    progress.set_error(string_printf(
+        "Falcon: DLSS denoising needs the whole %dx%d frame at once, but it is being rendered "
+        "in tiles. The tile size is raised to fit the frame automatically, so reaching this "
+        "means the frame is larger than that could cover -- lower the resolution, or switch "
+        "the denoiser.",
+        buffer_params_.full_width,
+        buffer_params_.full_height));
+  }
+
   const bool reset = scene->need_reset(false);
+  /* Viewport only: appearance edits (shading, lights, world, textures, film
+   * or integrator settings) invalidate the DLSS-RR carried history, since
+   * motion vectors cannot explain them and carrying would ghost the old
+   * look. Object/geometry/camera motion -- navigation and animation playback
+   * -- is described by the interactive motion passes, so the history is kept
+   * and warped into alignment instead (this is what makes DLSS behave like
+   * its game integrations during playback). Final (background) renders never
+   * clear: their frame-to-frame carry is aligned by the real motion passes. */
+  if (path_trace_ && !params.background) {
+    /* NOTE: film/integrator modifications must NOT be part of this check:
+     * the per-frame seed and pixel-jitter updates tag the integrator modified
+     * on every playback frame, which would drop the history exactly when it
+     * is supposed to carry. */
+    const bool appearance_changed = scene->light_manager->need_update() ||
+                                    scene->shader_manager->need_update() ||
+                                    scene->image_manager->need_update() ||
+                                    scene->background->is_modified();
+    /* Playback re-syncs every shader that carries an animated value (classroom:
+     * one animated material node tree tagged light, shader and image managers on
+     * every frame), so this check dropped the history on every single frame of
+     * the very playback it was meant to smooth -- 197 of 210 evaluations came
+     * out with Reset=1. Animated appearance is continuous and the motion pass
+     * still aligns the history, so playback carries it; an appearance edit made
+     * while playing is then treated like one made mid-navigation. Restore the
+     * old behaviour with FALCON_DLSS_CLEAR_ON_PLAYBACK=1. */
+    static const bool clear_on_playback = getenv("FALCON_DLSS_CLEAR_ON_PLAYBACK") != nullptr;
+    if (appearance_changed && playback_ && !clear_on_playback) {
+      if (getenv("FALCON_DLSS_DEBUG")) {
+        fprintf(stderr, "[appearance] changed during playback -> history kept\n");
+      }
+    }
+    else if (appearance_changed) {
+      if (getenv("FALCON_DLSS_DEBUG")) {
+        fprintf(stderr,
+                "[appearance] light=%d shader=%d image=%d background=%d -> clear history\n",
+                int(scene->light_manager->need_update()),
+                int(scene->shader_manager->need_update()),
+                int(scene->image_manager->need_update()),
+                int(scene->background->is_modified()));
+      }
+      path_trace_->clear_denoiser_temporal_history();
+    }
+  }
 
   if (scene->update(progress)) {
     profiler.reset(scene->shaders.size(), scene->objects.size());
@@ -764,6 +910,23 @@ void Session::update_status_time(bool show_pause, bool show_done)
   else {
     substatus = status_append(substatus,
                               string_printf("Sample %d/%d", current_sample, num_samples));
+  }
+
+  /* DLSS-RR pre-roll. The frame is rendered several times over to fill the RR
+   * history before the pass that is kept, so the sample counter above visibly
+   * restarts and the render takes several times as long as its sample count
+   * suggests. Say so, or the extra passes look like the render being stuck --
+   * 作者 2026-09-06: "事前レンダリングができているのか判別しづらい". The same
+   * numbers go into the render result metadata (cycles.dlss.*) and the stderr
+   * trace, so all three agree. */
+  {
+    const int preroll_total = render_scheduler_.get_dlss_preroll_passes_total();
+    const int preroll_left = render_scheduler_.get_dlss_preroll_passes_left();
+    if (preroll_total > 0 && preroll_left > 0) {
+      substatus = status_append(
+          substatus,
+          string_printf("DLSS pre-roll %d/%d", preroll_total - preroll_left + 1, preroll_total));
+    }
   }
 
   /* Append any device-specific status (such as background kernel optimization) */

@@ -18,15 +18,20 @@
 #include "BLI_string.h"
 #include "BLI_utildefines.h"
 
+#include "BLT_translation.hh"
+
 #include "ED_screen.hh"
 
+#include "GPU_immediate.hh"
 #include "GPU_matrix.hh"
+#include "GPU_state.hh"
 
 #include "RNA_prototypes.hh"
 
 #include "SEQ_channels.hh"
 #include "SEQ_sequencer.hh"
 #include "SEQ_time.hh"
+#include "SEQ_transform.hh"
 
 #include "UI_interface.hh"
 #include "UI_resources.hh"
@@ -68,7 +73,7 @@ static float widget_y_offset(const SeqChannelDrawContext *context)
 
 static float channel_index_y_min(const SeqChannelDrawContext *context, const int index)
 {
-  float y = (index - context->draw_offset) * context->channel_height;
+  float y = (seq::channel_to_y(index) - context->draw_offset) * context->channel_height;
   y /= context->scale;
   return y;
 }
@@ -76,15 +81,33 @@ static float channel_index_y_min(const SeqChannelDrawContext *context, const int
 static void displayed_channel_range_get(const SeqChannelDrawContext *context,
                                         int r_channel_range[2])
 {
-  /* Channel 0 is not usable, so should never be drawn. */
-  r_channel_range[0] = max_ii(1, floor(context->timeline_region_v2d->cur.ymin));
-  r_channel_range[1] = ceil(context->timeline_region_v2d->cur.ymax);
+  const View2D *v2d = context->timeline_region_v2d;
+  if (seq::channel_flip_enabled()) {
+    /* With the flip, `cur.ymax` (the top of the view) is where the *smallest* channel numbers
+     * sit and `cur.ymin` (the bottom) is where the *largest* ones sit -- the opposite of the
+     * non-flipped case below. Mirror both which edge feeds which bound and the `-1`/`ceil`
+     * one-row margin (originally applied at the `ymax`/large-channel edge) so it still applies
+     * at the edge that now shows the smallest channel numbers. */
+    r_channel_range[0] = max_ii(1, seq::y_to_channel(v2d->cur.ymax) - 1);
+    r_channel_range[1] = seq::y_to_channel(v2d->cur.ymin);
+  }
+  else {
+    /* Channel 0 is not usable, so should never be drawn. */
+    r_channel_range[0] = max_ii(1, seq::y_to_channel(v2d->cur.ymin));
+    r_channel_range[1] = ceil(v2d->cur.ymax);
+  }
 
   rctf strip_boundbox;
   BLI_rctf_init(&strip_boundbox, 0.0f, 0.0f, 1.0f, r_channel_range[1]);
   seq::timeline_expand_boundbox(context->scene, context->seqbase, &strip_boundbox);
   CLAMP(r_channel_range[0], strip_boundbox.ymin, strip_boundbox.ymax);
   CLAMP(r_channel_range[1], strip_boundbox.ymin, seq::MAX_CHANNELS);
+
+  /* Falcon: no headers above the channels the timeline has. */
+  const int falcon_shown = seq::falcon_timeline_channels_shown(context->scene, context->seqbase);
+  if (falcon_shown) {
+    r_channel_range[1] = min_ii(r_channel_range[1], falcon_shown);
+  }
 }
 
 static std::string draw_channel_widget_tooltip(bContext * /*C*/,
@@ -297,6 +320,89 @@ static void draw_background()
   ui::theme::frame_buffer_clear(TH_BACK);
 }
 
+/**
+ * Falcon (2026-09-20): "-" / "+" for the number of channels the timeline shows, in a band at the
+ * top of the channel region, level with the time scrubbing area of the timeline (which covers the
+ * same rows on the right). Only drawn while the channel count is on (`FALCON_VSE_CHANNELS`).
+ */
+static void draw_channel_count_buttons(const SeqChannelDrawContext *context)
+{
+  const int shown = seq::falcon_timeline_channels_shown(context->scene, context->seqbase);
+  if (shown == 0) {
+    return;
+  }
+  const float band = UI_TIME_SCRUB_MARGIN_Y;
+  const float winx = context->region->winx;
+  const float winy = context->region->winy;
+  if (winy < band * 2.0f || winx < UI_UNIT_X * 3.0f) {
+    return;
+  }
+
+  GPU_matrix_push();
+  wmOrtho2_region_pixelspace(context->region);
+
+  /* Band background, so the rows scrolled below it do not show through. */
+  {
+    const uint pos = GPU_vertformat_attr_add(
+        immVertexFormat(), "pos", gpu::VertAttrType::SFLOAT_32_32);
+    immBindBuiltinProgram(GPU_SHADER_3D_UNIFORM_COLOR);
+    immUniformThemeColor(TH_BACK);
+    immRectf(pos, 0.0f, winy - band, winx, winy);
+    GPU_blend(GPU_BLEND_ALPHA);
+    immUniformThemeColor(TH_TIME_SCRUB_BACKGROUND);
+    immRectf(pos, 0.0f, winy - band, winx, winy);
+    GPU_blend(GPU_BLEND_NONE);
+    immUnbindProgram();
+  }
+
+  ui::Block *block = block_begin(context->C, context->region, __func__, ui::EmbossType::Emboss);
+  const int button = int(UI_UNIT_X);
+  const int y = int(winy - band + (band - button) / 2.0f);
+  int x = int(U.widget_unit * 0.3f);
+  block_align_begin(block);
+  uiDefIconButO(block,
+                ui::ButtonType::But,
+                "SEQUENCER_OT_channel_remove",
+                wm::OpCallContext::InvokeDefault,
+                ICON_REMOVE,
+                x,
+                y,
+                button,
+                button,
+                std::nullopt);
+  x += button;
+  uiDefIconButO(block,
+                ui::ButtonType::But,
+                "SEQUENCER_OT_channel_add",
+                wm::OpCallContext::InvokeDefault,
+                ICON_ADD,
+                x,
+                y,
+                button,
+                button,
+                std::nullopt);
+  block_align_end(block);
+  x += button + int(U.widget_unit * 0.3f);
+
+  char label[32];
+  SNPRINTF(label, "%d", shown);
+  uiDefBut(block,
+           ui::ButtonType::Label,
+           label,
+           x,
+           y,
+           max_ii(button, int(winx) - x),
+           button,
+           nullptr,
+           0,
+           0,
+           TIP_("Channels in the timeline"));
+
+  block_end(context->C, block);
+  block_draw(context->C, block);
+  GPU_matrix_pop();
+}
+
 void channel_draw_context_init(const bContext *C,
                                ARegion *region,
                                SeqChannelDrawContext *r_context)
@@ -345,6 +451,8 @@ void draw_channels(const bContext *C, ARegion *region)
   draw_channel_headers(&context);
 
   ui::view2d_view_restore(C);
+
+  draw_channel_count_buttons(&context);
 }
 
 }  // namespace blender::ed::vse

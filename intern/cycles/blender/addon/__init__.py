@@ -34,6 +34,7 @@ if "bpy" in locals():
         importlib.reload(maketx)
 
 import bpy
+import os
 
 from . import (
     engine,
@@ -43,7 +44,7 @@ from . import (
 
 class CyclesRender(bpy.types.RenderEngine):
     bl_idname = 'CYCLES'
-    bl_label = "Cycles"
+    bl_label = "F-Cycles"
     bl_use_eevee_viewport = True
     bl_use_preview = True
     bl_use_exclude_layers = True
@@ -54,11 +55,35 @@ class CyclesRender(bpy.types.RenderEngine):
         super().__init__(*args, **kwargs)
         self.session = None
 
+    # Falcon: bridge the SHARC UI properties (scene.cycles.falcon_sharc_*) to the
+    # FALCON_SHARC_* environment variables the C++/kernel reads. Only in the GUI --
+    # in headless (-b) we leave the env alone so the command-line env workflow is
+    # untouched. Must run before engine.create/reset/render so the sync and
+    # integrator device_update see the values.
+    def _falcon_sharc_env_sync(self, scene):
+        if bpy.app.background:
+            return
+        cscene = getattr(scene, "cycles", None)
+        if cscene is None:
+            return
+        mode = getattr(cscene, "falcon_sharc_mode", 'OFF')
+        if mode == 'OFF':
+            os.environ.pop("FALCON_SHARC_MODE", None)
+            return
+        os.environ["FALCON_SHARC_MODE"] = mode.lower()
+        os.environ["FALCON_SHARC_ALPHA"] = "%.4f" % getattr(cscene, "falcon_sharc_alpha", 0.7)
+        os.environ["FALCON_SHARC_KEEP"] = "%.4f" % getattr(cscene, "falcon_sharc_keep", 0.95)
+        os.environ["FALCON_SHARC_GATE"] = "1" if getattr(cscene, "falcon_sharc_gate", True) else "0"
+        cache = getattr(cscene, "falcon_sharc_cache", "")
+        if cache:
+            os.environ["FALCON_SHARC_CACHE"] = bpy.path.abspath(cache)
+
     def __del__(self):
         engine.free(self)
 
     # final render
     def update(self, data, depsgraph):
+        self._falcon_sharc_env_sync(depsgraph.scene)
         if not self.session:
             if self.is_preview:
                 cscene = bpy.context.scene.cycles
@@ -71,7 +96,13 @@ class CyclesRender(bpy.types.RenderEngine):
         engine.reset(self, data, depsgraph)
 
     def render(self, depsgraph):
+        self._falcon_sharc_env_sync(depsgraph.scene)
         engine.render(self, depsgraph)
+        # Falcon LT: 仕掛けがある時だけ、光子の層をこのレンダーの Combined へ
+        # 足す(operators.falcon_lt_render_result_add)。Python から Render
+        # Result を書けるのは、レンダー中のエンジンが持つ結果だけ。
+        from . import operators
+        operators.falcon_lt_render_result_add(self)
 
     def render_frame_finish(self):
         engine.render_frame_finish(self)
@@ -84,6 +115,7 @@ class CyclesRender(bpy.types.RenderEngine):
 
     # viewport render
     def view_update(self, context, depsgraph):
+        self._falcon_sharc_env_sync(context.scene)
         if not self.session:
             # When starting a new render session in viewport (by switching
             # viewport to Rendered shading) unpause the render. The way to think
@@ -135,12 +167,18 @@ classes = (
 cli_commands = []
 
 
+# Falcon が足した UI の言葉の訳は scripts/startup/falcon_i18n.py に 1 か所にまとめてある
+# (ソースは英語・日本語はそこで当てる。C++ の IFACE_/TIP_ もそこを引く)。
+
+
 def register():
     from bpy.utils import register_class
     from . import ui
     from . import operators
     from . import properties
     from . import presets
+    from . import falcon_interp
+    from . import falcon_plugins
     from .maketx import maketx_command
     import atexit
 
@@ -151,9 +189,12 @@ def register():
     engine.init()
 
     properties.register()
+    # Falcon plugin folder: connect before the panels and before the devices are first listed.
+    falcon_plugins.register()
     ui.register()
     operators.register()
     presets.register()
+    falcon_interp.register()
 
     for cls in classes:
         register_class(cls)
@@ -169,6 +210,8 @@ def unregister():
     from . import operators
     from . import properties
     from . import presets
+    from . import falcon_interp
+    from . import falcon_plugins
 
     bpy.app.handlers.version_update.remove(version_update.do_versions)
 
@@ -176,7 +219,9 @@ def unregister():
         bpy.utils.unregister_cli_command(cmd)
     cli_commands.clear()
 
+    falcon_interp.unregister()
     ui.unregister()
+    falcon_plugins.unregister()
     operators.unregister()
     properties.unregister()
     presets.unregister()

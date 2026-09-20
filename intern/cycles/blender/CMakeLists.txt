@@ -87,6 +87,10 @@ set(ADDON_FILES
   addon/engine.py
   addon/maketx.py
   addon/operators.py
+  addon/falcon_photon.py
+  addon/falcon_interp.py
+  addon/falcon_plugins.py
+  addon/falcon_range.py
   addon/osl.py
   addon/presets.py
   addon/properties.py

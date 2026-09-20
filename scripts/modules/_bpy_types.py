@@ -1620,10 +1620,13 @@ class HydraRenderEngine(RenderEngine):
         self.engine_ptr = None
 
     def __del__(self):
-        if hasattr(self, 'engine_ptr'):
-            if self.engine_ptr:
-                import _bpy_hydra
-                _bpy_hydra.engine_free(self.engine_ptr)
+        # Falcon 2026-09-15: RE_engine_free が __del__ を 2 回走らせる(1 回目は
+        # BPY_call_method_no_args・2 回目は subtype_dealloc の finalizer)ので、
+        # 先に engine_ptr を外して 2 回目を空にする(同じポインタの二重 delete で落ちていた)。
+        ptr = self.__dict__.pop('engine_ptr', None)
+        if ptr:
+            import _bpy_hydra
+            _bpy_hydra.engine_free(ptr)
 
     def get_render_settings(self, engine_type):
         """

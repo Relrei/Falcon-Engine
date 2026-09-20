@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include <atomic>
+
 namespace blender {
 
 struct ReportList;
@@ -85,6 +87,13 @@ void RENDER_OT_clear_texture_cache(wmOperatorType *ot);
 struct RenderJobBase {
   Scene *scene = nullptr;
   Scene *current_scene = nullptr;
+  /**
+   * Falcon: for animation renders, the number of the frame being rendered (1 = the first one)
+   * and the number of frames, shown next to the job name in the status bar
+   * (#ED_render_job_frame_info). 0 = not known. Written by the render thread.
+   */
+  std::atomic<int> falcon_frame_index{0};
+  std::atomic<int> falcon_frame_total{0};
 };
 
 /**

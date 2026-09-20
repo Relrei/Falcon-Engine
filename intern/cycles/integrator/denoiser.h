@@ -21,6 +21,8 @@ class GraphicsInteropDevice;
 class RenderBuffers;
 class Progress;
 
+bool use_dlss_denoiser(Device *denoiser_device, const DenoiseParams &params);
+
 bool use_optix_denoiser(Device *denoiser_device, const DenoiseParams &params);
 
 bool use_gpu_oidn_denoiser(Device *denoiser_device, const DenoiseParams &params);
@@ -57,6 +59,35 @@ class Denoiser {
 
   void set_params(const DenoiseParams &params);
   const DenoiseParams &get_params() const;
+
+  /* Drop any temporal history the denoiser carries (DLSS-RR). Called when the
+   * scene content changed (anything but the camera): motion vectors cannot
+   * explain such edits, so carried history would ghost the old content. */
+  virtual void clear_temporal_history() {}
+
+  /* The next denoise restarts the sample count without changing the frame (a
+   * DLSS-RR pre-roll pass), so the history is already aligned with it. */
+  virtual void set_same_frame_restart(bool /*same_frame_restart*/) {}
+
+  /* The denoise about to run belongs to a DLSS-RR pre-roll pass whose image is
+   * discarded. */
+  virtual void set_preroll_pass(bool /*preroll_pass*/) {}
+
+  /* Number of the frame the next denoise belongs to (the scene's current frame).
+   * DLSS-RR uses it to tell "a new frame" from "more samples on the same frame";
+   * counting samples alone is wrong once a time limit or adaptive sampling makes
+   * the per-frame sample count move up and down. */
+  virtual void set_frame(int /*frame*/) {}
+
+  /* Camera matrices for the frame being denoised, in the row-major left-multiply
+   * form NGX wants. DLSS-RR needs them to make sense of the specular hit
+   * distance, which is a world-space length. */
+  virtual void set_camera_matrices(const float * /*world_to_view*/,
+                                   const float * /*view_to_clip*/)
+  {
+  }
+
+  static bool is_device_supported(DenoiserType type, const DeviceInfo &denoise_device_info);
 
   /* Recommended type for viewport denoising. */
   static DenoiserType automatic_viewport_denoiser_type(const DeviceInfo &denoise_device_info);

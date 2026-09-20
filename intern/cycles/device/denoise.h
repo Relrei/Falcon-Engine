@@ -11,6 +11,7 @@ CCL_NAMESPACE_BEGIN
 enum DenoiserType {
   DENOISER_OPTIX = 2,
   DENOISER_OPENIMAGEDENOISE = 4,
+  DENOISER_DLSS = 8,
   DENOISER_NUM,
 
   DENOISER_NONE = 0,
@@ -31,6 +32,13 @@ enum DenoiserPass {
   DENOISER_PASS_DEPTH = 1 << 4,
   DENOISER_PASS_MOTION = 1 << 5,
   DENOISER_PASS_BACKWARD_MOTION = 1 << 6,
+  DENOISER_PASS_SPECULAR_MOTION = 1 << 7,
+  DENOISER_PASS_TRANSMISSION = 1 << 8,
+  DENOISER_PASS_SPECULAR_HIT_DISTANCE = 1 << 9,
+  /* Volume passes feed the ColorBeforeFog guide (FALCON_DLSS_LAYER_GUIDES). */
+  DENOISER_PASS_VOLUME = 1 << 10,
+  /* Emission pass feeds RR's GBuffer_Emissive (FALCON_DLSS_EMISSIVE_GUIDE). */
+  DENOISER_PASS_EMISSION = 1 << 11,
 };
 
 using DenoiserPassMask = int;
@@ -87,6 +95,28 @@ class DenoiseParams : public Node {
   DenoiserPrefilter prefilter = DENOISER_PREFILTER_FAST;
   DenoiserQuality quality = DENOISER_QUALITY_HIGH;
   float upscale_factor = 1.0f;
+
+  /* DLSS-RR: carry the temporal history across restarts, aligning it with the
+   * motion vectors. Final renders carry across animation frames; the viewport
+   * carries across navigation restarts using the interactive motion passes. */
+  bool carry_history = false;
+
+  /* DLSS-RR: how many times the first frame of an animation is re-rendered into
+   * the same history before the kept pass. Only independent estimates of the
+   * frame grow the history, so the opening frame needs them made on purpose. */
+  int preroll_passes = 4;
+
+  /* DLSS-RR: the same, for the first frame after a cut (the history was thrown
+   * away there too, but the scene is already loaded and the shot is usually
+   * shorter, so it may want a different count). 0 = use preroll_passes. */
+  int preroll_passes_cut = 0;
+
+  /* DLSS-RR: warm the history up on the frame that opens a cut (a timeline
+   * marker bound to another camera) instead of handing RR a one-evaluation-deep
+   * history. Only final renders set this -- the viewport resets constantly and
+   * would pay the cost on every navigation step. Off by default in the struct
+   * so a DenoiseParams that nobody filled in cannot switch it on. */
+  bool cut_warmup = false;
 
   static const NodeEnum *get_type_enum();
   static const NodeEnum *get_prefilter_enum();

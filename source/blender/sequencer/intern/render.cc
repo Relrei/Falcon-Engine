@@ -21,6 +21,9 @@
 #include "BLI_math_matrix.hh"
 #include "BLI_path_utils.hh"
 #include "BLI_rect.h"
+#include "BLI_string.h"
+#include "BLI_task.h"
+#include "BLI_threads.h"
 #include "BLI_task.hh"
 
 #include "BKE_anim_data.hh"
@@ -83,6 +86,13 @@
 #include "utils.hh"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <set>
+#include <string>
+#include <utility>
 
 namespace blender::seq {
 
@@ -598,6 +608,30 @@ static void multiply_ibuf(ImBuf *ibuf, const float fmul, const bool multiply_alp
   }
 }
 
+/* When the strip's source image is going to be scaled down for this render (preview resolution
+ * lower than 100%, or the source is larger than the output canvas), apply the strip's modifier
+ * stack *after* scaling down instead of before. Modifier CPU cost is per-pixel of the image they
+ * run on, and does not otherwise depend on output resolution, so running them on the source image
+ * (which #input_preprocess always did, historically) means lowering preview resolution does not
+ * make modifiers any cheaper (measured: 480x270 and 3840x2160 output cost the same ~400ms for a
+ * 5-modifier stack on a 1920x1080 source, see an internal measurement (2026-08-30)). Scaling first fixes
+ * this (25% output ~= 1/16th the pixels of the source ~= 1/16th the modifier cost).
+ *
+ * Disabled with `FALCON_VSE_MODIFIER_AFTER_SCALE=0`, which restores the original order
+ * unconditionally (also see the `would_downscale` / final-render guard around the call site,
+ * which never takes this path for a full-quality/100% final render). */
+static bool vse_modifier_scale_before_apply_enabled()
+{
+  static const bool enabled = [] {
+    const char *env = getenv("FALCON_VSE_MODIFIER_AFTER_SCALE");
+    if (env == nullptr || env[0] == '\0') {
+      return true;
+    }
+    return atoi(env) != 0;
+  }();
+  return enabled;
+}
+
 static SeqResult input_preprocess(const RenderData *context,
                                   SeqRenderState *state,
                                   Strip *strip,
@@ -662,30 +696,117 @@ static SeqResult input_preprocess(const RenderData *context,
   const bool do_scale_to_render_size = seq_need_scale_to_render_size(strip, is_proxy_image);
   const float image_scale_factor = do_scale_to_render_size ? preview_scale_factor : 1.0f;
 
-  if (strip->modifiers.first) {
-    result.image = IMB_makeSingleUser(result.image);
+  /* Whether the crop/transform/scale-to-canvas step below would run at all, evaluated *before*
+   * modifiers run. Only used below to decide `scale_before_modifiers`; the actual decision of
+   * whether to run the transform block itself is re-evaluated fresh after modifiers run (a
+   * modifier -- namely the "Compositor" one -- can add to `result.translation`, which the
+   * original code order already accounted for by checking this condition post-modifier). */
+  const bool need_transform_pre_modifiers = sequencer_use_crop(strip) ||
+                                            sequencer_use_transform(strip) ||
+                                            context->rectx != result.image->x ||
+                                            context->recty != result.image->y ||
+                                            (strip->is_effect() && image_scale_factor != 1.0f) ||
+                                            result.translation != float2(0, 0);
+
+  /* Whether that transform is actually scaling the image down (lower preview/output
+   * resolution than 100%, or a source larger than the output canvas). This is the only case
+   * #vse_modifier_scale_before_apply_enabled() changes anything for; a full-quality/100% final
+   * render of media at or below the project resolution always keeps the original order below,
+   * so its output is bit-for-bit unchanged. */
+  const bool would_downscale = image_scale_factor < 1.0f ||
+                               (int64_t(result.image->x) * int64_t(result.image->y) >
+                                int64_t(context->rectx) * int64_t(context->recty));
+
+  const bool scale_before_modifiers = strip->modifiers.first != nullptr &&
+                                      need_transform_pre_modifiers && would_downscale &&
+                                      vse_modifier_scale_before_apply_enabled();
+
+  if (scale_before_modifiers) {
+    /* NOTE: scaling first and then color-correcting is not bit-identical to color-correcting
+     * the full-res image and then scaling it down -- the two operations don't commute when
+     * the color transform is non-linear (contrast, curves, tonemap, ...) or when the scale
+     * filter mixes neighbouring pixels (any resize that isn't nearest-neighbour). This is only
+     * taken for preview-resolution renders (see `would_downscale` above), where the difference
+     * is not visible in practice; measured maxdiff / mean-diff / off-by->1-in-255 pixel counts
+     * are recorded in an internal measurement (2026-08-30) together with this change. */
+    PRF_scope_with_name("SeqStripTransform", ProfileCategory::Draw);
+
+    const int x = context->rectx;
+    const int y = context->recty;
+    ImBuf *transformed_ibuf = IMB_allocImBuf(
+        x, y, result.image->float_data() ? ImBufFlags::FloatData : ImBufFlags::ByteData);
+
     float3x3 matrix = calc_strip_transform_matrix(scene,
                                                   strip,
                                                   int2(result.image->x, result.image->y),
                                                   int2(context->rectx, context->recty),
                                                   image_scale_factor,
                                                   preview_scale_factor);
-    float3x3 matrix_comp = calc_strip_transform_matrix(
-        scene, strip, int2(0), int2(0), image_scale_factor, preview_scale_factor);
-    matrix_comp = math::invert(matrix_comp);
+    matrix *= math::from_location<float3x3>(result.translation);
+    matrix = math::invert(matrix);
+    sequencer_preprocess_transform_crop(result.image,
+                                        transformed_ibuf,
+                                        context,
+                                        strip,
+                                        matrix,
+                                        !do_scale_to_render_size,
+                                        preview_scale_factor);
+    transformed_ibuf->byte_buffer.colorspace = result.image->byte_buffer.colorspace;
+    transformed_ibuf->float_buffer.colorspace = result.image->float_buffer.colorspace;
+    IMB_metadata_copy(transformed_ibuf, result.image);
+    IMB_freeImBuf(result.image);
+    result.image = transformed_ibuf;
+    result.translation = float2(0, 0);
+  }
+
+  if (strip->modifiers.first) {
+    result.image = IMB_makeSingleUser(result.image);
+    float3x3 matrix, matrix_comp;
+    if (scale_before_modifiers) {
+      /* The image has already been placed at its final position on the full render-area
+       * canvas, so the strip-local-to-render-area mapping (used only to sample modifier masks)
+       * is the identity. */
+      matrix = float3x3::identity();
+      matrix_comp = float3x3::identity();
+    }
+    else {
+      matrix = calc_strip_transform_matrix(scene,
+                                           strip,
+                                           int2(result.image->x, result.image->y),
+                                           int2(context->rectx, context->recty),
+                                           image_scale_factor,
+                                           preview_scale_factor);
+      matrix_comp = calc_strip_transform_matrix(
+          scene, strip, int2(0), int2(0), image_scale_factor, preview_scale_factor);
+      matrix_comp = math::invert(matrix_comp);
+    }
     ModifierApplyContext mod_context(
         *context, *state, *strip, matrix, matrix_comp, timeline_frame, result);
     modifier_apply_stack(mod_context);
   }
 
-  /* After everything above is done but before transform is applied,
-   * remember whether the image was opaque. */
+  /* Remember whether the image was opaque (used for occlusion culling), evaluated right after
+   * modifiers run -- same relative position as the original single-block code when
+   * `scale_before_modifiers` is false, so identical result there (some modifiers, e.g. "Mask",
+   * change whether the image can contain alpha). When `scale_before_modifiers` is true the
+   * transform has already happened above, so this can also reflect any transparent padding it
+   * introduced; that only makes this flag *more* conservative (never wrongly reports opaque),
+   * which is safe for the occlusion-culling optimisation this feeds. */
   result.is_opaque_before_transform = !result.image->can_contain_alpha();
 
-  if (sequencer_use_crop(strip) || sequencer_use_transform(strip) ||
-      context->rectx != result.image->x || context->recty != result.image->y ||
-      (strip->is_effect() && image_scale_factor != 1.0f) || result.translation != float2(0, 0))
-  {
+  /* Re-evaluated fresh (post-modifier), exactly like the original single-block code did --
+   * modifiers can change `result.image` size and/or `result.translation` (the "Compositor"
+   * modifier adds to the latter). When `scale_before_modifiers` was true, the transform has
+   * already happened above and this is skipped. */
+  const bool need_transform_post_modifiers = !scale_before_modifiers &&
+                                             (sequencer_use_crop(strip) ||
+                                              sequencer_use_transform(strip) ||
+                                              context->rectx != result.image->x ||
+                                              context->recty != result.image->y ||
+                                              (strip->is_effect() && image_scale_factor != 1.0f) ||
+                                              result.translation != float2(0, 0));
+
+  if (need_transform_post_modifiers) {
     PRF_scope_with_name("SeqStripTransform", ProfileCategory::Draw);
 
     const int x = context->rectx;
@@ -948,12 +1069,377 @@ static ImBuf *create_missing_media_image(const RenderData *context, int width, i
   return ibuf;
 }
 
+/* -------------------------------------------------------------------- */
+/** \name Image strip source read-ahead (BL_VSE_PREFETCH_N)
+ *
+ * Speculative background decode of the next N timeline frames of an
+ * IMAGE strip, so that by the time the sequencer actually asks for them
+ * the pixels are already sitting in `source_image_cache`. Only runs while
+ * rendering (F12 / Ctrl+F12 / `-b`, i.e. `RenderData::render` is set), never
+ * for the UI preview, playback or Blender's own sequencer Prefetch job, which
+ * then behave exactly like stock Blender. N=8 by default; `BL_VSE_PREFETCH_N=0`
+ * turns it off, in which case it costs a single cached integer compare on the
+ * hot path and nothing else. See vse_prefetch_n_get() for the measurements.
+ *
+ * This intentionally only covers the plain (non multi-view) IMAGE strip
+ * path: it mirrors `seq_render_image_strip_view()`'s single-file branch
+ * (same `IMBufFlags` and colorspace argument), not the multi-view/stereo
+ * branch of `seq_render_image_strip()`. Multi-view strips are skipped.
+ *
+ * KNOWN PITFALL: prefetched frames land in the *same* `source_image_cache`
+ * as everything else, sized from `U.memcachelimit`. If that cache is
+ * already full, `evict_caches_if_full()` (`strip_relations.cc`) can throw
+ * a just-prefetched frame back out before anything ever reads it -- in
+ * that situation read-ahead is wasted work rather than a bug, worth
+ * knowing before concluding it "isn't helping".
+ * \{ */
+
+namespace {
+
+/** Bookkeeping shared by every read-ahead dispatch call. Guarded by its
+ * own mutex; deliberately independent of `seq_render_mutex` and
+ * `intra_frame_cache`, which this feature must not touch. */
+struct PrefetchState {
+  std::mutex mutex;
+  /** (strip, timeline_frame) pairs currently queued or running, so two
+   * callers never dispatch a decode of the same frame twice. */
+  std::set<std::pair<const Strip *, int>> in_flight;
+  std::atomic<uint64_t> hits{0};
+  std::atomic<uint64_t> misses{0};
+  std::atomic<uint64_t> dispatched{0};
+  std::atomic<uint64_t> loaded{0};
+  std::atomic<uint64_t> failed{0};
+};
+
+struct PrefetchTaskData {
+  /* Copied by value at dispatch time (same idiom `do_render_strip_uncached()`
+   * already uses for `RenderData local_context = *context;` above). The
+   * worker thread only reads `context.scene`/`context.view_id` etc. through
+   * `source_image_cache_put()`, never touches GPU/depsgraph fields. */
+  RenderData context;
+  const Strip *strip = nullptr;
+  int timeline_frame = 0;
+  std::string filepath;
+  char colorspace[IM_MAX_SPACE] = "";
+  ImBufFlags flag = ImBufFlags::Zero;
+};
+
+}  // namespace
+
+static int vse_prefetch_n_get()
+{
+  /* Function-local statics are initialized exactly once, thread-safely,
+   * by the C++11 standard (guarded by a compiler-generated one-time lock
+   * on first use only) -- no extra mutex of our own needed here. */
+  static const int n = [] {
+    /* Default 8, `BL_VSE_PREFETCH_N=0` turns it off.
+     *
+     * With N=8 rendering a 1080p PNG image-strip timeline went
+     * 52.2 -> 9.40 ms/frame (5.6x, measured 2026-08-30 in `-b`).
+     *
+     * It is limited to renders (see seq_prefetch_dispatch_readahead()) because
+     * in the UI, with Blender's Prefetch on (its default), the two read-aheads
+     * stack up: the Prefetch job's renders dispatch read-ahead too, 300 PNG
+     * frames were decoded about 1,100-1,300 times, `Memory:` swung by
+     * 200-300 MB and every frame change waited in editing_free() ->
+     * vse_prefetch_wait_all() for the queue to drain (the UI froze for 3-7 s
+     * right after opening a file; (internal notes)). Playing 4 PNG
+     * sequences used 302-352% CPU against 106-117% for stock 5.2.1 at the same
+     * displayed frame rate: during playback frames are skipped, so the next
+     * N frames are mostly never shown ((internal notes)). */
+    const char *env = getenv("BL_VSE_PREFETCH_N");
+    const int requested = (env == nullptr) ? 8 : std::clamp(atoi(env), 0, 8);
+    if (requested == 0) {
+      return 0;
+    }
+    /* Read-ahead needs a worker thread that is not the one asking for the
+     * frame. With a single-threaded Blender (`blender -t 1`, as used by
+     * render farms and by our own measurement harness) the background task
+     * pool has no worker to run the dispatched decode, and the
+     * BLI_task_pool_work_and_wait() in vse_prefetch_wait_all() then blocks
+     * forever at teardown. Measured 2026-08-31 with BL_VSE_PREFETCH_N=8:
+     * `-t 1` hung past 150 s with all 30 frames already written, while the
+     * default thread count (11 s) and `-t 2` (13 s) both finished; the same
+     * `-t 1` run with the read-ahead off took 14 s. Reading ahead has
+     * nothing to gain on a single thread anyway, so turn it off here rather
+     * than deadlock -- including when it was asked for explicitly. */
+    if (BLI_system_thread_count() < 2) {
+      return 0;
+    }
+    return requested;
+  }();
+  return n;
+}
+
+static PrefetchState &vse_prefetch_state()
+{
+  static PrefetchState state;
+  return state;
+}
+
+static TaskPool *vse_prefetch_pool()
+{
+  /* Process-lifetime task pool, created once and never freed.
+   *
+   * With TBB available (the normal build config for this fork),
+   * `BLI_task_pool_create_background()` collapses to a `TASK_POOL_TBB`
+   * pool internally (see `task_pool.cc`): work items run on Blender's
+   * own shared TBB worker threads, not on a thread we spawned ourselves.
+   * The `TaskPool` destructor for that pool type is a no-op -- and since
+   * we only ever leak the raw pointer (never call `BLI_task_pool_free()`),
+   * that destructor never runs at all, so we never hit the
+   * "task_group destroyed with pending tasks" case. At process exit the
+   * OS reclaims this ~40 byte singleton exactly like it would any other
+   * Meyers singleton; no dangling OS thread is left behind because we
+   * never created one. */
+  static TaskPool *pool = BLI_task_pool_create_background(nullptr, TASK_PRIORITY_LOW);
+  return pool;
+}
+
+void vse_prefetch_wait_all()
+{
+  /* BL_VSE_PREFETCH_N=0, or nothing rendered yet (the UI never dispatches):
+   * nothing was ever dispatched, and vse_prefetch_pool()'s singleton was
+   * never even constructed. Bail out rather than constructing the
+   * (otherwise idle) TaskPool/tbb::task_group here just to immediately wait
+   * on an empty one -- this must cost nothing when nothing was read ahead. */
+  if (vse_prefetch_n_get() == 0 ||
+      vse_prefetch_state().dispatched.load(std::memory_order_relaxed) == 0)
+  {
+    return;
+  }
+  /* Previously this pool's tasks were deliberately never waited on (see
+   * the leak-by-design comment above): at process exit that's harmless,
+   * but at *scene* teardown (editing_free() -> source_image_cache_destroy())
+   * it is not -- a still-running task's vse_prefetch_task_run() calls
+   * source_image_cache_put(), which touches scene->ed->runtime->
+   * source_image_cache under source_image_cache_mutex. If that destroy
+   * call frees the Scene (and the cache) out from under a task still in
+   * flight, the task's mutex-protected access races a genuine
+   * use-after-free -- the mutex only serializes the two sides, it does
+   * not stop the Scene itself from having already been freed. This is
+   * the source of the ~1-in-4 SIGSEGV-at-shutdown seen with
+   * BL_VSE_PREFETCH_N=16 before this fix.
+   *
+   * BLI_task_pool_work_and_wait() on this pool resolves to
+   * TaskPool::tbb_task_pool_work_and_wait() -> tbb_group->wait(), which
+   * blocks until every task currently queued/running in the group has
+   * completed, without destroying the group -- so the same process-
+   * lifetime singleton can keep accepting work afterwards (e.g. after a
+   * new file is loaded). Safe to call with zero in-flight tasks: an idle
+   * tbb::task_group::wait() returns immediately. */
+  BLI_task_pool_work_and_wait(vse_prefetch_pool());
+}
+
+void vse_prefetch_wait_for_strip(const Strip *strip)
+{
+  /* Same cheap bail-out as vse_prefetch_wait_all(): nothing was ever
+   * dispatched, so there is nothing to drain. */
+  if (vse_prefetch_n_get() == 0) {
+    return;
+  }
+
+  PrefetchState &state = vse_prefetch_state();
+  if (state.dispatched.load(std::memory_order_relaxed) == 0) {
+    return;
+  }
+  {
+    /* Only the (strip, frame) *keys* are inspected here, never the Strip
+     * itself -- the caller is about to free it, so `strip` must not be
+     * dereferenced on this side either. Pointer identity (it is still a
+     * key in `in_flight` iff a task holding the same pointer was
+     * dispatched and has not finished/erased its entry yet) is all that
+     * is needed. */
+    std::lock_guard<std::mutex> lock(state.mutex);
+    bool in_flight_for_strip = false;
+    for (const auto &key : state.in_flight) {
+      if (key.first == strip) {
+        in_flight_for_strip = true;
+        break;
+      }
+    }
+    if (!in_flight_for_strip) {
+      /* Common case: no read-ahead task is currently touching this
+       * strip. Nothing to drain -- callers on the strip-editing hot
+       * path (trim, move, add) pay only this one mutex-guarded lookup. */
+      return;
+    }
+  }
+
+  /* At least one dispatched task still holds `strip` and has not yet
+   * called source_image_cache_put() (which reads `strip->start`) or
+   * erased its `in_flight` entry. Drain the whole pool -- at most
+   * BL_VSE_PREFETCH_N (<= 8) tasks can ever be in flight at once, so
+   * this is bounded and, in the vast majority of calls (the early-out
+   * above), never even reached. Safe to call from the strip-free path:
+   * source_image_cache_put() only ever reads `strip`/`scene`, and the
+   * caller has not freed `strip` yet at this point. */
+  BLI_task_pool_work_and_wait(vse_prefetch_pool());
+}
+
+/* Env-gated counters printed every 64 dispatches, same house style as
+ * `falcon_vse_log()` in `render/intern/pipeline.cc` (kept local here since
+ * that helper is `static` to its own translation unit). Only prints
+ * anything when `BL_VSE_PREFETCH_N` is actually enabled. */
+static void vse_prefetch_log_if_due(const PrefetchState &state)
+{
+  const uint64_t d = state.dispatched.load(std::memory_order_relaxed);
+  if (d == 0 || d % 64 != 0) {
+    return;
+  }
+  printf("FVSE_PREFETCH hits=%llu misses=%llu dispatched=%llu loaded=%llu failed=%llu\n",
+        (unsigned long long)state.hits.load(std::memory_order_relaxed),
+        (unsigned long long)state.misses.load(std::memory_order_relaxed),
+        (unsigned long long)d,
+        (unsigned long long)state.loaded.load(std::memory_order_relaxed),
+        (unsigned long long)state.failed.load(std::memory_order_relaxed));
+  fflush(stdout);
+}
+
+static void vse_prefetch_task_run(TaskPool * /*pool*/, void *taskdata)
+{
+  PrefetchTaskData *data = static_cast<PrefetchTaskData *>(taskdata);
+  PrefetchState &state = vse_prefetch_state();
+
+  /* Same decode call `seq_render_image_strip_view()` makes for the
+   * single-file (non multi-view) case, with the same flags/colorspace
+   * captured from the main thread at dispatch time. `IMB_load_image_from_
+   * filepath()` is confirmed thread-safe (task brief); nothing in
+   * `imbuf/` is touched or modified here. */
+  ImBuf *ibuf = IMB_load_image_from_filepath(
+      data->filepath.c_str(), data->flag, data->colorspace);
+
+  if (ibuf != nullptr) {
+    convert_multilayer_ibuf(ibuf);
+    if (ibuf->float_data() != nullptr && ibuf->byte_data() != nullptr) {
+      IMB_free_byte_pixels(ibuf);
+    }
+
+    SeqResult result;
+    result.image = ibuf;
+    /* source_image_cache_put() takes its own reference internally and
+     * does its own locking (source_image_cache.cc:29 `source_image_cache_
+     * mutex`); we still own and must free our local reference below. */
+    source_image_cache_put(&data->context, data->strip, float(data->timeline_frame), result);
+    IMB_freeImBuf(ibuf);
+    state.loaded.fetch_add(1, std::memory_order_relaxed);
+  }
+  else {
+    /* Speculative read-ahead: a miss here (missing/unreadable file) is
+     * quietly discarded. Never raises an error, never touches anything
+     * that could stall or cancel the real render. */
+    state.failed.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.in_flight.erase({data->strip, data->timeline_frame});
+  }
+  vse_prefetch_log_if_due(state);
+}
+
+static void vse_prefetch_task_free(TaskPool * /*pool*/, void *taskdata)
+{
+  MEM_delete(static_cast<PrefetchTaskData *>(taskdata));
+}
+
+/**
+ * Kick off speculative background decodes for the next
+ * `BL_VSE_PREFETCH_N` timeline frames of an IMAGE strip. Does not block;
+ * does not wait for anything; a frame that is not ready yet when actually
+ * requested is simply decoded synchronously as before -- read-ahead only
+ * ever helps, it is never on the critical path.
+ */
+static void seq_prefetch_dispatch_readahead(const RenderData *context,
+                                             Strip *strip,
+                                             int timeline_frame)
+{
+  const int n = vse_prefetch_n_get();
+  if (n == 0) {
+    return;
+  }
+  /* Renders only: the UI preview, playback and Blender's sequencer Prefetch
+   * job pass no Render (`render_new_render_data(..., nullptr, ...)`). */
+  if (context->render == nullptr) {
+    return;
+  }
+  if (strip->type != STRIP_TYPE_IMAGE || context->skip_cache) {
+    return;
+  }
+
+  PrefetchState &state = vse_prefetch_state();
+
+  for (int i = 1; i <= n; i++) {
+    const int frame = timeline_frame + i;
+
+    StripElem *s_elem = render_give_stripelem(context->scene, strip, frame);
+    if (s_elem == nullptr) {
+      /* Past the end of the strip (or similar) -- nothing to prefetch. */
+      continue;
+    }
+
+    SeqResult cached = source_image_cache_get(context, strip, float(frame));
+    if (cached.is_valid()) {
+      IMB_freeImBuf(cached.image); /* _get() hands back an owning reference. */
+      state.hits.fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
+    state.misses.fetch_add(1, std::memory_order_relaxed);
+
+    char filepath[FILE_MAX];
+    char prefix[FILE_MAX];
+    const char *ext = nullptr;
+    BLI_path_join(filepath, sizeof(filepath), strip->data->dirpath, s_elem->filename);
+    BLI_path_abs(filepath, ID_BLEND_PATH_FROM_GLOBAL(&context->scene->id));
+
+    const int totfiles = seq_num_files(context->scene, strip->views_format, true);
+    if (seq_image_strip_is_multiview_render(
+            context->scene, strip, totfiles, filepath, prefix, ext))
+    {
+      /* Multi-view read-ahead is out of scope for this pass; let the
+       * normal synchronous path handle it when actually requested. */
+      continue;
+    }
+
+    const std::pair<const Strip *, int> key{strip, frame};
+    {
+      std::lock_guard<std::mutex> lock(state.mutex);
+      if (state.in_flight.count(key) != 0) {
+        continue;
+      }
+      state.in_flight.insert(key);
+    }
+
+    PrefetchTaskData *data = MEM_new<PrefetchTaskData>(__func__);
+    data->context = *context;
+    data->strip = strip;
+    data->timeline_frame = frame;
+    data->filepath = filepath;
+    STRNCPY(data->colorspace, strip->data->colorspace_settings.name);
+    data->flag = ImBufFlags::ByteData | ImBufFlags::Metadata | ImBufFlags::MultiLayer;
+    if (strip->alpha_mode == SEQ_ALPHA_PREMUL) {
+      data->flag |= ImBufFlags::AlphaPremul;
+    }
+
+    state.dispatched.fetch_add(1, std::memory_order_relaxed);
+    BLI_task_pool_push(
+        vse_prefetch_pool(), vse_prefetch_task_run, data, true, vse_prefetch_task_free);
+  }
+}
+
+/** \} */
+
 static ImBuf *seq_render_image_strip(const RenderData *context,
                                      Strip *strip,
                                      int timeline_frame,
                                      bool *r_is_proxy_image)
 {
   PRF_scope_with_name("SeqRenderImage", ProfileCategory::Draw);
+
+  /* Speculative background read-ahead for the next BL_VSE_PREFETCH_N
+   * frames (renders only, see block above). Does not affect or block what
+   * follows. */
+  seq_prefetch_dispatch_readahead(context, strip, timeline_frame);
 
   char filepath[FILE_MAX];
   const char *ext = nullptr;

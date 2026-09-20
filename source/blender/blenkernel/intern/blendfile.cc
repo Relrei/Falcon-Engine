@@ -58,6 +58,7 @@
 #include "BKE_main.hh"
 #include "BKE_main_idmap.hh"
 #include "BKE_main_namemap.hh"
+#include "BKE_mem_reclaim.hh"
 #include "BKE_preferences.h"
 #include "BKE_report.hh"
 #include "BKE_scene.hh"
@@ -1301,6 +1302,14 @@ static void setup_app_data(bContext *C,
     }
     FOREACH_MAIN_ID_END;
     reports->count.missing_linked_id = missing_linked_ids_num;
+  }
+
+  /* Falcon: the old file is gone by now (including every render result freed
+   * above), so this is the other coarse boundary where the allocator can give
+   * its buffers back. Skipped for undo, which is not coarse at all.
+   * `FALCON_MEM_RECLAIM=0` to skip. */
+  if (mode != LOAD_UNDO) {
+    blender::bke::mem_reclaim_to_os("file-read");
   }
 }
 

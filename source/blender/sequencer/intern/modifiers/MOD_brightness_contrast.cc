@@ -7,6 +7,8 @@
  */
 
 #include <cfloat>
+#include <cmath>
+#include <type_traits>
 
 #include "BLI_math_base.h"
 #include "BLI_math_vector.hh"
@@ -24,6 +26,7 @@
 #include "UI_interface_layout.hh"
 
 #include "modifier.hh"
+#include "brightcontrast_cpu.hh"
 #include "render.hh"
 
 namespace blender::seq {
@@ -31,11 +34,26 @@ namespace blender::seq {
 struct BrightContrastApplyOp {
   float mul;
   float add;
+  uchar byte_table[256];
+  bool optimized = false;
 
   template<typename ImageT, typename MaskSampler>
   void apply(ImageT *image, MaskSampler &mask, int image_x, IndexRange y_range)
   {
     image += y_range.first() * image_x * 4;
+    if constexpr (std::is_same_v<MaskSampler, MaskSamplerNone>) {
+      if (this->optimized) {
+        const size_t count = size_t(image_x) * y_range.size();
+        if constexpr (std::is_same_v<ImageT, uchar>) {
+          brightcontrast_cpu::apply_bytes(image, count, this->byte_table);
+          return;
+        }
+        else if (brightcontrast_cpu::mode() != brightcontrast_cpu::Mode::Auto) {
+          brightcontrast_cpu::float_kernel()(image, count, this->mul, this->add);
+          return;
+        }
+      }
+    }
     for (int64_t y : y_range) {
       mask.begin_row(y);
       for ([[maybe_unused]] int64_t x : IndexRange(image_x)) {
@@ -83,6 +101,11 @@ static void brightcontrast_apply(ModifierApplyContext &context, StripModifierDat
     op.add = op.mul * brightness + delta;
   }
 
+  op.optimized = mask == nullptr && std::isfinite(op.mul) && std::isfinite(op.add) &&
+                 brightcontrast_cpu::mode() != brightcontrast_cpu::Mode::Reference;
+  if (op.optimized && context.result.image && context.result.image->byte_data()) {
+    brightcontrast_cpu::make_byte_table(op.mul, op.add, op.byte_table);
+  }
   apply_modifier_op(op, context.result.image, mask, context.transform);
   if (mask != nullptr) {
     IMB_freeImBuf(mask);

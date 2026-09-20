@@ -1972,7 +1972,7 @@ static wmOperatorStatus sequencer_split_invoke(bContext *C, wmOperator *op, cons
         return OPERATOR_CANCELLED;
       }
     }
-    RNA_int_set(op->ptr, "channel", mouseloc[1]);
+    RNA_int_set(op->ptr, "channel", seq::y_to_channel(mouseloc[1]));
   }
   RNA_int_set(op->ptr, "frame", split_frame);
   RNA_enum_set(op->ptr, "side", split_side);
@@ -2223,7 +2223,8 @@ static wmOperatorStatus sequencer_box_blade_exec(bContext *C, wmOperator *op)
 
       /* Ripple strips for all channels that the blade box extends to, so that the user can
        * optionally affect other channels than those with strips to cut. */
-      if (strip->channel <= int(box_rect.ymax) && strip->channel >= int(box_rect.ymin) &&
+      if (strip->channel <= seq::y_to_channel(box_rect.ymax) &&
+          strip->channel >= seq::y_to_channel(box_rect.ymin) &&
           (strip->left_handle() > rect_frames[0]))
       {
         if (ignore_connections) {

@@ -11,6 +11,10 @@
 #include "blender/sync.h"
 #include "blender/util.h"
 
+#ifdef WITH_DLSS
+#  include "integrator/denoiser_dlss.h"
+#endif
+
 #include "session/denoising.h"
 #include "session/merge.h"
 
@@ -406,6 +410,67 @@ static PyObject *sync_func(PyObject * /*self*/, PyObject *args)
   Py_RETURN_NONE;
 }
 
+/* Falcon plugin folders (see `addon/falcon_plugins.py`): directories where NGX also looks for the
+ * DLSS runtime. Accepted and ignored in builds without DLSS, so the add-on does not need to care. */
+static PyObject *set_falcon_plugin_paths_func(PyObject * /*self*/, PyObject *arg)
+{
+  PyObject *seq = PySequence_Fast(arg, "expected a sequence of paths");
+  if (seq == nullptr) {
+    return nullptr;
+  }
+  vector<string> paths;
+  const Py_ssize_t num = PySequence_Fast_GET_SIZE(seq);
+  for (Py_ssize_t i = 0; i < num; i++) {
+    const char *path = PyUnicode_AsUTF8(PySequence_Fast_GET_ITEM(seq, i));
+    if (path == nullptr) {
+      Py_DECREF(seq);
+      return nullptr;
+    }
+    paths.push_back(path);
+  }
+  Py_DECREF(seq);
+#ifdef WITH_DLSS
+  DLSSDenoiser::set_plugin_paths(paths);
+#endif
+  Py_RETURN_NONE;
+}
+
+/* Falcon: DLSS turned on or off by the DLSS add-on (see `addon/falcon_plugins.py`). Accepted and
+ * ignored in builds without DLSS. */
+static PyObject *set_dlss_enabled_func(PyObject * /*self*/, PyObject *arg)
+{
+  const int enabled = PyObject_IsTrue(arg);
+  if (enabled == -1) {
+    return nullptr;
+  }
+#ifdef WITH_DLSS
+  DLSSDenoiser::set_enabled(enabled != 0);
+#endif
+  Py_RETURN_NONE;
+}
+
+static PyObject *get_dlss_enabled_func(PyObject * /*self*/, PyObject * /*args*/)
+{
+#ifdef WITH_DLSS
+  return PyBool_FromLong(DLSSDenoiser::get_enabled());
+#else
+  Py_RETURN_FALSE;
+#endif
+}
+
+static PyObject *get_falcon_plugin_paths_func(PyObject * /*self*/, PyObject * /*args*/)
+{
+  vector<string> paths;
+#ifdef WITH_DLSS
+  paths = DLSSDenoiser::get_plugin_paths();
+#endif
+  PyObject *ret = PyList_New(paths.size());
+  for (size_t i = 0; i < paths.size(); i++) {
+    PyList_SET_ITEM(ret, i, pyunicode_from_string(paths[i].c_str()));
+  }
+  return ret;
+}
+
 static PyObject *available_devices_func(PyObject * /*self*/, PyObject *args)
 {
   const char *type_name;
@@ -429,7 +494,7 @@ static PyObject *available_devices_func(PyObject * /*self*/, PyObject *args)
   for (size_t i = 0; i < devices.size(); i++) {
     const DeviceInfo &device = devices[i];
     const string type_name = Device::string_from_type(device.type);
-    PyObject *device_tuple = PyTuple_New(8);
+    PyObject *device_tuple = PyTuple_New(10);
     PyTuple_SET_ITEM(device_tuple, 0, pyunicode_from_string(device.description.c_str()));
     PyTuple_SET_ITEM(device_tuple, 1, pyunicode_from_string(type_name.c_str()));
     PyTuple_SET_ITEM(device_tuple, 2, pyunicode_from_string(device.id.c_str()));
@@ -439,6 +504,8 @@ static PyObject *available_devices_func(PyObject * /*self*/, PyObject *args)
         device_tuple, 5, PyBool_FromLong(device.denoisers & DENOISER_OPENIMAGEDENOISE));
     PyTuple_SET_ITEM(device_tuple, 6, PyBool_FromLong(device.denoisers & DENOISER_OPTIX));
     PyTuple_SET_ITEM(device_tuple, 7, PyBool_FromLong(device.has_execution_optimization));
+    PyTuple_SET_ITEM(device_tuple, 8, PyBool_FromLong(device.meets_driver_requirement));
+    PyTuple_SET_ITEM(device_tuple, 9, PyBool_FromLong(device.denoisers & DENOISER_DLSS));
     PyTuple_SET_ITEM(ret, i, device_tuple);
   }
 
@@ -831,6 +898,10 @@ static PyMethodDef methods[] = {
     {"osl_compile", osl_compile_func, METH_VARARGS, ""},
 #endif
     {"available_devices", available_devices_func, METH_VARARGS, ""},
+    {"set_falcon_plugin_paths", set_falcon_plugin_paths_func, METH_O, ""},
+    {"get_falcon_plugin_paths", get_falcon_plugin_paths_func, METH_NOARGS, ""},
+    {"set_dlss_enabled", set_dlss_enabled_func, METH_O, ""},
+    {"get_dlss_enabled", get_dlss_enabled_func, METH_NOARGS, ""},
     {"system_info", system_info_func, METH_NOARGS, ""},
 
     /* Standalone denoising */
@@ -928,6 +999,12 @@ void *blender::CCL_python_module_init()
   else {
     PyModule_AddObjectRef(mod, "with_openimagedenoise", Py_False);
   }
+
+#ifdef WITH_DLSS
+  PyModule_AddObjectRef(mod, "with_dlss", Py_True);
+#else
+  PyModule_AddObjectRef(mod, "with_dlss", Py_False);
+#endif
 
 #ifdef WITH_CYCLES_DEBUG
   PyModule_AddObjectRef(mod, "with_debug", Py_True);

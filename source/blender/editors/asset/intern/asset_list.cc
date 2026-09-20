@@ -161,6 +161,7 @@ void AssetList::ensure_updated()
       true,
       /*filter_assets_hide_online=*/!show_online,
       /*filter_assets_hide_offline=*/!show_offline,
+      /*group_sequences=*/false,
       "",
       "");
   filelist_set_asset_include_online(files, show_online);

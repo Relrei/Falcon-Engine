@@ -103,6 +103,16 @@ void BPY_driver_reset();
 void BPY_DECREF(void *pyob_ptr);
 
 void BPY_DECREF_RNA_INVALIDATE(void *pyob_ptr);
+/**
+ * Falcon: call a no-argument method on `pyob_ptr`, if it has one.
+ *
+ * Used to run a render engine's `__del__` while its RNA is still valid, so that a
+ * Python engine (Cycles) drops its session -- and with it the device memory --
+ * when the engine is freed instead of whenever the last reference happens to go
+ * away. Acquires the GIL. A missing method is not an error; an exception raised by
+ * the method is printed and cleared, never propagated.
+ */
+void BPY_call_method_no_args(void *pyob_ptr, const char *method_name);
 [[nodiscard]] bool BPY_context_member_get(bContext *C,
                                           const char *member,
                                           bContextDataResult *result);

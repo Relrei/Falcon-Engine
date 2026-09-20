@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import os
+
 import bpy
 from bpy.app.translations import contexts as i18n_contexts
 from bl_ui.utils import PresetPanel
@@ -19,6 +21,10 @@ from bl_ui.properties_view_layer import (
 )
 
 from bl_ui.properties_object import has_geometry_visibility
+from bpy.app.translations import (
+    pgettext_iface as iface_,
+    pgettext_rpt as rpt_,
+)
 
 
 class CyclesPresetPanel(PresetPanel, Panel):
@@ -151,11 +157,34 @@ def show_preview_denoise_active(context):
     if not cscene.use_preview_denoising:
         return False
 
+    if cscene.preview_denoiser == 'DLSS':
+        return has_dlss_gpu_devices(context)
+
     if cscene.preview_denoiser == 'OPTIX':
         return has_optixdenoiser_gpu_devices(context)
 
     # OIDN is always available, thanks to CPU support
     return True
+
+
+
+def _has_camera_cuts(context):
+    """カメラが2台以上あり、カメラを束縛したマーカーが1つ以上あるか。
+
+    この2つが揃った時だけ「カメラ切り替え」が起きる = 履歴が捨てられる所がある。
+    """
+    scene = getattr(context, "scene", None)
+    if scene is None:
+        return False
+    cams = 0
+    for ob in scene.objects:
+        if ob.type == 'CAMERA':
+            cams += 1
+            if cams >= 2:
+                break
+    if cams < 2:
+        return False
+    return any(m.camera is not None for m in scene.timeline_markers)
 
 
 def show_denoise_active(context):
@@ -166,16 +195,40 @@ def show_denoise_active(context):
     if cscene.denoiser == 'OPTIX':
         return has_optixdenoiser_gpu_devices(context)
 
+    # Falcon: greyed out while DLSS cannot run (e.g. its runtime was removed), like the viewport.
+    if cscene.denoiser == 'DLSS':
+        return has_dlss_gpu_devices(context)
+
     # OIDN is always available, thanks to CPU support
     return True
 
 
+def draw_dlss_runtime_missing(layout):
+    """Falcon: DLSS is enabled (its add-on) but no runtime is in the plugin folders. Returns True
+    when drawn, the caller then skips the GPU requirement message."""
+    from . import falcon_plugins
+    if falcon_plugins.dlss_status() != 'NOT_FOUND':
+        return False
+    row = layout.row()
+    row.alert = True
+    row.label(text="DLSS runtime not found", icon='ERROR')
+    return True
+
+
 def get_effective_preview_denoiser(context, has_oidn_gpu):
+    # Mirrors Denoiser::automatic_viewport_denoiser_type: Automatic prefers DLSS-RR when the
+    # device can run it. Without this the panel resolved Automatic to OIDN and hid every
+    # DLSS-only option, so the settings for the denoiser that was actually running could only
+    # be reached by picking DLSS by hand.
     scene = context.scene
     cscene = scene.cycles
 
     if cscene.preview_denoiser != "AUTO":
         return cscene.preview_denoiser
+
+    prefer_dlss = os.environ.get("FALCON_DLSS_VIEWPORT_AUTO", "1") != "0"
+    if prefer_dlss and has_dlss_gpu_devices(context):
+        return 'DLSS'
 
     if has_oidn_gpu:
         return 'OPENIMAGEDENOISE'
@@ -188,6 +241,10 @@ def get_effective_preview_denoiser(context, has_oidn_gpu):
 
 def has_oidn_gpu_devices(context):
     return context.preferences.addons[__package__].preferences.has_oidn_gpu_devices()
+
+
+def has_dlss_gpu_devices(context):
+    return context.preferences.addons[__package__].preferences.has_dlss_gpu_devices()
 
 
 def has_optixdenoiser_gpu_devices(context):
@@ -225,22 +282,32 @@ class CYCLES_RENDER_PT_sampling_viewport(CyclesButtonsPanel, Panel):
         scene = context.scene
         cscene = scene.cycles
 
+        # DLSS renders a fresh sample per update (continuous stream), so the
+        # adaptive-sampling controls have no effect there. Max Samples does:
+        # it caps the stream length (the scheduler stops once reached).
+        is_dlss = (cscene.use_preview_denoising and
+                   get_effective_preview_denoiser(
+                       context, has_oidn_gpu_devices(context)) == 'DLSS')
+
         layout.use_property_split = True
         layout.use_property_decorate = False
 
         heading = layout.column(align=True, heading="Noise Threshold")
+        heading.active = not is_dlss
         row = heading.row(align=True)
         row.prop(cscene, "use_preview_adaptive_sampling", text="")
         sub = row.row()
         sub.active = cscene.use_preview_adaptive_sampling
         sub.prop(cscene, "preview_adaptive_threshold", text="")
 
+        col = layout.column(align=True)
         if cscene.use_preview_adaptive_sampling:
-            col = layout.column(align=True)
             col.prop(cscene, "preview_samples", text="Max Samples")
-            col.prop(cscene, "preview_adaptive_min_samples", text="Min Samples")
+            sub = col.column(align=True)
+            sub.active = not is_dlss
+            sub.prop(cscene, "preview_adaptive_min_samples", text="Min Samples")
         else:
-            layout.prop(cscene, "preview_samples", text="Samples")
+            col.prop(cscene, "preview_samples", text="Samples")
 
 
 class CYCLES_RENDER_PT_sampling_viewport_denoise(CyclesButtonsPanel, Panel):
@@ -269,10 +336,27 @@ class CYCLES_RENDER_PT_sampling_viewport_denoise(CyclesButtonsPanel, Panel):
         sub.active = show_preview_denoise_active(context)
         sub.prop(cscene, "preview_denoiser", text="Denoiser")
 
-        col.prop(cscene, "preview_denoising_input_passes", text="Passes")
-
         has_oidn_gpu = has_oidn_gpu_devices(context)
         effective_preview_denoiser = get_effective_preview_denoiser(context, has_oidn_gpu)
+
+        if effective_preview_denoiser == 'DLSS':
+            if has_dlss_gpu_devices(context):
+                col.prop(cscene, "preview_denoising_upscale_quality",
+                         text="Upscale Quality")
+                col.prop(cscene, "preview_denoising_carry_history")
+                sub = col.column()
+                sub.active = cscene.preview_denoising_carry_history
+                sub.prop(cscene, "preview_denoising_carry_motion_limit")
+                col.prop(cscene, "preview_denoising_bypass_dof")
+            elif not draw_dlss_runtime_missing(col):
+                col.label(text=rpt_("Requires NVIDIA GPU with compute capability %s") % "7.5",
+                          icon='INFO', translate=False)
+                col.label(text=rpt_("and NVIDIA driver version %s or newer") % "590",
+                          icon='BLANK1', translate=False)
+            return
+
+        col.prop(cscene, "preview_denoising_input_passes", text="Passes")
+
         if effective_preview_denoiser == 'OPENIMAGEDENOISE':
             col.prop(cscene, "preview_denoising_prefilter", text="Prefilter")
             col.prop(cscene, "preview_denoising_quality", text="Quality")
@@ -347,6 +431,33 @@ class CYCLES_RENDER_PT_sampling_render_denoise(CyclesButtonsPanel, Panel):
         if cscene.denoiser == 'OPENIMAGEDENOISE':
             col.prop(cscene, "denoising_prefilter", text="Prefilter")
             col.prop(cscene, "denoising_quality", text="Quality")
+
+        if cscene.denoiser == 'DLSS':
+            if has_dlss_gpu_devices(context):
+                col.prop(cscene, "denoising_upscale_quality",
+                         text="Upscale Quality")
+                # None=等倍(DLAA・最高品質)。下に行くほど内部解像度が下がり
+                # 速くなるが精度が落ちる(Quality=66% / Balanced=58% / Perf=50%)。
+                col.label(text="None = native resolution, best quality; lower entries are faster but coarser",
+                          icon='INFO')
+                # 履歴持ち越し=アニメでRR履歴をフレーム間継承(実測でちらつき最小)。
+                # OFF=旧来のフレーム毎リセット。
+                col.prop(cscene, "denoising_carry_history")
+                sub = col.column()
+                sub.active = cscene.denoising_carry_history
+                sub.prop(cscene, "denoising_preroll_passes")
+                sub.prop(cscene, "denoising_preroll_passes_cut",
+                         text="At Cuts (0 = Same as First)")
+                # カット(マーカーでカメラが切り替わる所)が実際に有るシーンでだけ出す。
+                # カメラが1台しか無い/束縛マーカーが無いシーンでは効きようがない。
+                if _has_camera_cuts(context):
+                    sub.prop(cscene, "denoising_cut_warmup")
+                # ★フレーム補間(2026-09-13・言葉は仮)。1 コマおきに焼いて、
+                # 間は RIFE で作る。焼かないコマを決めるのは C++ 側で、
+                # 作るのは addon/falcon_interp.py の render_complete。
+                col.prop(cscene, "falcon_frame_interp")
+            elif not draw_dlss_runtime_missing(col):
+                col.label(text="No DLSS-capable GPU found", icon='INFO')
 
         if cscene.denoiser == 'OPENIMAGEDENOISE':
             row = col.row()
@@ -2576,11 +2687,658 @@ def get_panels():
     return panels
 
 
+def _falcon_simple_panel(context):
+    """CyclesF パネルを「機能1つ・チェックボックス1つ」の形で出すか。
+
+    アドオン設定の `falcon_simple_panel`(既定 False)。False の間は今までの
+    パネルがそのまま出る=見た目は1画素も変わらない。倒すのは properties.py の
+    default の1行だけ。"""
+    try:
+        prefs = context.preferences.addons[__package__].preferences
+        return bool(getattr(prefs, "falcon_simple_panel", False))
+    except Exception:
+        return False
+
+
+def _falcon_draw_status(layout, context):
+    """状態は「異常な時だけ喋る」。正常時はGPUの1行のみ。"""
+    cscene = context.scene.cycles
+    prefs = context.preferences.addons[__package__].preferences
+
+    col = layout.column(align=True)
+    gpu_on = (cscene.device == 'GPU' and prefs.compute_device_type != 'NONE' and
+              prefs.has_active_device())
+    if gpu_on:
+        col.label(text="GPU: %s" % prefs.compute_device_type, icon='CHECKMARK')
+    else:
+        col.label(text="Rendering on the CPU — set Device to GPU Compute", icon='ERROR')
+    if not (cscene.use_denoising and cscene.denoising_use_gpu):
+        col.label(text="Final denoising is not on the GPU (fix with the presets below)", icon='ERROR')
+    if not (cscene.use_preview_denoising and cscene.preview_denoising_use_gpu):
+        col.label(text="Viewport denoising off", icon='INFO')
+    if cscene.falcon_sharc_mode != 'OFF':
+        col.label(text="SHARC: %s" % cscene.falcon_sharc_mode, icon='OUTLINER_OB_LIGHT')
+
+
+def _falcon_draw_classic(layout, context):
+    """従来の F-Cycles 親パネル(既定)。"""
+    from . import operators as _fops
+    cscene = context.scene.cycles
+
+    _falcon_draw_status(layout, context)
+
+    # ★作者 2026-09-07「自動で出ることを前提。オンオフで切り替えれる機構に」。
+    #   コースティクスの入口はこのチェック1つ(既定 ON)。切ると、この下の
+    #   自動化の導線も、子パネルの「コースティクス (Photon)」「ライトトレース」も
+    #   まるごと出なくなる(灰色にするのではなく出さない)。
+    layout.prop(cscene, "falcon_caustics_photon")
+    if not cscene.falcon_caustics_photon:
+        return
+    layout = layout.column(align=True)
+
+    # --- コースティクス自動化(Octane式: ガラス+ライトを置くだけで出す) ---
+    # レシピ知識ゼロで使える一本道。触りたい人向けの細部は下の子パネルに温存。
+    if cscene.falcon_auto_caustics == 'AUTO':
+        box = layout.box()
+        hdr = box.row(align=True)
+        hdr.label(text="Caustics", icon='LIGHT_AREA')
+        hdr.prop(cscene, "falcon_auto_caustics", text="")
+        if _fops._falcon_caustics_active():
+            r = box.row(align=True)
+            r.label(text="Enabled — caustics appear in renders", icon='CHECKMARK')
+            r.operator("cycles.falcon_photon_clear", text="", icon='X')
+            # 強さは焼き直し不要の render-time ノブ(点マップ gain の env を更新)
+            box.prop(cscene, "falcon_photon_point_gain", text="Strength", slider=True)
+        elif _fops._falcon_scene_has_caustics(context.scene):
+            box.label(text="Glass and light detected", icon='CHECKMARK')
+            box.operator("cycles.falcon_auto_caustics", icon='SHADERFX')
+        else:
+            # 空状態=「最初の一手」を案内(黙って無反応にしない)
+            box.label(text="Add glass or refraction and a light to make caustics", icon='INFO')
+        # 清書コースティクス(LT): フォトンと別経路の仕上げ。検出時は常に選べる。
+        if _fops._falcon_scene_has_caustics(context.scene):
+            sub = box.column(align=True)
+            sub.operator("cycles.falcon_lt_clean_caustics",
+                         text="Clean Caustics (LT, Minutes)", icon='RENDER_STILL')
+            risk = _fops._falcon_lt_flood_risk(context.scene)
+            if risk:
+                sub.label(text=risk, icon='ERROR', translate=False)
+    else:
+        # OFF でも戻す導線を1行だけ残す(見つかる/Discoverability)
+        layout.prop(cscene, "falcon_auto_caustics")
+
+
+def _falcon_draw_simple(layout, context):
+    """Caustica の形: 機能1つ・チェックボックス1つ。
+    ここに出る言葉は「コースティクス / 強さ / 品質(速い・清書)」だけ。
+    今までのツマミは1つも消さず「詳細」子パネルの下へ移してある。"""
+    from . import operators as _fops
+    cscene = context.scene.cycles
+
+    # 入口は classic と同じ1つ(上のチェック)。切れば下は何も出ない。
+    layout.prop(cscene, "falcon_caustics_photon")
+    if not cscene.falcon_caustics_photon:
+        return
+    has = _fops._falcon_scene_has_caustics(context.scene)
+
+    col = layout.column(align=True)
+    row = col.row(align=True)
+    row.enabled = has
+    row.prop(cscene, "falcon_caustics_on")
+    if not has:
+        col.label(text="Add glass or refraction and a light to make caustics", icon='INFO')
+        return
+    if not cscene.falcon_caustics_on:
+        return
+
+    body = layout.column(align=True)
+    body.prop(cscene, "falcon_photon_point_gain", text="Strength", slider=True)
+    body.separator()
+    # ★2択は行いっぱいに置く。ラベルと同じ行に入れると N パネルの幅で
+    #   「清書(数分)」が丸ごと消える(実測)。
+    # ★★`expand=True` に `text=""` を渡すと Blender は「アイコンだけ」の扱いにして
+    #   項目名を描かなくなる(N パネルで両方とも空欄になった。2026-09-02 実測)。
+    #   ⇒ ラベルは自分で1行出し、prop には text を渡さない。
+    body.label(text="Quality")
+    row = body.row(align=True)
+    row.prop(cscene, "falcon_caustics_quality", expand=True)
+    if cscene.falcon_caustics_quality == 'CLEAN':
+        # F12 には割り込まない。清書は押した時だけ走る別経路。
+        body.operator("cycles.falcon_lt_clean_caustics",
+                      text="Render", icon='RENDER_STILL')
+        risk = _fops._falcon_lt_flood_risk(context.scene)
+        if risk:
+            body.label(text=risk, icon='ERROR', translate=False)
+
+
+# --- CyclesF パネル ---------------------------------------------------------
+#
+# ★**登録済みの Panel クラスを継いで別の空間へ出してはいけない。**
+#   継ぐと、継がれた側(親)の draw / poll が RNA から外れ、元の場所から
+#   黙って消える。2026-09-02 に実測: レンダープロパティから CyclesF が
+#   7組まるごと消えていた(エラーも警告も出ず、N パネル側は正常に出るので
+#   気づけない)。→ (internal notes)
+#
+# ⇒ 別の空間・別の親へ出す写しは、**継承でなく同じ描画関数を呼ぶ**。
+#   中身(文言・ツマミ)は下の _falcon_draw_* の1箇所にしかないので、
+#   二重管理にはならない(片方だけ直る事故が起きない)。
+
+def _falcon_draw_presets(layout, context):
+    col = layout.column(align=True)
+    col.operator("cycles.falcon_near_realtime",
+                 text="Faster Viewport", icon='SHADERFX')
+    col.operator("cycles.falcon_still_quality",
+                 text="High-Quality Still", icon='RENDER_STILL')
+    col.operator("cycles.falcon_final_quality",
+                 text="For Animation", icon='RENDER_ANIMATION')
+
+
+def _falcon_draw_photon(layout, context):
+    import os as _os
+    cscene = context.scene.cycles
+
+    col = layout.column(align=True)
+    row = col.row(align=True)
+    row.prop(cscene, "falcon_photon_photons", text="Photons")
+    row = col.row(align=True)
+    row.prop(cscene, "falcon_photon_cell", text="Cell")
+    row.prop(cscene, "falcon_photon_dispersion", text="Chromatic Dispersion")
+    row = col.row(align=True)
+    row.prop(cscene, "falcon_photon_gpu", text="GPU (Fast)")
+    row.prop(cscene, "falcon_photon_point", text="Point Map")
+    if cscene.falcon_photon_gpu:
+        # The blur width is asked for in pixels and measured out in the
+        # scene, so it reads the same whether it ends up as a lookup radius
+        # (point map) or a cell size (grid).
+        row = col.row(align=True)
+        row.prop(cscene, "falcon_photon_point_radius_auto", text="Auto Radius")
+        if cscene.falcon_photon_point_radius_auto:
+            row.prop(cscene, "falcon_photon_point_radius_px", text="Pixel Radius")
+        row = col.row(align=True)
+        sub = row.row()
+        sub.active = not cscene.falcon_photon_point_radius_auto
+        if cscene.falcon_photon_point:
+            sub.prop(cscene, "falcon_photon_point_radius", text="Radius (m)")
+            row.prop(cscene, "falcon_photon_point_gain", text="Gain")
+        else:
+            sub.prop(cscene, "falcon_photon_cell", text="Cell (m)")
+            row.prop(cscene, "falcon_photon_radius", text="Spread")
+        if cscene.falcon_photon_point:
+            row = col.row(align=True)
+            row.prop(cscene, "falcon_photon_point_maxpts", text="Point Cap")
+            row.prop(cscene, "falcon_photon_point_normal_deg", text="Normal Angle (Degrees)")
+    else:
+        row = col.row(align=True)
+        row.prop(cscene, "falcon_photon_radius", text="Caustic Smoothness")
+    col.operator("cycles.falcon_photon_bake", icon='LIGHT_SUN')
+    # Runs in a separate background process (safe against the Vulkan
+    # viewport crash); confirmation dialog picks once/per-frame bake.
+    col.operator("cycles.falcon_bake_and_render_range",
+                 icon='RENDER_ANIMATION')
+    if _os.environ.get("FALCON_PHOTON_MODE") == "add":
+        r = col.row(align=True)
+        if _os.environ.get("FALCON_PHOTON_POINTS"):
+            r.label(text="Composite: on (point map)", icon='CHECKMARK')
+        else:
+            r.label(text="Composite: on", icon='CHECKMARK')
+        r.operator("cycles.falcon_photon_clear", text="", icon='X')
+
+
+def _falcon_draw_lt(layout, context):
+    cscene = context.scene.cycles
+
+    # ★作者 9-07「Octane の Photon path tracing は有効にして初めて機能する。
+    #   最初から項目があるより、チェックのオン/オフで切り替えて初めて設定
+    #   項目が出る方がいい」。9-07 にチェックそのものは親パネルの先頭へ移した
+    #   (3つ並んでいた「コースティクス」を1つの入口の下へ畳んだ)。この
+    #   パネル自体が poll で出なくなるが、スクリプトから直接呼ばれた時のために
+    #   ここでも見る。
+    if not cscene.falcon_caustics_photon:
+        return
+
+    col = layout.column(align=True)
+    row = col.row(align=True)
+    row.prop(cscene, "falcon_lt_mode", expand=True)
+    # 自動は摘みを持たない(場面から決める)ので、下の摘みは蓄積/疑似だけ出す
+    col2 = col.column(align=True)
+    col2.active = (cscene.falcon_lt_mode != 'AUTO')
+    row = col2.row(align=True)
+    row.prop(cscene, "falcon_lt_blur", text="Blur (px)")
+    row.prop(cscene, "falcon_lt_gain", text="Gain")
+    row = col2.row(align=True)
+    row.prop(cscene, "falcon_lt_visibility", text="Visibility (Remove Occluded/Through-Glass)")
+    row = col2.row(align=True)
+    row.prop(cscene, "falcon_lt_direct", text="Splat Direct Floor (Brightness Calibration)")
+    row = col2.row(align=True)
+    row.prop(cscene, "falcon_lt_guide_tiles", text="Emission Guiding")
+    row = col2.row(align=True)
+    row.prop(cscene, "falcon_lt_world", text="World Photons (Caustics Inside Shadows)")
+    col.operator("cycles.falcon_lighttrace_render", icon='RENDER_STILL')
+    # 生パスが残っていれば、ゲイン/ぼかし変更は再レンダー不要で反映できる
+    col.operator("cycles.falcon_lt_recomposite", icon='FILE_REFRESH')
+
+
+def _falcon_draw_culling(layout, context):
+    scene = context.scene
+
+    col = layout.column(align=True)
+    col.operator("cycles.falcon_auto_cull", icon='CAMERA_DATA')
+    col.operator("cycles.falcon_auto_cull_verify", icon='CHECKMARK')
+    col.operator("cycles.falcon_auto_cull_clear", icon='X')
+
+    # 現状の適用数を表示
+    n = sum(1 for ob in scene.objects
+            if getattr(ob.cycles, "use_camera_cull", False))
+    if n:
+        col.label(text=iface_("Culled: %d") % n, icon='CHECKMARK', translate=False)
+        if not (scene.render.use_simplify and scene.cycles.use_camera_cull):
+            col.label(text="Simplify + Camera Culling is off (not in effect)", icon='ERROR')
+    col.label(text="Culled objects also disappear from reflections, GI and shadows", icon='INFO')
+
+
+def _falcon_draw_temporal(layout, context):
+
+    cscene = context.scene.cycles
+
+    col = layout.column(align=True)
+    col.operator("cycles.falcon_temporal_setup",
+                 text="Save Material for Flicker Removal", icon='NODE_COMPOSITING')
+    col.label(text="After rendering, apply with tools/falcon_temporal.py", icon='INFO')
+
+    # DLSSの履歴は「別視点の実フレーム」からしか育たない=冷えた1枚目とカット直後だけ
+    # ノイズが多い。手前を捨て焼きして埋める。
+    if cscene.use_denoising and cscene.denoiser == 'DLSS':
+        col = layout.column(align=True)
+        col.separator()
+        col.prop(cscene, "denoising_warmup_frames")
+        col.operator("cycles.falcon_warmup_render", icon='RENDER_ANIMATION')
+
+
+def _falcon_draw_sharc(layout, context):
+    cscene = context.scene.cycles
+    mode = cscene.falcon_sharc_mode
+
+    col = layout.column()
+    col.use_property_split = True
+    col.use_property_decorate = False
+    col.prop(cscene, "falcon_sharc_mode", text="Mode")
+
+    sub = col.column()
+    sub.active = mode != 'OFF'
+    sub.prop(cscene, "falcon_sharc_alpha", text="Blend", slider=True)
+    if mode in {'BLEND', 'LIVE'}:
+        sub.prop(cscene, "falcon_sharc_gate", text="Auto GI Gate")
+        if cscene.falcon_sharc_gate:
+            gate = sub.row(align=True)
+            gate.prop(cscene, "falcon_sharc_gate_low", text="Gate Low")
+            gate.prop(cscene, "falcon_sharc_gate_high", text="Gate High")
+    if mode == 'LIVE':
+        sub.prop(cscene, "falcon_sharc_keep", text="Keep History", slider=True)
+    sub.prop(cscene, "falcon_sharc_cache", text="Cache")
+
+    if mode == 'WARMUP':
+        layout.label(text="Render once at high spp, then switch to Blend", icon='INFO')
+    elif mode == 'BLEND':
+        # 実測(2026-07-02): OIDN併用のfinalでは全ブレンド量で悪化(cellバイアス)。
+        if cscene.use_denoising:
+            layout.label(text="Blend + denoising hurts final renders — Live (viewport) recommended",
+                         icon='ERROR')
+        else:
+            layout.label(text="For GI-heavy scenes without denoising", icon='INFO')
+    elif mode == 'LIVE':
+        layout.label(text="Viewport only: GI keeps converging while the camera holds still", icon='INFO')
+        if not (cscene.use_preview_denoising and cscene.preview_denoising_use_gpu):
+            layout.label(text="Works best together with \"Faster Viewport\"", icon='ERROR')
+
+
+def _falcon_draw_header_preset(layout):
+    # 走っているのが再ビルド後のバイナリか、ここで即分かるようにする。
+    # (GUIを開いたまま再ビルドしても中身は入れ替わらないので、見分けがつかず
+    #  「直したのに変わらない」で何度も時間を溶かした)
+    # 時刻はバイナリの更新時刻。bpy.app.build_time はUTCで、壁時計と9時間
+    # ずれて読み違えるため使わない。
+    import bpy
+    import os
+    import time
+
+    h = bpy.app.build_hash
+    if isinstance(h, bytes):
+        h = h.decode(errors="replace")
+    try:
+        stamp = time.strftime("%m/%d %H:%M",
+                              time.localtime(os.path.getmtime(bpy.app.binary_path)))
+    except OSError:
+        stamp = "?"
+    layout.label(text="%s  %s" % (h[:9], stamp))
+
+
+# --- 機能ごとの見出しと中身。ここが唯一の正本で、下の4組(レンダープロパティ /
+#     その「詳細」の下 / N パネル / N パネルの「詳細」の下)が全部これを指す。
+class _FalconPresets:
+    bl_label = "Use-Case Presets"
+
+    def draw(self, context):
+        _falcon_draw_presets(self.layout, context)
+
+
+class _FalconCausticsChild:
+    """コースティクスのチェック(親パネル先頭)が入っている時だけ出る子パネル。
+
+    ★poll は super() で本来の親(FalconClassicChild / FalconAdvancedChild /
+      FalconSidebarClassicChild)の poll へ繋ぐ。繋がないと簡単表示の出し分けが
+      壊れて、片方の親から黙って消える(2026-09-02 の罠と同じ形)。"""
+
+    @classmethod
+    def poll(cls, context):
+        if not super().poll(context):
+            return False
+        cs = getattr(context.scene, "cycles", None)
+        return bool(getattr(cs, "falcon_caustics_photon", False))
+
+
+class _FalconPhoton(_FalconCausticsChild):
+    bl_label = "Caustics (Photon)"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        _falcon_draw_photon(self.layout, context)
+
+
+class _FalconLT(_FalconCausticsChild):
+    bl_label = "Light Tracing (LT, Final-Quality Still)"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        _falcon_draw_lt(self.layout, context)
+
+
+class _FalconCulling:
+    bl_label = "Auto Culling (Scene Slimming)"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        _falcon_draw_culling(self.layout, context)
+
+
+class _FalconTemporal:
+    bl_label = "Animation Flicker Removal (Temporal)"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        _falcon_draw_temporal(self.layout, context)
+
+
+class _FalconSharc:
+    bl_label = "SHARC Cache (Experimental)"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        _falcon_draw_sharc(self.layout, context)
+
+
+# --- レンダープロパティ側(Blender の作法どおりの置き場) --------------------
+class CYCLES_RENDER_PT_falcon(CyclesButtonsPanel, Panel):
+    bl_label = "F-Cycles"
+    bl_order = 1000  # 本家パネル群より後ろ=レンダープロパティの一番下に置く
+
+    def draw_header_preset(self, context):
+        _falcon_draw_header_preset(self.layout)
+
+    def draw(self, context):
+        if _falcon_simple_panel(context):
+            _falcon_draw_simple(self.layout, context)
+        else:
+            _falcon_draw_classic(self.layout, context)
+
+
+class CYCLES_RENDER_PT_falcon_advanced(CyclesButtonsPanel, Panel):
+    # 簡単表示の時だけ出る受け皿。今までの子パネルはここへそのまま移る。
+    bl_label = "Details"
+    bl_parent_id = "CYCLES_RENDER_PT_falcon"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        return CyclesButtonsPanel.poll(context) and _falcon_simple_panel(context)
+
+    def draw(self, context):
+        _falcon_draw_status(self.layout, context)
+
+
+class FalconClassicChild:
+    """簡単表示が OFF の時だけ出る子(=今までの並び)。"""
+    bl_parent_id = "CYCLES_RENDER_PT_falcon"
+
+    @classmethod
+    def poll(cls, context):
+        return CyclesButtonsPanel.poll(context) and not _falcon_simple_panel(context)
+
+
+class FalconAdvancedChild:
+    """簡単表示が ON の時だけ出る子。「詳細」の下に置いた同じ子の写しで、
+    描画は同じ関数を呼ぶ(中身が二重管理にならない)。"""
+    bl_parent_id = "CYCLES_RENDER_PT_falcon_advanced"
+
+    @classmethod
+    def poll(cls, context):
+        return CyclesButtonsPanel.poll(context) and _falcon_simple_panel(context)
+
+
+# --- CyclesF 親は「状態」だけのダッシュボードに絞り、用途プリセット/各機能は
+#     すべて下の折りたたみ子パネルへ分解した(旧: 1枚べた書きで塊すぎた)。
+class CYCLES_RENDER_PT_falcon_presets(_FalconPresets, FalconClassicChild, CyclesButtonsPanel, Panel):
+    pass
+
+
+class CYCLES_RENDER_PT_falcon_photon(_FalconPhoton, FalconClassicChild, CyclesButtonsPanel, Panel):
+    pass
+
+
+class CYCLES_RENDER_PT_falcon_lt(_FalconLT, FalconClassicChild, CyclesButtonsPanel, Panel):
+    pass
+
+
+class CYCLES_RENDER_PT_falcon_culling(_FalconCulling, FalconClassicChild, CyclesButtonsPanel, Panel):
+    pass
+
+
+class CYCLES_RENDER_PT_falcon_temporal(_FalconTemporal, FalconClassicChild, CyclesButtonsPanel, Panel):
+    pass
+
+
+class CYCLES_RENDER_PT_falcon_sharc(_FalconSharc, FalconClassicChild, CyclesButtonsPanel, Panel):
+    pass
+
+
+# --- 「詳細」の下へ移した同じ子の写し(簡単表示の時だけ出る) ----------------
+#     bl_parent_id は登録時に決まるので、旗で親を付け替えることはできない。
+#     ⇒ 親違いの写しを両方登録し、poll でどちらか一方だけを出す。
+class CYCLES_RENDER_PT_falcon_adv_presets(_FalconPresets, FalconAdvancedChild, CyclesButtonsPanel, Panel):
+    pass
+
+
+class CYCLES_RENDER_PT_falcon_adv_photon(_FalconPhoton, FalconAdvancedChild, CyclesButtonsPanel, Panel):
+    pass
+
+
+class CYCLES_RENDER_PT_falcon_adv_lt(_FalconLT, FalconAdvancedChild, CyclesButtonsPanel, Panel):
+    pass
+
+
+class CYCLES_RENDER_PT_falcon_adv_culling(_FalconCulling, FalconAdvancedChild, CyclesButtonsPanel, Panel):
+    pass
+
+
+class CYCLES_RENDER_PT_falcon_adv_temporal(_FalconTemporal, FalconAdvancedChild, CyclesButtonsPanel, Panel):
+    pass
+
+
+class CYCLES_RENDER_PT_falcon_adv_sharc(_FalconSharc, FalconAdvancedChild, CyclesButtonsPanel, Panel):
+    pass
+
+
+# --- CyclesF をビューポートのサイドバー(N パネル)にも出す ------------------
+#
+# 作者の要望(2026-08-28): 「CyclesF の機能がどうしても扱いづらい。
+# コースティクス、パネルからの方が操作しやすいかもしれない。場所的にこっちの方が」
+# = 3Dビューポートの N パネルの「Falcon」タブ(falcon_dropmovie アドオンが作っている)。
+#
+# ★**移すのでなく、両方に出す。**レンダープロパティ側は Blender の作法どおりの置き場で、
+#   消すと他の記述や手の記憶と食い違う。描く中身は上の _falcon_draw_* を呼ぶだけなので、
+#   二重管理にはならない(片方だけ直る事故が起きない)。
+class FalconSidebarPanel:
+    """N パネルの Falcon タブへ出すための土台。描画は同じ関数を呼ぶ。"""
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Falcon"
+    bl_context = ""          # VIEW_3D では context を持たない(持つと出ない)
+    bl_parent_id = ""        # 親子はサイドバー側で組み直す
+    COMPAT_ENGINES = {'CYCLES'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.engine in cls.COMPAT_ENGINES
+
+
+class FalconSidebarClassicChild(FalconSidebarPanel):
+    """簡単表示が OFF の時だけ出るサイドバーの子(=今までの並び)。"""
+    bl_parent_id = "VIEW3D_PT_falcon_cyclesf"
+
+    @classmethod
+    def poll(cls, context):
+        return (context.engine in cls.COMPAT_ENGINES
+                and not _falcon_simple_panel(context))
+
+
+class FalconSidebarAdvancedChild(FalconSidebarPanel):
+    """簡単表示が ON の時だけ出るサイドバーの子(「詳細」の下)。"""
+    bl_parent_id = "VIEW3D_PT_falcon_cyclesf_advanced"
+
+    @classmethod
+    def poll(cls, context):
+        return (context.engine in cls.COMPAT_ENGINES
+                and _falcon_simple_panel(context))
+
+
+class VIEW3D_PT_falcon_cyclesf(FalconSidebarPanel, Panel):
+    bl_label = "F-Cycles"
+    bl_order = 100
+
+    def draw_header_preset(self, context):
+        _falcon_draw_header_preset(self.layout)
+
+    def draw(self, context):
+        if _falcon_simple_panel(context):
+            _falcon_draw_simple(self.layout, context)
+        else:
+            _falcon_draw_classic(self.layout, context)
+
+
+class VIEW3D_PT_falcon_cyclesf_advanced(FalconSidebarAdvancedChild, Panel):
+    bl_label = "Details"
+    bl_parent_id = "VIEW3D_PT_falcon_cyclesf"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        _falcon_draw_status(self.layout, context)
+
+
+class VIEW3D_PT_falcon_cyclesf_plugins(FalconSidebarPanel, Panel):
+    """Falcon plugin folder (falcon_plugins.py): what was found and what is connected."""
+    bl_label = "Plugins"
+    bl_parent_id = "VIEW3D_PT_falcon_cyclesf"
+    bl_options = {'DEFAULT_CLOSED'}
+    bl_order = 1000
+
+    def draw(self, context):
+        from . import falcon_plugins
+        falcon_plugins.draw_plugins(self.layout, context)
+
+
+class VIEW3D_PT_falcon_cyclesf_photon(_FalconPhoton, FalconSidebarClassicChild, Panel):
+    pass
+
+
+class VIEW3D_PT_falcon_cyclesf_lt(_FalconLT, FalconSidebarClassicChild, Panel):
+    pass
+
+
+class VIEW3D_PT_falcon_cyclesf_presets(_FalconPresets, FalconSidebarClassicChild, Panel):
+    pass
+
+
+class VIEW3D_PT_falcon_cyclesf_culling(_FalconCulling, FalconSidebarClassicChild, Panel):
+    pass
+
+
+class VIEW3D_PT_falcon_cyclesf_temporal(_FalconTemporal, FalconSidebarClassicChild, Panel):
+    pass
+
+
+class VIEW3D_PT_falcon_cyclesf_sharc(_FalconSharc, FalconSidebarClassicChild, Panel):
+    pass
+
+
+class VIEW3D_PT_falcon_cyclesf_adv_presets(_FalconPresets, FalconSidebarAdvancedChild, Panel):
+    pass
+
+
+class VIEW3D_PT_falcon_cyclesf_adv_photon(_FalconPhoton, FalconSidebarAdvancedChild, Panel):
+    pass
+
+
+class VIEW3D_PT_falcon_cyclesf_adv_lt(_FalconLT, FalconSidebarAdvancedChild, Panel):
+    pass
+
+
+class VIEW3D_PT_falcon_cyclesf_adv_culling(_FalconCulling, FalconSidebarAdvancedChild, Panel):
+    pass
+
+
+class VIEW3D_PT_falcon_cyclesf_adv_temporal(_FalconTemporal, FalconSidebarAdvancedChild, Panel):
+    pass
+
+
+class VIEW3D_PT_falcon_cyclesf_adv_sharc(_FalconSharc, FalconSidebarAdvancedChild, Panel):
+    pass
+
+
 classes = (
     CYCLES_PT_sampling_presets,
     CYCLES_PT_viewport_sampling_presets,
     CYCLES_PT_integrator_presets,
     CYCLES_PT_performance_presets,
+    CYCLES_RENDER_PT_falcon,
+    CYCLES_RENDER_PT_falcon_presets,
+    CYCLES_RENDER_PT_falcon_photon,
+    CYCLES_RENDER_PT_falcon_lt,
+    CYCLES_RENDER_PT_falcon_culling,
+    CYCLES_RENDER_PT_falcon_temporal,
+    CYCLES_RENDER_PT_falcon_sharc,
+    # 簡単表示(falcon_simple_panel=True)の時だけ poll が通る組。
+    # 既定 False では1枚も出ないので、見た目は今までと同じ。
+    CYCLES_RENDER_PT_falcon_advanced,
+    CYCLES_RENDER_PT_falcon_adv_presets,
+    CYCLES_RENDER_PT_falcon_adv_photon,
+    CYCLES_RENDER_PT_falcon_adv_lt,
+    CYCLES_RENDER_PT_falcon_adv_culling,
+    CYCLES_RENDER_PT_falcon_adv_temporal,
+    CYCLES_RENDER_PT_falcon_adv_sharc,
+    VIEW3D_PT_falcon_cyclesf,
+    VIEW3D_PT_falcon_cyclesf_advanced,
+    VIEW3D_PT_falcon_cyclesf_adv_presets,
+    VIEW3D_PT_falcon_cyclesf_adv_photon,
+    VIEW3D_PT_falcon_cyclesf_adv_lt,
+    VIEW3D_PT_falcon_cyclesf_adv_culling,
+    VIEW3D_PT_falcon_cyclesf_adv_temporal,
+    VIEW3D_PT_falcon_cyclesf_adv_sharc,
+    VIEW3D_PT_falcon_cyclesf_presets,
+    VIEW3D_PT_falcon_cyclesf_photon,
+    VIEW3D_PT_falcon_cyclesf_lt,
+    VIEW3D_PT_falcon_cyclesf_culling,
+    VIEW3D_PT_falcon_cyclesf_temporal,
+    VIEW3D_PT_falcon_cyclesf_plugins,
+    VIEW3D_PT_falcon_cyclesf_sharc,
     CYCLES_RENDER_PT_sampling,
     CYCLES_RENDER_PT_sampling_viewport,
     CYCLES_RENDER_PT_sampling_viewport_denoise,

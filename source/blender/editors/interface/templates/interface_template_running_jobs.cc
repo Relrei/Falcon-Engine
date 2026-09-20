@@ -22,6 +22,7 @@
 #include "BLI_timecode.h"
 #include "BLT_translation.hh"
 
+#include "ED_render_job.hh"
 #include "ED_screen.hh"
 
 #include "UI_resources.hh"
@@ -81,6 +82,7 @@ void template_running_jobs(Layout *layout, bContext *C)
 
   void *owner = nullptr;
   int icon = 0;
+  bool is_render_job = false;
   std::function<void(bContext &)> cancel_fn = nullptr;
   const char *op_name = nullptr;
   const char *op_description = nullptr;
@@ -138,6 +140,7 @@ void template_running_jobs(Layout *layout, bContext *C)
     if (WM_jobs_test(wm, &scene, WM_JOB_TYPE_RENDER)) {
       cancel_fn = set_global_break;
       icon = ICON_SCENE;
+      is_render_job = true;
       if (U.render_display_type != USER_RENDER_DISPLAY_NONE) {
         op_name = "RENDER_OT_view_show";
         op_description = "Show the render window";
@@ -248,6 +251,16 @@ void template_running_jobs(Layout *layout, bContext *C)
     SNPRINTF_UTF8(text, "%d%%", int(progress * 100));
 
     const char *name = active ? RPT_(WM_jobs_name(wm, owner)) : RPT_("Canceling...");
+
+    /* Falcon: which frame of how many an animation render is on ("Rendering... 31 / 60"). */
+    std::string name_with_frames;
+    int frame_index, frame_total;
+    if (active && is_render_job &&
+        ED_render_job_frame_info(wm, static_cast<const Scene *>(owner), &frame_index, &frame_total))
+    {
+      name_with_frames = fmt::format("{} {} / {}", name, frame_index, frame_total);
+      name = name_with_frames.c_str();
+    }
 
     /* job icon as a button */
     if (op_name) {

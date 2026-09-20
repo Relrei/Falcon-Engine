@@ -9,6 +9,7 @@
  */
 
 #include <algorithm>
+#include <cstdlib>
 
 #include "DNA_scene_types.h"
 #include "DNA_sequence_types.h"
@@ -16,6 +17,7 @@
 #include "BLI_listbase.h"
 #include "BLI_math_base.h"
 
+#include "BKE_idprop.hh"
 #include "BKE_movieclip.hh"
 #include "BKE_sound.hh"
 
@@ -296,12 +298,82 @@ int time_find_next_prev_edit(Scene *scene,
   return best_frame;
 }
 
+/* Falcon (2026-09-20): the author asked for "10 channels from the start, and a button to add as
+ * many as I like". Upstream shows 7 empty channels and grows with the strips, so the rows move
+ * when a strip lands on a new channel. The count is a system property on the scene so it is saved
+ * with the .blend and needs no DNA change. `FALCON_VSE_CHANNELS=0` switches it off. */
+#define FALCON_TIMELINE_CHANNELS_DEFAULT 10
+#define FALCON_TIMELINE_CHANNELS_PROP "falcon_vse_channels"
+
+static bool falcon_timeline_channels_enabled()
+{
+  static const bool enabled = [] {
+    const char *env = getenv("FALCON_VSE_CHANNELS");
+    return !(env && env[0] == '0');
+  }();
+  return enabled;
+}
+
+int falcon_timeline_channels(const Scene *scene)
+{
+  if (!falcon_timeline_channels_enabled()) {
+    return 0;
+  }
+  int count = FALCON_TIMELINE_CHANNELS_DEFAULT;
+  if (scene != nullptr && scene->id.system_properties != nullptr) {
+    const IDProperty *prop = IDP_GetPropertyTypeFromGroup(
+        scene->id.system_properties, FALCON_TIMELINE_CHANNELS_PROP, IDP_INT);
+    if (prop != nullptr) {
+      count = IDP_int_get(prop);
+    }
+  }
+  return std::clamp(count, 1, MAX_CHANNELS);
+}
+
+int falcon_timeline_channels_shown(const Scene *scene, const ListBaseT<Strip> *seqbase)
+{
+  const int count = falcon_timeline_channels(scene);
+  if (count == 0) {
+    return 0;
+  }
+  int shown = count;
+  if (seqbase != nullptr) {
+    for (const Strip &strip : *seqbase) {
+      shown = std::max<int>(shown, strip.channel);
+    }
+  }
+  return std::min(shown, MAX_CHANNELS);
+}
+
+void falcon_timeline_channels_set(Scene *scene, const int count)
+{
+  IDProperty *group = IDP_ID_system_properties_ensure(&scene->id);
+  const int value = std::clamp(count, 1, MAX_CHANNELS);
+  IDProperty *prop = IDP_GetPropertyTypeFromGroup(group, FALCON_TIMELINE_CHANNELS_PROP, IDP_INT);
+  if (prop != nullptr) {
+    IDP_int_set(prop, value);
+    return;
+  }
+  IDP_AddToGroup(group, bke::idprop::create(FALCON_TIMELINE_CHANNELS_PROP, value).release());
+}
+
 void timeline_init_boundbox(const Scene *scene, rctf *r_rect)
 {
   r_rect->xmin = scene->r.sfra;
   r_rect->xmax = scene->r.efra + 1;
-  r_rect->ymin = 1.0f; /* The first strip is drawn at y == 1.0f */
-  r_rect->ymax = 8.0f;
+  /* ★チャンネルの本数(Falcon の 10 チャンネル)と上下反転の両方を見る。
+   * 反転していない時はチャンネル 1 が下(いちばん小さい Y)、反転すると**上**(いちばん大きい Y)。 */
+  const int falcon_channels = falcon_timeline_channels(scene);
+  const int top_channel = falcon_channels ? falcon_channels : 8;
+  if (channel_flip_enabled()) {
+    r_rect->ymin = channel_to_y(top_channel);
+    r_rect->ymax = channel_to_y(1) + 1.0f;
+  }
+  else {
+    r_rect->ymin = channel_to_y(1); /* The first strip is drawn at y == 1.0f */
+    /* Channel n covers <n, n+1>. */
+    r_rect->ymax = falcon_channels ? channel_to_y(falcon_channels) + 1.0f : 8.0f;
+  }
 }
 
 void timeline_expand_boundbox(const Scene *scene, const ListBaseT<Strip> *seqbase, rctf *rect)
@@ -314,7 +386,15 @@ void timeline_expand_boundbox(const Scene *scene, const ListBaseT<Strip> *seqbas
     rect->xmin = std::min<float>(rect->xmin, strip.left_handle() - 1);
     rect->xmax = std::max<float>(rect->xmax, strip.right_handle(scene) + 1);
     /* We do +1 here to account for the channel thickness. Channel n has range of <n, n+1>. */
-    rect->ymax = std::max(rect->ymax, strip.channel + 1.0f);
+    rect->ymax = std::max(rect->ymax, channel_to_y(strip.channel) + 1.0f);
+    if (channel_flip_enabled()) {
+      /* Non-flipped, `ymin` is never updated here because channel 1 (the smallest Y) is always
+       * the init-time sentinel already, so nothing can shrink it further. Flipped, the smallest
+       * Y instead comes from whichever strip has the *largest* channel number, which isn't
+       * known in advance, so it does need updating per-strip -- gated on the flip so the
+       * non-flipped path (and its default-off behavior) is untouched. */
+      rect->ymin = std::min(rect->ymin, channel_to_y(strip.channel));
+    }
   }
 }
 

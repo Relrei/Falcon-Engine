@@ -2,6 +2,12 @@
 #
 # SPDX-License-Identifier: GPL-2.0-or-later
 
+# Falcon: 表示名を flavor から決める (blender.cc)
+add_definitions(-DFALCON_BUILD_FLAVOR="${FALCON_BUILD_FLAVOR}")
+if(FALCON_DIST)
+  add_definitions(-DFALCON_DIST_BUILD=1)
+endif()
+
 set(INC
   PUBLIC .
   ../ikplugin
@@ -113,6 +119,7 @@ set(SRC
   intern/editmesh_cache.cc
   intern/editmesh_tangent.cc
   intern/effect.cc
+  intern/falcon_export_info.cc
   intern/fcurve.cc
   intern/fcurve_driver.cc
   intern/file_handler.cc
@@ -185,6 +192,7 @@ set(SRC
   intern/material.cc
   intern/mball.cc
   intern/mball_tessellate.cc
+  intern/mem_reclaim.cc
   intern/mesh.cc
   intern/mesh_attributes.cc
   intern/mesh_calc_edges.cc
@@ -395,6 +403,7 @@ set(SRC
   BKE_editmesh_cache.hh
   BKE_editmesh_tangent.hh
   BKE_effect.h
+  BKE_falcon_export_info.hh
   BKE_fcurve.hh
   BKE_fcurve_driver.h
   BKE_file_handler.hh
@@ -450,6 +459,7 @@ set(SRC
   BKE_material.hh
   BKE_mball.hh
   BKE_mball_tessellate.hh
+  BKE_mem_reclaim.hh
   BKE_mesh.h
   BKE_mesh.hh
   BKE_mesh_fair.hh

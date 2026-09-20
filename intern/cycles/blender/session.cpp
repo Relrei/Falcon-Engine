@@ -44,6 +44,9 @@ CCL_NAMESPACE_BEGIN
 DeviceTypeMask BlenderSession::device_override = DEVICE_MASK_ALL;
 bool BlenderSession::headless = false;
 bool BlenderSession::print_render_stats = false;
+bool BlenderSession::dlss_history_warmed_this_job = false;
+string BlenderSession::last_cut_camera_;
+int BlenderSession::last_cut_frame_ = INT_MIN;
 
 BlenderSession::BlenderSession(blender::RenderEngine &b_engine,
                                blender::UserDef &b_userpref,
@@ -74,6 +77,9 @@ BlenderSession::BlenderSession(blender::RenderEngine &b_engine,
   last_redraw_time = 0.0;
   start_resize_time = 0.0;
   last_status_time = 0.0;
+  if (getenv("FALCON_DEBUG_LIFECYCLE")) {
+    fprintf(stderr, "[lifecycle] BlenderSession CONSTRUCTED (offline) this=%p\n", (void *)this);
+  }
 }
 
 BlenderSession::BlenderSession(blender::RenderEngine &b_engine,
@@ -113,6 +119,9 @@ BlenderSession::BlenderSession(blender::RenderEngine &b_engine,
 
 BlenderSession::~BlenderSession()
 {
+  if (getenv("FALCON_DEBUG_LIFECYCLE")) {
+    fprintf(stderr, "[lifecycle] BlenderSession DESTROYED this=%p\n", (void *)this);
+  }
   free_session();
 }
 
@@ -132,6 +141,13 @@ void BlenderSession::create_session()
 
   /* create session */
   session = make_unique<Session>(session_params, scene_params);
+  if (getenv("FALCON_DEBUG_LIFECYCLE")) {
+    fprintf(stderr,
+            "[lifecycle] inner Session CREATED this=%p session=%p warmed_flag=%d\n",
+            (void *)this,
+            (void *)session.get(),
+            int(dlss_history_warmed_this_job));
+  }
   session->progress.set_update_callback([this] { tag_redraw(); });
   session->progress.set_cancel_callback([this] { test_cancel(); });
   session->set_pause(session_pause);
@@ -152,7 +168,7 @@ void BlenderSession::create_session()
 
   /* set buffer parameters */
   const BufferParams buffer_params = BlenderSync::get_buffer_params(
-      b_v3d, b_rv3d, scene->camera, width, height);
+      b_v3d, b_rv3d, b_scene, scene, width, height);
   session->reset(session_params, buffer_params);
 
   /* Viewport and preview (as in, material preview) does not do tiled rendering, so can inform
@@ -243,7 +259,7 @@ void BlenderSession::reset_session(blender::Main &b_data, blender::Depsgraph &b_
   sync->sync_camera(*b_render, width, height, "");
 
   const BufferParams buffer_params = BlenderSync::get_buffer_params(
-      nullptr, nullptr, scene->camera, width, height);
+      nullptr, nullptr, b_scene, scene, width, height);
   session->reset(session_params, buffer_params);
 
   /* reset time */
@@ -321,6 +337,42 @@ void BlenderSession::stamp_view_layer_metadata(Scene *scene, const string &view_
                           scene->object_manager->get_cryptomatte_assets(scene));
   }
 
+  /* DLSS-RR: what actually happened to the temporal history on this frame.
+   *
+   * 作者 2026-09-06: "事前レンダリングができているのか判別しづらい". The pre-roll
+   * only left a trace in a stderr fprintf, which a GUI render never shows, so
+   * there was no way to tell a frame that pre-rolled from one that did not
+   * *after* it was rendered. Put it in the render result metadata: N panel ->
+   * Metadata in the image editor, and saved into OpenEXR/PNG.
+   *
+   * These are the same numbers as the "DLSS pre-roll k/N" status line and the
+   * [preroll] stderr trace -- all three read RenderScheduler's decision. The
+   * fields are only written for a DLSS render, so an OIDN or undenoised render
+   * keeps the metadata it always had. */
+  if (scene->integrator->get_use_denoise() &&
+      scene->integrator->get_denoiser_type() == DENOISER_DLSS)
+  {
+    int preroll_passes = -1;
+    bool history_was_cold = false;
+    session->get_dlss_preroll_info(preroll_passes, history_was_cold);
+
+    const string preroll_str = to_string(preroll_passes > 0 ? preroll_passes : 0);
+    BKE_render_result_stamp_data(b_rr, "cycles.dlss.preroll_passes", preroll_str.c_str());
+    BKE_render_result_stamp_data(
+        b_rr, "cycles.dlss.history", history_was_cold ? "cold" : "warm");
+
+    /* The cut warm-up is the *other* thing that can have warmed this history
+     * (denoiser side: the same inputs evaluated N times, no re-render). 1 =
+     * detect the cut and drop the history, N>1 = also repeat the evaluate,
+     * off = the switch is off for this scene. */
+    const char *env_warmup = getenv("FALCON_DLSS_CUT_WARMUP");
+    const int warmup = env_warmup ? atoi(env_warmup) : 1;
+    const string warmup_str = (scene->integrator->get_denoiser_cut_warmup() && warmup != 0) ?
+                                  to_string(warmup) :
+                                  string("off");
+    BKE_render_result_stamp_data(b_rr, "cycles.dlss.warmup", warmup_str.c_str());
+  }
+
   /* Store synchronization and bare-render times. */
   double total_time;
   double render_time;
@@ -335,6 +387,181 @@ void BlenderSession::stamp_view_layer_metadata(Scene *scene, const string &view_
                                time_human_readable_from_seconds(total_time - render_time).c_str());
 }
 
+void BlenderSession::clear_denoiser_history_on_cut()
+{
+  /* Hard cuts (bound-camera marker switch, timeline jump) cannot be explained by
+   * motion vectors: warping the history across one drags the previous shot into
+   * the new one as a ghost -- the old chalkboard text still legible over the new
+   * frame. Drop the history there, like games do on scene cuts. Single-frame
+   * steps stay below the frame threshold and keep their history. */
+  /* ★名前で覚える(番地では毎コマ変わる。宣言のところを見ること)。 */
+  const auto *cut_camera_ob = (b_v3d && b_v3d->camera) ? b_v3d->camera : b_scene->camera;
+  const string cut_camera = cut_camera_ob ? string(cut_camera_ob->id.name) : string();
+  const int cut_frame = b_scene->r.cfra;
+
+  /* The cut state is process-global (see session.h), so a new job has to clear
+   * it or the first frame of this render would be compared against the last
+   * camera of the previous one. The start frame of the range is the same signal
+   * render() uses for dlss_history_warmed_this_job. */
+  if (background && cut_frame == b_scene->r.sfra) {
+    last_cut_camera_.clear();
+    last_cut_frame_ = INT_MIN;
+  }
+
+  /* The frame number is what tells DLSS-RR "new frame" from "more samples on
+   * the same frame"; this runs once per render/update, before the denoise. */
+  session->set_denoiser_frame(cut_frame);
+
+  if (getenv("FALCON_DLSS_DEBUG")) {
+    fprintf(stderr,
+            "[cut] cfra=%d cam=%s last=%s\n",
+            cut_frame,
+            cut_camera.c_str(),
+            last_cut_camera_.c_str());
+  }
+
+  /* How far the frame may move before it counts as a jump. A final render
+   * steps by the scene's frame step, so a step of 2 is one frame, not a cut.
+   * Viewport playback drops frames whenever it cannot keep up (a path-traced
+   * viewport never keeps up: measured 2 -> 12 -> 8 -> 4 on a 16-frame loop),
+   * and every dropped frame looked like a cut here, so the history was thrown
+   * away on every update of exactly the playback it was meant to smooth. The
+   * interactive motion pass holds where things were at the previous update,
+   * dropped frames included, so playback is left to the motion-limit check
+   * (clear_denoiser_history_on_jump). FALCON_DLSS_CUT_ON_PLAYBACK=1 restores
+   * the frame rule during playback. */
+  const bool playing = (b_v3d != nullptr) && (b_screen != nullptr) &&
+                       (b_screen->animtimer != nullptr);
+  static const bool cut_on_playback = getenv("FALCON_DLSS_CUT_ON_PLAYBACK") != nullptr;
+  const int frame_tolerance = (b_v3d == nullptr) ? max(1, b_scene->r.frame_step) : 1;
+  const bool frame_jump = (last_cut_frame_ != INT_MIN) &&
+                          (std::abs(cut_frame - last_cut_frame_) > frame_tolerance) &&
+                          (!playing || cut_on_playback);
+
+  /* A camera-bound marker switching cameras is the cut we can name exactly, and
+   * acting on it means both dropping the history (it cannot be reprojected
+   * across a cut) and warming it back up (a dropped history leaves the frame
+   * noisy -- that is what the switch pays for). So one switch governs both:
+   * "カメラ切り替え時の事前レンダリング" on the scene, and FALCON_DLSS_CUT_WARMUP
+   * =0 as the revert to the behaviour before 2026-09-04, where the switch was
+   * never even detected in a final render. (1, the default, = detect and drop
+   * the history; >1 additionally repeats the evaluate, which measured worse --
+   * see the cut warm-up note in denoiser_dlss.cpp.)
+   *
+   * ★Not detecting it is not the harmless half of the choice. Measured on
+   * frames 700..816: with the switch undetected the previous shot bleeds into
+   * the new one for five frames (mean 0.246 at the cut against the 0.169 the
+   * shot settles at, still 0.187 five frames later), and the high-frequency
+   * residual reads *low* because a ghost is smooth. The timeline-jump branch is not
+   * gated: it exists to stop the history ghosting across a scrub. */
+  blender::PointerRNA scene_rna_ptr = RNA_id_pointer_create(&b_scene->id);
+  blender::PointerRNA cscene = RNA_pointer_get(&scene_rna_ptr, "cycles");
+  static const int cut_warmup_env = getenv("FALCON_DLSS_CUT_WARMUP") ?
+                                        atoi(getenv("FALCON_DLSS_CUT_WARMUP")) :
+                                        1;
+  const bool camera_switch = (!last_cut_camera_.empty() && cut_camera != last_cut_camera_) &&
+                             cut_warmup_env != 0 && get_boolean(cscene, "denoising_cut_warmup");
+
+  if (camera_switch || frame_jump) {
+    if (getenv("FALCON_DLSS_DEBUG")) {
+      fprintf(stderr, "[cut] -> clear history (camera=%d frame=%d playing=%d)\n",
+              int(camera_switch), int(frame_jump), int(playing));
+    }
+    session->clear_denoiser_temporal_history();
+  }
+
+  last_cut_camera_ = cut_camera;
+  last_cut_frame_ = cut_frame;
+}
+
+void BlenderSession::clear_denoiser_history_on_jump()
+{
+  /* DLSS-RR is built for games: sixty small steps a second, so the previous frame is always a
+   * near neighbour of the current one and the motion vectors line the history up. A path-traced
+   * viewport runs at a few frames a second, so one flick of the mouse moves the camera further
+   * between two frames than a game moves in half a second. The history then gets warped by
+   * vectors that no longer describe it, and what was behind the newly revealed geometry smears
+   * across it -- the ghosting that made carrying history unusable.
+   *
+   * So carry it only while the step is small enough for RR to cope, and reset on the flicks. The
+   * limit is expressed in pixels of apparent motion, which is what actually matters to the
+   * reprojection, and is estimated from how far the camera turned and moved: turning by the whole
+   * field of view sweeps the whole width, and moving sideways by the distance to what you are
+   * looking at is about one radian of parallax. Above the limit the result is no worse than
+   * carrying nothing, which is where the viewport already was. */
+  if (!b_v3d || !b_rv3d || !scene->camera) {
+    have_last_view_matrix_ = false;
+    return;
+  }
+
+  const Transform view = scene->camera->get_matrix();
+
+  if (!have_last_view_matrix_) {
+    last_view_matrix_ = view;
+    have_last_view_matrix_ = true;
+    return;
+  }
+
+  blender::PointerRNA scene_rna_ptr = RNA_id_pointer_create(&b_scene->id);
+  blender::PointerRNA cscene = RNA_pointer_get(&scene_rna_ptr, "cycles");
+  const int motion_limit = get_int(cscene, "preview_denoising_carry_motion_limit");
+
+  const float3 pos = transform_get_column(&view, 3);
+  const float3 last_pos = transform_get_column(&last_view_matrix_, 3);
+
+  /* Angle between the two view directions, and the sideways shift measured against how far away
+   * the thing being orbited is -- both end up as radians of apparent motion. */
+  const float3 dir = -transform_get_column(&view, 2);
+  const float3 last_dir = -transform_get_column(&last_view_matrix_, 2);
+  const float turn = safe_acosf(clamp(dot(dir, last_dir), -1.0f, 1.0f));
+
+  const float focus = max(b_rv3d->dist, 1e-3f);
+  const float shift = len(pos - last_pos) / focus;
+
+  /* Radians to pixels: the sensor spans 2*atan(sensor/(2*lens)) across the width. */
+  const float lens = max(scene->camera->get_fov(), 1e-3f);
+  const float pixels_per_radian = float(width) / lens;
+  float motion_pixels = (turn + shift) * pixels_per_radian;
+
+  /* A moving object breaks the history the same way a moving camera does, and for the same
+   * reason: at a few frames a second it crosses far more of the screen between two frames than
+   * it would in a game. Its interactive motion pass still holds where it was last update, so
+   * measure the largest step any object took, seen from the camera. */
+  for (Object *ob : scene->objects) {
+    const array<Transform> &motion = ob->get_motion();
+    if (motion.empty()) {
+      continue;
+    }
+
+    const Transform ob_tfm = ob->get_tfm();
+    const float3 ob_pos = transform_get_column(&ob_tfm, 3);
+    const float3 ob_last_pos = transform_get_column(&motion[0], 3);
+    const float step = len(ob_pos - ob_last_pos);
+    if (step == 0.0f) {
+      continue;
+    }
+
+    /* Apparent size of the step: the further away it is, the less of the screen it crosses. */
+    const float distance = max(len(ob_pos - pos), 1e-3f);
+    motion_pixels = max(motion_pixels, (step / distance) * pixels_per_radian);
+  }
+
+  if (getenv("FALCON_DLSS_DEBUG")) {
+    fprintf(stderr,
+            "[jump] motion=%.1fpx limit=%d turn=%.4f shift=%.4f%s\n",
+            motion_pixels,
+            motion_limit,
+            turn,
+            shift,
+            (motion_pixels > float(motion_limit)) ? " -> clear history" : "");
+  }
+  if (motion_pixels > float(motion_limit)) {
+    session->clear_denoiser_temporal_history();
+  }
+
+  last_view_matrix_ = view;
+}
+
 void BlenderSession::render(blender::Depsgraph &b_depsgraph_)
 {
   b_depsgraph = &b_depsgraph_;
@@ -344,9 +571,41 @@ void BlenderSession::render(blender::Depsgraph &b_depsgraph_)
     return;
   }
 
+  /* Final renders step through the frames themselves, so the cut check has to
+   * run here too -- synchronize() is the viewport's path. */
+  clear_denoiser_history_on_cut();
+
   /* Create driver to write out render results. */
   ensure_display_driver_if_needed();
   session->set_output_driver(make_unique<BlenderOutputDriver>(b_engine));
+
+  session->set_is_animation((b_engine.flag & blender::RE_ENGINE_ANIMATION) != 0);
+
+  /* dlss_history_warmed_this_job is process-global (BlenderSession itself is
+   * rebuilt every frame, see its declaration), so it never sees a *job*
+   * boundary on its own -- once set, it would otherwise stay true for every
+   * later animation render in this Blender session, including the genuine
+   * cold first frame of an unrelated job. The start frame of the current
+   * range is the signal we actually have for "this is frame 1 of this job";
+   * treat reaching it as a fresh start and force the pre-roll again. */
+  if (b_scene->r.cfra == b_scene->r.sfra) {
+    dlss_history_warmed_this_job = false;
+  }
+
+  if (getenv("FALCON_DEBUG_LIFECYCLE")) {
+    fprintf(stderr,
+            "[lifecycle] render() this=%p session=%p cfra=%d sfra=%d warmed_flag=%d\n",
+            (void *)this,
+            (void *)session.get(),
+            b_scene->r.cfra,
+            b_scene->r.sfra,
+            int(dlss_history_warmed_this_job));
+  }
+  if (dlss_history_warmed_this_job) {
+    /* Session may have just been freshly rebuilt (Persistent Data off) --
+     * tell it not to treat this frame as the cold first frame of the job. */
+    session->set_dlss_history_warm();
+  }
 
   session->full_buffer_written_cb = [&](string_view filename) { full_buffer_written(filename); };
 
@@ -356,7 +615,7 @@ void BlenderSession::render(blender::Depsgraph &b_depsgraph_)
   const SessionParams session_params = BlenderSync::get_session_params(
       b_engine, b_userpref, *b_scene, background, pixelsize);
   BufferParams buffer_params = BlenderSync::get_buffer_params(
-      b_v3d, b_rv3d, scene->camera, width, height);
+      b_v3d, b_rv3d, b_scene, scene, width, height);
 
   /* temporary render result to find needed passes and views */
   blender::RenderResult *b_rr = RE_engine_begin_result(
@@ -477,6 +736,11 @@ void BlenderSession::render(blender::Depsgraph &b_depsgraph_)
   session->progress.get_time(total_time, render_time);
   LOG_INFO << "Total render time: " << total_time;
   LOG_INFO << "Render time (without synchronization): " << render_time;
+
+  /* This frame is done: any later frame in this job (even one rendered by a
+   * freshly rebuilt Session, see set_dlss_history_warm above) no longer
+   * needs the cold-start DLSS-RR pre-roll. */
+  dlss_history_warmed_this_job = true;
 }
 
 void BlenderSession::render_frame_finish()
@@ -801,6 +1065,11 @@ void BlenderSession::synchronize(blender::Depsgraph &b_depsgraph_)
    * synchronization at a later time to not block on running updates */
   sync->sync_recalc(b_depsgraph_, b_screen, b_v3d, b_rv3d);
 
+  /* Timeline playback in the viewport: see Session::set_playback and
+   * clear_denoiser_history_on_cut for what it changes. */
+  session->set_playback((b_v3d != nullptr) && (b_screen != nullptr) &&
+                        (b_screen->animtimer != nullptr));
+
   /* don't do synchronization if on pause */
   if (session_pause) {
     tag_update();
@@ -833,9 +1102,12 @@ void BlenderSession::synchronize(blender::Depsgraph &b_depsgraph_)
     sync->sync_camera(*b_render, width, height, "");
   }
 
+  clear_denoiser_history_on_cut();
+  clear_denoiser_history_on_jump();
+
   /* get buffer parameters */
   const BufferParams buffer_params = BlenderSync::get_buffer_params(
-      b_v3d, b_rv3d, scene->camera, width, height);
+      b_v3d, b_rv3d, b_scene, scene, width, height);
 
   /* reset if needed */
   if (scene->need_reset()) {
@@ -957,7 +1229,7 @@ void BlenderSession::view_draw(const int w, const int h)
       const SessionParams session_params = BlenderSync::get_session_params(
           b_engine, b_userpref, *b_scene, background, pixelsize);
       const BufferParams buffer_params = BlenderSync::get_buffer_params(
-          b_v3d, b_rv3d, scene->camera, width, height);
+          b_v3d, b_rv3d, b_scene, scene, width, height);
       const bool session_pause = BlenderSync::get_session_pause(*b_scene, background);
 
       if (session_pause == false) {

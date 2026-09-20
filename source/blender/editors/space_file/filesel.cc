@@ -32,6 +32,7 @@
 #include "MEM_guardedalloc.h"
 
 #include "BLI_fileops.h"
+#include "BLI_listbase_iterator.hh"
 #include "BLI_fnmatch.h"
 #include "BLI_math_base.h"
 #include "BLI_path_utils.hh"
@@ -98,6 +99,92 @@ static void fileselect_initialize_params_common(SpaceFile *sfile, FileSelectPara
   /* Switching thumbnails needs to recalc layout #28809. */
   if (sfile->layout) {
     sfile->layout->dirty = true;
+  }
+}
+
+bool ED_fileselect_sequence_grouping_enabled()
+{
+  /* Read once: the environment cannot change while Blender runs, and this is called per redraw. */
+  static const bool enabled = []() {
+    const char *env = BLI_getenv("FALCON_FILE_SEQUENCE_GROUP");
+    return !(env && STREQ(env, "0"));
+  }();
+  return enabled;
+}
+
+/** Falcon: whether \a op is a Video Sequencer operator (its file browser folds by default). */
+static bool fileselect_sequence_grouping_op_is_sequencer(const wmOperator *op)
+{
+  if (op == nullptr || op->type == nullptr) {
+    return false;
+  }
+  return STRPREFIX(op->type->idname, "SEQUENCER_OT_");
+}
+
+/**
+ * Falcon: whether the file browser opened by \a op should fold numbered image sequences by
+ * default. Only the Video Sequencer wants this; opening an image as a texture or in the Image
+ * Editor must keep showing one entry per file.
+ */
+static bool fileselect_sequence_grouping_default(const wmOperator *op)
+{
+  if (!ED_fileselect_sequence_grouping_enabled()) {
+    return false;
+  }
+  return fileselect_sequence_grouping_op_is_sequencer(op);
+}
+
+/**
+ * Falcon: bits of #UserDef_FileSpaceData.flag that remember the "Group Image Sequences" choice
+ * of file browser dialogs (opened by an operator), relative to their default, one bit per kind
+ * of dialog: those of Video Sequencer operators (on by default) and all others (off by default).
+ * Cleared bits (the factory value, and what preferences saved without Falcon hold) mean "use the
+ * default". Written when a dialog closes (#ED_fileselect_params_to_userdef()), read when one opens
+ * (#ED_fileselect_set_params_from_userdef()), like the display settings. They are bits
+ * #FileSelectParams.flag does not use, and are never copied into it (see
+ * #PARAMS_FLAGS_REMEMBERED).
+ */
+static constexpr eFileSel_Params_Flag USERDEF_GROUP_SEQUENCES_OFF_IN_SEQUENCER =
+    FILE_PARAMS_FLAG_UNUSED_1;
+static constexpr eFileSel_Params_Flag USERDEF_GROUP_SEQUENCES_ON_ELSEWHERE =
+    FILE_PARAMS_FLAG_UNUSED_2;
+
+static eFileSel_Params_Flag fileselect_sequence_grouping_userdef_bit(const wmOperator *op)
+{
+  return fileselect_sequence_grouping_op_is_sequencer(op) ?
+             USERDEF_GROUP_SEQUENCES_OFF_IN_SEQUENCER :
+             USERDEF_GROUP_SEQUENCES_ON_ELSEWHERE;
+}
+
+void fileselect_ensure_sequence_grouping_default(const bScreen *screen, SpaceFile *sfile)
+{
+  if (sfile == nullptr || sfile->op != nullptr) {
+    /* A browser opened by an operator keeps the operator based default, see
+     * #fileselect_sequence_grouping_default(). Its (temporary) screen has no sequencer anyway. */
+    return;
+  }
+  FileSelectParams *params = sfile->params;
+  if (params == nullptr || sfile->runtime == nullptr ||
+      sfile->runtime->sequence_grouping_default_done)
+  {
+    return;
+  }
+  sfile->runtime->sequence_grouping_default_done = true;
+
+  if (!ED_fileselect_sequence_grouping_enabled() || screen == nullptr) {
+    return;
+  }
+  if (params->group_sequences & FILE_GROUP_SEQUENCES_CHOSEN) {
+    /* Picked with the toggle (and saved with the file): that is this browser's setting now. */
+    return;
+  }
+  /* An embedded browser that shares its screen with a Video Sequencer (the "Video Editing"
+   * workspace) is there to bring footage in, so fold numbered image sequences by default. */
+  for (const ScrArea &area : screen->areabase) {
+    if (area.spacetype == SPACE_SEQ) {
+      params->group_sequences |= FILE_GROUP_SEQUENCES;
+      break;
+    }
   }
 }
 
@@ -222,6 +309,8 @@ static FileSelectParams *fileselect_ensure_updated_file_params(SpaceFile *sfile)
     }
 
     params->flag = eFileSel_Params_Flag{};
+    params->group_sequences = fileselect_sequence_grouping_default(op) ? FILE_GROUP_SEQUENCES :
+                                                                         0;
     if (is_directory == true && is_filename == false && is_filepath == false && is_files == false)
     {
       params->flag |= FILE_DIRSEL_ONLY;
@@ -690,6 +779,13 @@ void ED_fileselect_set_params_from_userdef(SpaceFile *sfile)
     return;
   }
 
+  /* Falcon: the "Group Image Sequences" choice last made in a dialog of the same kind. */
+  if (ED_fileselect_sequence_grouping_enabled() &&
+      (sfile_udata->flag & fileselect_sequence_grouping_userdef_bit(op)))
+  {
+    params->group_sequences = fileselect_sequence_grouping_default(op) ? 0 : FILE_GROUP_SEQUENCES;
+  }
+
   if (sfile_udata->thumbnail_size == 0) {
     /* Saved params are invalid so continue with defaults. */
     return;
@@ -713,7 +809,7 @@ void ED_fileselect_set_params_from_userdef(SpaceFile *sfile)
   }
 }
 
-void ED_fileselect_params_to_userdef(SpaceFile *sfile)
+void ED_fileselect_params_to_userdef(SpaceFile *sfile, const wmOperator *op)
 {
   FileSelectParams *params = ED_fileselect_get_active_params(sfile);
   UserDef_FileSpaceData *sfile_udata_new = &U.file_space_data;
@@ -735,6 +831,17 @@ void ED_fileselect_params_to_userdef(SpaceFile *sfile)
     /* In this case also remember the invert flag. */
     sfile_udata_new->flag = (sfile_udata_new->flag & ~FILE_SORT_INVERT) |
                             (params->flag & FILE_SORT_INVERT);
+  }
+
+  /* Falcon: keep the "Group Image Sequences" memory (the flags were rewritten above) and update
+   * the bit of this dialog's kind: set when it closes with the other value than its default. */
+  sfile_udata_new->flag |= sfile_udata_old.flag & (USERDEF_GROUP_SEQUENCES_OFF_IN_SEQUENCER |
+                                                   USERDEF_GROUP_SEQUENCES_ON_ELSEWHERE);
+  if (op && ED_fileselect_sequence_grouping_enabled()) {
+    const bool group = (params->group_sequences & FILE_GROUP_SEQUENCES) != 0;
+    SET_FLAG_FROM_TEST(sfile_udata_new->flag,
+                       group != fileselect_sequence_grouping_default(op),
+                       fileselect_sequence_grouping_userdef_bit(op));
   }
 
   /* Tag preferences as dirty if something has changed. */
@@ -1363,7 +1470,7 @@ void ED_fileselect_exit(wmWindowManager *wm, SpaceFile *sfile)
     return;
   }
   if (sfile->op) {
-    ED_fileselect_params_to_userdef(sfile);
+    ED_fileselect_params_to_userdef(sfile, sfile->op);
     WM_event_fileselect_event(wm, sfile->op, EVT_FILESELECT_EXTERNAL_CANCEL);
     sfile->op = nullptr;
   }
@@ -1527,12 +1634,12 @@ void ED_fileselect_ensure_default_filepath(bContext *C, wmOperator *op, const ch
 Vector<std::string> ED_fileselect_selected_files_full_paths(const SpaceFile *sfile)
 {
   Vector<std::string> paths;
-  char path[FILE_MAX_LIBEXTRA];
   for (const int i : IndexRange(filelist_files_ensure(sfile->files))) {
     if (filelist_entry_is_selected(sfile->files, i)) {
+      /* Falcon: a folded image sequence stands for all of its frames, so hand out every one of
+       * them (same enumeration as #file_ops.cc and #file_draw.cc). */
       const FileDirEntry *entry = filelist_file(sfile->files, i);
-      filelist_file_get_full_path(sfile->files, entry, path);
-      paths.append(path);
+      paths.extend(filelist_file_expand_full_paths(sfile->files, entry));
     }
   }
   return paths;

@@ -249,6 +249,51 @@ void filelist_file_get_full_path(const FileList *filelist,
   BLI_path_join(r_filepath, FILE_MAX_LIBEXTRA, root, file->relpath);
 }
 
+Vector<std::string> filelist_file_expand_names(const FileDirEntry *file)
+{
+  Vector<std::string> names;
+  if (file->relpath == nullptr) {
+    return names;
+  }
+  if ((file->typeflag & FILE_TYPE_IMAGE_SEQUENCE) == 0) {
+    names.append(file->relpath);
+    return names;
+  }
+
+  /* Falcon: rebuild the frame names the fold was made of (see #filelist_filter()). */
+  char head[FILE_MAX], tail[FILE_MAX];
+  ushort digits = 0;
+  BLI_path_sequence_decode(file->relpath, head, sizeof(head), tail, sizeof(tail), &digits);
+  for (int framenr = file->seq_first; framenr <= file->seq_last; framenr++) {
+    char frame_name[FILE_MAX];
+    BLI_path_sequence_encode(frame_name, sizeof(frame_name), head, tail, digits, framenr);
+    names.append(frame_name);
+  }
+  return names;
+}
+
+Vector<std::string> filelist_file_expand_full_paths(const FileList *filelist,
+                                                    const FileDirEntry *file)
+{
+  char full_path[FILE_MAX_LIBEXTRA];
+  filelist_file_get_full_path(filelist, file, full_path);
+
+  Vector<std::string> paths;
+  if (file->typeflag & FILE_TYPE_IMAGE_SEQUENCE) {
+    char dir[FILE_MAX_LIBEXTRA];
+    BLI_path_split_dir_part(full_path, dir, sizeof(dir));
+    for (const std::string &name : filelist_file_expand_names(file)) {
+      char frame_path[FILE_MAX_LIBEXTRA];
+      BLI_path_join(frame_path, sizeof(frame_path), dir, name.c_str());
+      paths.append(frame_path);
+    }
+  }
+  if (paths.is_empty()) {
+    paths.append(full_path);
+  }
+  return paths;
+}
+
 bool filelist_file_is_preview_pending(const FileList *filelist, const FileDirEntry *file)
 {
   /* Actual preview loading is only started after the filelist is loaded, so the file isn't flagged
@@ -382,6 +427,10 @@ static int filelist_geticon_file_type_ex(const FileList *filelist,
   if (typeflag & FILE_TYPE_BLENDER_BACKUP) {
     return ICON_FILE_BACKUP;
   }
+  if (typeflag & FILE_TYPE_IMAGE_SEQUENCE) {
+    /* Falcon: a folded image sequence is presented as a single movie-like item. */
+    return ICON_FILE_MOVIE;
+  }
   if (typeflag & FILE_TYPE_IMAGE) {
     return ICON_FILE_IMAGE;
   }
@@ -506,6 +555,9 @@ static void filelist_intern_entry_free(FileList *filelist, FileListInternEntry *
   }
   if (entry->name && entry->free_name) {
     MEM_delete(const_cast<char *>(entry->name));
+  }
+  if (entry->seq_name) {
+    MEM_delete(entry->seq_name);
   }
   MEM_delete(entry);
 }
@@ -1206,13 +1258,20 @@ static FileDirEntry *filelist_file_create_entry(FileList *filelist, const int in
   ret->time = int64_t(entry->st.st_mtime);
 
   ret->relpath = BLI_strdup(entry->relpath);
-  if (entry->free_name) {
+  if (entry->seq_name) {
+    /* Falcon: folded image sequence, show `name[0000-1350].png` instead of the first frame. */
+    ret->name = BLI_strdup(entry->seq_name);
+    ret->flags |= FILE_ENTRY_NAME_FREE;
+  }
+  else if (entry->free_name) {
     ret->name = BLI_strdup(entry->name);
     ret->flags |= FILE_ENTRY_NAME_FREE;
   }
   else {
     ret->name = entry->name;
   }
+  ret->seq_first = (entry->typeflag & FILE_TYPE_IMAGE_SEQUENCE) ? entry->seq_first : 0;
+  ret->seq_last = (entry->typeflag & FILE_TYPE_IMAGE_SEQUENCE) ? entry->seq_last : 0;
   ret->uid = entry->uid;
   ret->blentype = entry->blentype;
   ret->typeflag = entry->typeflag;

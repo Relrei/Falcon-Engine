@@ -311,6 +311,15 @@ if(WITH_OPENIMAGEDENOISE)
   add_definitions(-DWITH_OPENIMAGEDENOISE)
 endif()
 
+if(WITH_DLSS)
+  find_package(DLSS)
+  if(DLSS_FOUND)
+    add_definitions(-DWITH_DLSS)
+  else()
+    set_and_warn_library_found("DLSS" DLSS_FOUND WITH_DLSS)
+  endif()
+endif()
+
 if(WITH_OPENVDB)
   add_definitions(-DWITH_OPENVDB)
 endif()
@@ -341,6 +350,14 @@ endif()
 # NaN debugging
 if(WITH_CYCLES_DEBUG_NAN)
   add_definitions(-DWITH_CYCLES_DEBUG_NAN)
+endif()
+
+# Falcon spatial hash radiance cache (read-only cache + in-kernel blend), and the kernel data of the
+# Falcon photon / light tracing features that shares its block. ON by default: every shipped build
+# uses it, and the kernel does not compile without it.
+option(WITH_FALCON_SHARC "Enable Falcon spatial hash radiance cache and photon kernel data" ON)
+if(WITH_FALCON_SHARC)
+  add_definitions(-DWITH_FALCON_SHARC)
 endif()
 
 if(WITH_PUGIXML OR OPENIMAGEIO_PUGIXML_FOUND)

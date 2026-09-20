@@ -100,10 +100,10 @@ ImBuf *final_image_cache_get(Scene *scene,
       return nullptr;
     }
     res = cache->map_.lookup_default(key, nullptr);
-  }
-
-  if (res) {
-    IMB_refImBuf(res);
+    /* Acquire ownership before eviction or invalidation can release the cache reference. */
+    if (res) {
+      IMB_refImBuf(res);
+    }
   }
   return res;
 }
@@ -117,6 +117,10 @@ void final_image_cache_put(Scene *scene,
                            ImBuf *image)
 {
   if (is_render) {
+    return;
+  }
+  /* 空きが柔らかい下限を割っている間は太らせない(既に入っている物は残す)。 */
+  if (cache_should_stop_growing(scene)) {
     return;
   }
 
@@ -192,6 +196,18 @@ void final_image_cache_iterate(Scene *scene,
   }
   for (const FinalImageCache::Key &frame_view : cache->map_.keys()) {
     callback_iter(userdata, frame_view.timeline_frame);
+  }
+}
+
+void final_image_cache_collect_images(const Scene *scene, Set<const ImBuf *> &r_images)
+{
+  std::lock_guard lock(final_image_cache_mutex);
+  FinalImageCache *cache = query_final_image_cache(scene);
+  if (cache == nullptr) {
+    return;
+  }
+  for (ImBuf *frame : cache->map_.values()) {
+    r_images.add(frame);
   }
 }
 

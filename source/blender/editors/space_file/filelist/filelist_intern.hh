@@ -92,6 +92,21 @@ struct FileListInternEntry {
   BLI_stat_t st = {0};
 
   /**
+   * Falcon: numbered image sequence folding (runtime only, rebuilt on every #filelist_filter call).
+   *
+   * - On the entry that represents the whole sequence: #seq_name holds the display name
+   *   (`name[0000-1350].png`), #seq_first / #seq_last the frame range and #seq_digits the number
+   *   of digits. #typeflag also gets #FILE_TYPE_IMAGE_SEQUENCE. #relpath is left untouched so it
+   *   still points at the first real frame.
+   * - On every other frame of the sequence: #seq_skip is true, so it is dropped while filtering.
+   */
+  char *seq_name = nullptr;
+  int seq_first = 0;
+  int seq_last = 0;
+  unsigned short seq_digits = 0;
+  bool seq_skip = false;
+
+  /**
    * Be careful not to use the returned asset pointer in a context where it might be dangling, e.g.
    * because the file list or the asset library were destroyed.
    */
@@ -194,6 +209,8 @@ enum {
   FLF_ASSETS_ONLY = 1 << 4,
   FLF_ASSETS_HIDE_ONLINE = 1 << 5,
   FLF_ASSETS_HIDE_OFFLINE = 1 << 6,
+  /** Falcon: fold numbered image sequences into a single entry. */
+  FLF_GROUP_SEQUENCES = 1 << 7,
 };
 
 struct FileListReadJob;

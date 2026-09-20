@@ -10,6 +10,8 @@
 
 #include "DNA_space_enums.h"
 
+#include <string>
+
 #include "BLI_function_ref.hh"
 #include "BLI_set.hh"
 #include "BLI_vector.hh"
@@ -51,6 +53,20 @@ void proxy_build_process(ProxyBuildContext *context,
 
 /* Cleans up and deallocates the proxy build context. */
 void proxy_build_finish(ProxyBuildContext *context);
+
+/**
+ * Absolute path of the media file the *original* strip of this build context reads from. Empty
+ * for strips that are not movies.
+ *
+ * The key is the *file*, not the strip: `ProxyBuildContext::strip` is a duplicate made by
+ * #proxy_build_start and gets a fresh session UID of its own, and - more importantly - a file is
+ * normally shared by several strips (cutting a clip in two leaves two strips on one file). Only
+ * the first of those strips reaches the queue; #MOV_proxy_builder_start rejects the rest as
+ * duplicates of a proxy path already being built, *after* #proxy_build_start has already closed
+ * their readers. #proxy_endjob therefore has to re-open every strip on that file, not just the
+ * one it happened to queue.
+ */
+const std::string &proxy_build_context_source_path(const ProxyBuildContext *context);
 
 void proxy_set(Strip *strip, bool value);
 bool can_use_proxy(const RenderData *context, const Strip *strip, IMB_Proxy_Size psize);

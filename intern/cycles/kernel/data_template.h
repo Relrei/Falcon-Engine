@@ -136,6 +136,8 @@ KERNEL_STRUCT_MEMBER(film, int, pass_denoising_normal)
 KERNEL_STRUCT_MEMBER(film, int, pass_denoising_roughness)
 KERNEL_STRUCT_MEMBER(film, int, pass_denoising_depth)
 KERNEL_STRUCT_MEMBER(film, int, pass_denoising_backward_motion)
+KERNEL_STRUCT_MEMBER(film, int, pass_denoising_specular_hit_distance)
+KERNEL_STRUCT_MEMBER(film, float, specular_hit_distance_far)
 KERNEL_STRUCT_MEMBER(film, int, denoising_pass_options_flag)
 /* AOVs. */
 KERNEL_STRUCT_MEMBER(film, int, pass_aov_color)
@@ -236,6 +238,146 @@ KERNEL_STRUCT_MEMBER(integrator, int, use_volume_guiding)
 KERNEL_STRUCT_MEMBER(integrator, int, use_guiding_direct_light)
 KERNEL_STRUCT_MEMBER(integrator, int, use_guiding_mis_weights)
 KERNEL_STRUCT_MEMBER(integrator, int, pad1)
+
+/* Falcon SHARC. `falcon_sharc_active` is 1 only when FALCON_SHARC_MODE selects
+ * warmup/blend; it gates the in-kernel blend so a normal render is a complete
+ * no-op (no cache lookup at all). `falcon_sharc_alpha` is the runtime blend
+ * factor (FALCON_SHARC_ALPHA), tunable without a kernel recompile. */
+#ifdef WITH_FALCON_SHARC
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_sharc_active)
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_sharc_alpha)
+/* Falcon DAS: gates the per-pixel threshold scale in the adaptive sampling
+ * convergence check. `falcon_das_strength` lerps the map's effect (0 = off,
+ * 1 = map as-is) so it can be tuned without rebuilding the map.
+ * `falcon_das_active` is 0 when off and otherwise the number of floats in
+ * falcon_das_scale -- the kernel uses it as the bound for its index, because
+ * the map is a file whose path comes out of the .blend (2026-08-21). */
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_das_active)
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_das_strength)
+/* Falcon Photon Cache: additive caustic lookup at any surface vertex (the
+ * cache then holds photon-estimated caustic radiance, not path radiance).
+ * `falcon_sharc_cell_size` makes the grid resolution a runtime knob shared by
+ * SHARC and the photon cache (FALCON_SHARC_CELL, default 0.2). */
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_photon_add)
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_photon_lookup_gate)
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_photon_nearest)
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_sharc_cell_size)
+/* Falcon Photon GPU bake pass: camera rays are replaced by light-emitted
+ * photons that deposit caustic radiance into the (const-cast) sharc cache at
+ * their first diffuse hit. flux = per-photon power (host: light watts * k /
+ * photon count). Sun photons launch as parallel rays over the scene-footprint
+ * rectangle at z = sun_z. 8 members keep the falcon block a multiple of 4. */
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_photon_pass)
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_photon_flux)
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_photon_is_sun)
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_photon_sun_minx)
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_photon_sun_miny)
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_photon_sun_sizex)
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_photon_sun_sizey)
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_photon_sun_z)
+/* Falcon Dispersion v0: global Cauchy-B strength (um^2) applied to every
+ * smooth refractive microfacet closure; 0 disables (FALCON_DISPERSION.md).
+ * Paired with falcon_pad0 to keep the falcon block a multiple of 4. */
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_dispersion_b)
+/* Falcon Photon map: caustic deposit radius in cells (fixed-radius kernel
+ * density estimation; 0/1 = legacy 2x2x2 splat). Wider = smoother caustics
+ * from fewer photons, at more deposits/photon during the bake. */
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_photon_radius)
+/* Falcon Photon POINT map (Round 9, LuxCore-faithful): photons stored as raw
+ * points (pos/flux/normal), density estimated at lookup over a host-built
+ * neighbor grid. point_store gates the bake-time append; point_mode gates the
+ * add-time gather. radius (m), cos (normal-angle rejection) and gain are
+ * RENDER-TIME knobs -- retuning them never needs a rebake. 8 members keep the
+ * falcon block a multiple of 4. */
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_photon_point_store)
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_photon_point_max)
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_photon_point_mode)
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_photon_point_radius)
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_photon_point_cos)
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_photon_point_gain)
+/* Spot photon emission: is_spot selects cone emission from the light origin
+ * (uniform in solid angle; flux = watts * Omega/(4 pi) / N, i.e. the point
+ * light's intensity W/(4 pi) integrated over the cone). */
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_photon_is_spot)
+/* Falcon Light Tracing (FQ, cache-free caustics): when set, the photon bake
+ * pass splats the first-diffuse-hit flux DIRECTLY to the camera pixel (project
+ * + connect) instead of depositing into the map. gain is a labeled brightness
+ * knob until the camera importance We is calibrated. 4 members keep the block a
+ * multiple of 4. */
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_lighttrace)
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_lighttrace_gain)
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_lt_direct)
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_lt_samples)
+/* Light-tracing performance knobs (labeled non-physical): splat_radius (px,
+ * 0 = physical single-pixel splat) spreads each splat over an energy-
+ * normalized Gaussian footprint so few photons/SPP look smooth. visibility
+ * gates the vertex->camera occlusion ray (reserved, wired in the next step).
+ * 4 members keep the block a multiple of 4. */
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_lt_splat_radius)
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_lt_visibility)
+/* ★2026-09-06 S1: 画素あたりに実際に撃った光子の数(= FALCON_PHOTON_N を
+ * 画素数で割った物)。splat の重みは film の /sample_count を打ち消すために
+ * これを掛ける。今までは「レンダーの SPP」(falcon_lt_samples)を使っていて、
+ * 光子の数とレンダーの SPP が同じであることが暗黙の前提だった。撃った数で
+ * 正規化しておくと、光子の予算を SPP と切り離せる(ビューポート案の
+ * work tile 分割・Auto の光子数)。0 = 旧来どおり falcon_lt_samples を使う。
+ * ★2026-09-06 S4: 1回のレンダーで全部の灯から撒く(0 = 灯ごとに別レンダー)。
+ *   灯は出力に比例して選び、光子1個の flux は「全灯の合計出力 / N」になる
+ *   ので、どの灯を引いても同じ値になる。この2つで members は偶数のまま
+ *   (下の float2 pixel_jitter の CPU/GPU オフセットが揃う条件)。 */
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_lt_photons)
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_photon_all_lights)
+/* World (uniform environment) photon emission: per direction a parallel beam
+ * through the caster bounding sphere's cross-section disk (pbrt
+ * UniformInfiniteLight, power = 4 pi^2 r^2 L). Geometry rides in the sun_*
+ * fields (center = sun_minx/miny/z, disk radius = sun_sizex, launch backoff
+ * = sun_sizey) -- is_sun/is_spot/is_world are mutually exclusive. */
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_photon_is_world)
+/* Contact caustics: when a photon's LAST segment is shorter than 2 cells, the
+ * specular surface it came from is sitting on the receiver, and the caustic it
+ * makes is pinned to a LINE (the contact) instead of spread over an area. A
+ * fixed-cell density estimate cannot represent that -- the stored radiance goes
+ * as 1/cell and never settles (measured +0.94/+0.67/+0.37/+0.18 of whole-image
+ * energy at cells 1/2/4/8 mm, a glass cup standing on a table, 2026-08-15).
+ * This is the deposit radius in cells used for those photons only; 0 = off, so
+ * the global Caustic Smoothness stays at its shipped 1.0 and heavy scenes keep
+ * their hash occupancy (raising it globally took glasszoo 37% -> 70%). */
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_photon_contact_radius)
+/* Falcon error field: the measured (reference-free) relative error per world
+ * cell, from the PT/LT double-estimator route. `falcon_error_threshold` > 0
+ * arms it; a camera-visible cell whose error is at or below the threshold is
+ * considered already solved by the radiance cache, so the path takes the
+ * cached value in full and stops there. `falcon_error_cell_size` is separate
+ * from the SHARC cell size on purpose: the statistics need a coarser grid
+ * (0.8 m measured) than the cache (0.2 m). Two members, so the falcon block
+ * keeps its even count. */
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_error_cell_size)
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_error_threshold)
+/* `falcon_error_raise_alpha` = the field is trusted enough to take the cache in
+ * full where it passes, not merely to skip a substitution already decided. It
+ * is opt-in because it changes the picture: only a field that measures the
+ * CACHE's own error (warmup spread, gated on how many pixels landed in the
+ * cell) earns it -- the light tracer's error field does not, and using it that
+ * way cost 29% of an image's energy on 2026-07-29. `falcon_error_pad1` keeps
+ * the falcon member count even. */
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_error_raise_alpha)
+/* How short the photon's last segment has to be (in cells) to count as
+ * "the caster is touching the receiver". Paired with contact_radius; a knob
+ * because the height at which photons leave a cup WALL is a scene dimension,
+ * not a constant -- at 2 cells only the ones leaving the base qualify. */
+KERNEL_STRUCT_MEMBER(integrator, float, falcon_photon_contact_cells)
+/* How many diffuse vertices of one camera path may add the photon layer
+ * (0 = no limit, the default and the behaviour up to 2026-08-15).
+ * ⚠ Measured ineffective for the glass-on-table defect it was added for:
+ * limits 1/2/4 render within 1e-5 per pixel of no limit (see shade_surface.h).
+ *
+ * This slot used to be falcon_pad0, which existed only to keep the extra
+ * falcon members an even count so the float2 pixel_jitter below keeps
+ * identical CPU/GPU offsets (CUDA float2 is align-8, Cycles CPU float2 is
+ * align-4 -- an odd count would desync the layouts). Taking the pad rather
+ * than appending a member is what keeps that count unchanged. */
+KERNEL_STRUCT_MEMBER(integrator, int, falcon_photon_lookup_bounces)
+#endif
 
 KERNEL_STRUCT_MEMBER(integrator, float2, pixel_jitter)
 KERNEL_STRUCT_END(KernelIntegrator)

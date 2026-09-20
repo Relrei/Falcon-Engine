@@ -9,6 +9,7 @@
 #include "scene/scene.h"
 #include "session/session.h"
 
+#include "util/string.h"
 #include "util/unique_ptr.h"
 #include "util/vector.h"
 
@@ -110,6 +111,33 @@ class BlenderSession {
   double last_progress;
   double last_status_time;
 
+  /* Hard-cut detection for the DLSS-RR viewport history (bound-camera marker
+   * switches and timeline jumps reset it; playback steps of one frame keep
+   * it and get warped by the interactive motion passes instead). */
+  /* Drop the DLSS-RR history when the frame that follows cannot be reached from
+   * the last one by motion vectors (marker camera switch, timeline jump). */
+  void clear_denoiser_history_on_cut();
+  /* ★These have to be process-global for the same reason dlss_history_warmed_
+   * this_job is (see its declaration): a background animation render builds a
+   * fresh BlenderSession for every frame, so a per-instance member is back at
+   * its initial value on the frame that opens a cut and the comparison below
+   * can never fire. Measured 2026-09-04: the marker camera switches of the tree
+   * film (603/812/966) were never detected in the final render, so the history
+   * was neither dropped nor warmed there and those frames came out at twice the
+   * high-frequency residual of their neighbours. Reset at the start frame of a
+   * job (see clear_denoiser_history_on_cut). */
+  /* ★カメラの「名前」で覚える。評価済みの Object * は使えない — 背景のアニメ書き出しでは
+   * 評価のたびに新しい複製ができ、8 コマの書き出しで 36 種類の番地が出た(2026-09-20 実測)。
+   * ポインタで比べると毎コマ「カメラが変わった」= 偽の当たりになり、履歴を 1 コマ 5 回捨てる。 */
+  static string last_cut_camera_;
+  static int last_cut_frame_;
+
+  /* Viewport: drop the carried history when the camera jumped too far for the motion vectors to
+   * explain (see clear_denoiser_history_on_jump). */
+  void clear_denoiser_history_on_jump();
+  Transform last_view_matrix_ = transform_identity();
+  bool have_last_view_matrix_ = false;
+
   int width, height;
   float pixelsize;
   bool preview_osl;
@@ -131,6 +159,17 @@ class BlenderSession {
   static bool headless;
 
   static bool print_render_stats;
+
+  /* Background animation renders: a fresh BlenderSession (and therefore a
+   * fresh inner Session/RenderScheduler) is constructed for every single
+   * frame -- Persistent Data does not keep the BlenderSession itself alive,
+   * only whether the frame-boundary sync tears down the *inner* Session (see
+   * reset_session()). A per-instance member can therefore never see a
+   * previous frame's state; this has to be process-global. Set once a frame
+   * has completed with DLSS-RR history established, so a freshly constructed
+   * BlenderSession/Session for the next frame is told the history is already
+   * warm instead of re-running the first-frame pre-roll on every frame. */
+  static bool dlss_history_warmed_this_job;
 
  protected:
   void stamp_view_layer_metadata(Scene *scene, const string &view_layer_name);

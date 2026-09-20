@@ -56,6 +56,7 @@
 #  include "CCL_api.h"
 #endif
 
+
 #include "BPY_extern.hh"
 #include "BPY_extern_python.hh"
 #include "BPY_extern_run.hh"
@@ -311,6 +312,7 @@ static PyObject *CCL_initPython()
   return (PyObject *)CCL_python_module_init();
 }
 #endif
+
 
 #ifdef WITH_HYDRA
 /* Defined in `render_hydra` module. */
@@ -794,6 +796,29 @@ void BPY_DECREF(void *pyob_ptr)
 {
   const PyGILState_STATE gilstate = PyGILState_Ensure();
   Py_DECREF((PyObject *)pyob_ptr);
+  PyGILState_Release(gilstate);
+}
+
+void BPY_call_method_no_args(void *pyob_ptr, const char *method_name)
+{
+  const PyGILState_STATE gilstate = PyGILState_Ensure();
+  PyObject *pyob = static_cast<PyObject *>(pyob_ptr);
+  PyObject *method = PyObject_GetAttrString(pyob, method_name);
+  if (method == nullptr) {
+    /* Not having the method is the normal case for engines that do not define it. */
+    PyErr_Clear();
+  }
+  else {
+    PyObject *result = PyObject_CallNoArgs(method);
+    Py_DECREF(method);
+    if (result == nullptr) {
+      PyErr_Print();
+      PyErr_Clear();
+    }
+    else {
+      Py_DECREF(result);
+    }
+  }
   PyGILState_Release(gilstate);
 }
 

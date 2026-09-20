@@ -432,6 +432,11 @@ static void blo_update_defaults_scene(Main *bmain, Scene *scene)
   scene->r.im_format.exr_flag |= R_IMF_EXR_FLAG_MULTIPART;
   scene->r.bake.im_format.exr_flag |= R_IMF_EXR_FLAG_MULTIPART;
 
+  /* Falcon: persistent data + texture-cache auto generation on by default
+   * (the DNA defaults alone are overridden by the bundled startup file). */
+  scene->r.mode |= R_PERSISTENT_DATA;
+  scene->r.scemode |= R_USE_TEXTURE_CACHE | R_TEXTURE_CACHE_AUTO_GENERATE;
+
   scene->r.compositor_device = SCE_COMPOSITOR_DEVICE_GPU;
 
   /* Don't enable compositing nodes. */

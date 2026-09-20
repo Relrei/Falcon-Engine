@@ -90,7 +90,188 @@ void RenderScheduler::set_sample_params(const int num_samples,
 
 int RenderScheduler::get_num_samples() const
 {
+  /* Do continuous rendering for the DLSS viewport stream (carry OFF). With
+   * carry ON the viewport accumulates the buffer like a final render and must
+   * stop at the configured sample count; final renders always terminate. */
+  if (!background_ && denoiser_params_.use && denoiser_params_.type == DENOISER_DLSS &&
+      !denoiser_params_.carry_history)
+  {
+    return Integrator::MAX_SAMPLES;
+  }
+
   return num_samples_;
+}
+
+int RenderScheduler::get_pass_num_samples() const
+{
+  /* A pre-roll pass exists only to fold one more independent estimate into the
+   * RR history; the image it produces is thrown away. So it need not carry the
+   * frame's whole sample count. FALCON_DLSS_PREROLL_SPP caps the samples a
+   * pre-roll pass renders (0 = the frame's own count, the original behaviour);
+   * the kept pass always renders the full count. */
+  if (preroll_passes_left_ > 0) {
+    const char *env = getenv("FALCON_DLSS_PREROLL_SPP");
+    const int spp = env ? atoi(env) : DLSS_PREROLL_SPP_DEFAULT;
+    if (spp > 0) {
+      return min(spp, num_samples_);
+    }
+  }
+
+  return get_num_samples();
+}
+
+/* ★FALCON_DLSS_ANIM_WARMUP -- the animation warm-up decided in RE_RenderAnim
+ * (source/blender/render/intern/pipeline.cc). Cycles cannot ask the render
+ * pipeline, so it reads the same variable with the same default. ★The two
+ * defaults have to move together: pipeline.cc falcon_anim_warmup_frames(). */
+static int falcon_anim_warmup_frames()
+{
+  const char *env = getenv("FALCON_DLSS_ANIM_WARMUP");
+  const int n = env ? atoi(env) : RenderScheduler::DLSS_ANIM_WARMUP_DEFAULT;
+  return (n > 0) ? n : 0;
+}
+
+int RenderScheduler::get_dlss_preroll_passes() const
+{
+  /* Every frame but the first inherits a DLSS-RR history that already folded in
+   * the noise of all the frames before it -- each one an independent estimate
+   * of the same scene -- so its noise is averaged away over many frames. The
+   * first frame starts with an empty history and comes out visibly noisier: the
+   * opening of a sequence appears to "resolve" over its first frames.
+   *
+   * Extra samples do not fix this (measured: 4x and 8x the samples leave the
+   * frame just as noisy). What the history needs is not a cleaner estimate but
+   * several *independent* ones, which is exactly what the following frames feed
+   * it. So render the first frame several times over with different sample
+   * seeds, denoising each pass into the same history, and keep the last pass as
+   * the frame. FALCON_DLSS_PREROLL overrides the scene setting (0 disables).
+   *
+   * ★A still render (F12 on one frame) is the *extreme* case of the same
+   * thing, not an exception to it: it has no following frames at all, so its
+   * history is one evaluation deep and stays there -- "DLSS cannot denoise a
+   * still, it stops after one render". It used to be excluded here on the
+   * grounds that "a still render must honour its sample count", which the
+   * pre-roll does honour: only the passes that are thrown away are capped (see
+   * get_pass_num_samples), the kept pass always renders the frame's full count.
+   * Stills get their own count because they pay for every pass with no later
+   * frame to amortise it: FALCON_DLSS_STILL_PREROLL, default
+   * DLSS_STILL_PREROLL_DEFAULT. */
+  if (!background_ || !dlss_history_cold_ || !denoiser_params_.use ||
+      denoiser_params_.type != DENOISER_DLSS || !denoiser_params_.carry_history)
+  {
+    return 0;
+  }
+
+  if (!is_animation_) {
+    const char *env_still = getenv("FALCON_DLSS_STILL_PREROLL");
+    return max(env_still ? atoi(env_still) : DLSS_STILL_PREROLL_DEFAULT, 0);
+  }
+
+  /* The history is cold for two different reasons, and they do not want the
+   * same number of passes: the very first frame of the render (dlss_history_
+   * cold_ from construction) and the first frame after a cut (which also set
+   * dlss_history_cut_pending_ via clear_denoiser_temporal_history). A cut is
+   * usually far more frequent than the opening frame, so it gets its own count;
+   * 0 means "the same as the first frame", which is the previous behaviour. */
+  if (dlss_history_cut_pending_) {
+    const char *env_cut = getenv("FALCON_DLSS_PREROLL_CUT");
+    const int passes_cut = max(env_cut ? atoi(env_cut) : denoiser_params_.preroll_passes_cut, 0);
+    if (passes_cut > 0) {
+      return passes_cut;
+    }
+    if (env_cut) {
+      /* The env var explicitly asked for zero: no pre-roll on cuts at all. */
+      return 0;
+    }
+    if (denoiser_params_.cut_warmup) {
+      /* ★The cut is already handled on the denoiser side: the warm-up runs RR
+       * several times over the same inputs, which costs a few milliseconds
+       * instead of re-rendering the frame. Falling through to preroll_passes
+       * here would silently add those re-renders on every cut of a film (the
+       * opening frame still gets them -- there is no history there at all).
+       * Set the count above, or FALCON_DLSS_PREROLL_CUT, to ask for both. */
+      return 0;
+    }
+  }
+
+  const char *env = getenv("FALCON_DLSS_PREROLL");
+  if (env) {
+    /* Asked for explicitly: that always wins, in either direction. */
+    return max(atoi(env), 0);
+  }
+
+  /* ★2026-09-13. The pre-roll and the animation warm-up (FALCON_DLSS_ANIM_WARMUP,
+   * RE_RenderAnim in pipeline.cc) solve the same problem -- the first frame of a
+   * sequence starts with an empty RR history -- and running both is not just
+   * redundant, it is worse than either alone. Measured on stone1.blend, f0-7,
+   * 32 spp (sigma = Immerkaer residual noise at 960x540, ratio = sigma(f0) over
+   * the median of f4-7, "8 frames" is the wall time for the whole run):
+   *
+   *   pre-roll  warm-up   sigma(f0)   ratio   delta(f0->f1)   8 frames
+   *      0         0        0.0812    1.03       0.0157         61.9 s
+   *      7         0        0.1077    1.35       0.0465        102.4 s   (was the default here)
+   *     16         0        0.1138    1.43       0.0509        151.0 s
+   *      7         2        0.0791    1.00       0.0152        112.9 s
+   *      0         2        0.0764    0.96       0.0151         69.7 s   <- new default
+   *      0         4        0.0730    0.93       0.0157         81.1 s
+   *
+   * The pre-roll makes the opening frame *worse*, monotonically with the pass
+   * count, and charges 40+ seconds for it: it hands RR the same frame N times
+   * over, so the history it builds has no motion in it, and PREROLL_MODE=2 then
+   * drops that history on the very next frame (see denoiser_dlss.cpp). The
+   * warm-up renders the N frames *before* the first one instead, so the history
+   * is built exactly the way every later frame builds it.
+   *
+   * So: while the warm-up is on, do not pre-roll. Turning the warm-up off
+   * (FALCON_DLSS_ANIM_WARMUP=0) gives the scene setting back, unchanged --
+   * that is the whole of the old behaviour, and the way to ask for the pre-roll
+   * from a .blend. FALCON_DLSS_PREROLL above asks for both. */
+  if (falcon_anim_warmup_frames() > 0) {
+    return 0;
+  }
+
+  return max(denoiser_params_.preroll_passes, 0);
+}
+
+int RenderScheduler::get_dlss_preroll_passes_total() const
+{
+  return preroll_passes_total_;
+}
+
+int RenderScheduler::get_dlss_preroll_passes_left() const
+{
+  return preroll_passes_left_;
+}
+
+bool RenderScheduler::get_dlss_history_was_cold() const
+{
+  return preroll_history_was_cold_;
+}
+
+void RenderScheduler::set_is_animation(bool is_animation)
+{
+  is_animation_ = is_animation;
+}
+
+void RenderScheduler::set_playback(bool playback)
+{
+  playback_ = playback;
+}
+
+void RenderScheduler::set_dlss_history_warm()
+{
+  /* A cut just threw the history away, so it is not warm however many times the
+   * frame loop says so before the work is scheduled. */
+  if (dlss_history_cut_pending_) {
+    return;
+  }
+  dlss_history_cold_ = false;
+}
+
+void RenderScheduler::set_dlss_history_cold()
+{
+  dlss_history_cold_ = true;
+  dlss_history_cut_pending_ = true;
 }
 
 int RenderScheduler::get_sample_offset() const
@@ -122,6 +303,20 @@ int RenderScheduler::get_num_rendered_samples() const
 
 void RenderScheduler::reset(const BufferParams &buffer_params)
 {
+  /* A frame was rendered, so the DLSS-RR history it left behind carries into
+   * the next one and the pre-roll is no longer needed. */
+  if (background_ && state_.num_rendered_samples > 0 && !dlss_history_cut_pending_) {
+    dlss_history_cold_ = false;
+  }
+
+  /* The denoiser parameters are synced after this reset, so the pass count can
+   * only be decided once the first work is scheduled. */
+  preroll_passes_left_ = -1;
+  preroll_sample_base_ = 0;
+  preroll_same_frame_restart_ = false;
+  preroll_passes_total_ = -1;
+  preroll_history_was_cold_ = false;
+
   buffer_params_ = buffer_params;
 
   update_start_resolution_divider();
@@ -131,12 +326,23 @@ void RenderScheduler::reset(const BufferParams &buffer_params)
   if (background_ || start_resolution_divider_ == 0) {
     state_.resolution_divider = 1;
   }
+  else if (denoiser_params_.use && denoiser_params_.type == DENOISER_DLSS &&
+           denoiser_params_.carry_history)
+  {
+    /* Carrying the DLSS-RR history across navigation needs a constant render
+     * size: a resolution change recreates the DLSS feature and drops the
+     * history. Skip the low-resolution navigation staircase; the DLSS upscale
+     * factor already keeps the per-update cost down. */
+    state_.resolution_divider = pixel_size_;
+  }
   else {
     state_.user_is_navigating = true;
     state_.resolution_divider = start_resolution_divider_;
   }
 
   state_.num_rendered_samples = 0;
+  state_.num_dlss_stream_samples = 0;
+  state_.last_dlss_denoise_samples = 0;
   state_.last_display_update_time = 0.0;
   state_.last_display_update_sample = -1;
 
@@ -288,7 +494,175 @@ bool RenderScheduler::done() const
     return true;
   }
 
-  return get_num_rendered_samples() >= num_samples_;
+  /* The continuous DLSS viewport stream (carry OFF) rewinds the per-work
+   * sample counter, so judge completion by the total streamed samples instead.
+   * This makes the viewport Max Samples setting effective for DLSS (rendering
+   * stops instead of accumulating forever; navigation resets and restarts the
+   * stream). With carry ON the viewport accumulates the buffer normally, so
+   * the default check below already honors the sample limit. */
+  if (use_dlss_stream()) {
+    return state_.num_dlss_stream_samples >= num_samples_;
+  }
+
+  return get_num_rendered_samples() >= get_pass_num_samples();
+}
+
+/* DLSS-RR is built to read a stream of 1-sample jittered frames and rebuild the
+ * image out of them -- that is what NVIDIA's own viewport integration feeds it,
+ * and why the viewport has no sample slider. The final render instead hands it
+ * an accumulated 32-sample buffer, which is not the input it was trained on.
+ * FALCON_DLSS_STREAM_FINAL=1 renders the final frame the way the viewport does:
+ * one fresh sample per RR evaluation, each at a new sub-pixel jitter, letting
+ * RR's own history do the accumulating. */
+/* One RR evaluation per frame in the final render, at the last sample.
+ *
+ * The re-denoise rounds inside a frame were there to build the history up
+ * before the kept image, but they run with zero motion and fold their own
+ * output back in, so every round bakes its residual in as if it were surface
+ * detail. Measured against 1024-sample references on five scenes (8 frames,
+ * 32 spp), one round per frame is better on every one of them, in accuracy and
+ * in how much the error moves between frames -- e.g. classroom-with-a-fast-pan
+ * 0.0292 -> 0.0185 and smoke 0.0206 -> 0.0138 -- and it is faster.
+ * FALCON_DLSS_INTRA_FRAME_DENOISE=1 puts the rounds back. */
+bool RenderScheduler::dlss_final_denoise_only()
+{
+  static const bool intra_frame = getenv("FALCON_DLSS_INTRA_FRAME_DENOISE") != nullptr;
+  return !intra_frame;
+}
+
+bool RenderScheduler::use_dlss_stream_final() const
+{
+  static const bool enabled = getenv("FALCON_DLSS_STREAM_FINAL") != nullptr;
+  return enabled && background_ && denoiser_params_.use &&
+         denoiser_params_.type == DENOISER_DLSS;
+}
+
+bool RenderScheduler::use_dlss_stream() const
+{
+  return (!background_ && denoiser_params_.use && denoiser_params_.type == DENOISER_DLSS &&
+          !denoiser_params_.carry_history) ||
+         use_dlss_stream_final();
+}
+
+/* Playing the timeline gives the renderer about one display frame per timeline
+ * frame -- 40 ms at 24 fps -- and that is nowhere near a single sampling pass
+ * at the navigation resolution. Measured on the tree scene (viewport 508x285,
+ * denoiser off so the raw buffer is visible): 86.7% of the pixels never
+ * received a single sample, so the viewport was showing a mostly empty buffer.
+ * With DLSS-RR on top, that empty buffer is covered by the warped history,
+ * which is what "the canopy goes black during playback" was.
+ *
+ * So render playback frames smaller and let DLSS upscale the rest of the way,
+ * instead of handing it a full-size buffer that never gets filled. The factor
+ * is constant for the whole playback, so the DLSS feature is recreated once
+ * when playback starts and once when it stops -- not per frame, which would
+ * drop the history every frame (see the carry_history branch in reset()).
+ *
+ * FALCON_DLSS_PLAYBACK_UPSCALE is the *total* upscale DLSS is asked for while
+ * playing; 0, or anything at or below the mode's own factor, turns this off. */
+float RenderScheduler::playback_upscale_factor() const
+{
+  if (!playback_ || background_ || !denoiser_params_.use ||
+      denoiser_params_.type != DENOISER_DLSS)
+  {
+    return 1.0f;
+  }
+
+  /* ★The whole trick is "render smaller, let DLSS put it back". The feature is
+   * always created from the two buffer sizes (denoiser_dlss.cpp), so DLSS does
+   * output the full frame even when the panel's upscale quality is None -- what
+   * used to be missing was the *other* half of "putting it back": the
+   * postprocess kernel maps each output pixel to its input pixel with the
+   * factor the denoiser is handed, and that was the panel's value while the
+   * buffers differed by the total. Panel None read a 1/2.9 buffer as if it were
+   * full size (bottom band drawn, rest black) and panel 2.0 read it as if it
+   * were half size (horizontal streaks) -- one mismatch, two pictures, both
+   * reported on 2026-09-10.
+   *
+   * Since denoise_filter_color_postprocess now derives that factor from the
+   * buffers themselves, the shrink no longer needs the panel to be upscaling.
+   * FALCON_DLSS_PLAYBACK_NEEDS_UPSCALE=1 restores the 2026-09-10 restriction
+   * (shrink only while the panel's upscale quality is on). */
+  static const bool needs_upscale = getenv("FALCON_DLSS_PLAYBACK_NEEDS_UPSCALE") ?
+                                        atoi(getenv("FALCON_DLSS_PLAYBACK_NEEDS_UPSCALE")) != 0 :
+                                        false;
+  if (needs_upscale && !(denoiser_params_.upscale_factor > 1.0f)) {
+    return 1.0f;
+  }
+
+  /* ★Back on by default since 2026-09-13, at the 2026-08-31 value. It was
+   * turned off on 2026-09-10 because the denoiser only ever put back the
+   * panel's own factor, so anything asked for beyond that was never restored
+   * (bottom band + black with panel None, horizontal streaks with panel 2.0).
+   * That is now fixed at the other end -- the postprocess derives the factor
+   * from the buffer sizes, i.e. the *total* -- so the shrink is the whole
+   * point again: without it, 86.7% of the pixels are never sampled during
+   * playback (2026-08-31, denoiser off, tree scene) and the viewport shows the
+   * warped history over an empty buffer.
+   *
+   * FALCON_DLSS_PLAYBACK_UPSCALE=0 restores the 2026-09-10 behaviour (no
+   * shrink: no black, no streaks, but nothing gets sampled either). */
+  static const float target = getenv("FALCON_DLSS_PLAYBACK_UPSCALE") ?
+                                  (float)atof(getenv("FALCON_DLSS_PLAYBACK_UPSCALE")) :
+                                  2.9f;
+  if (!(target > denoiser_params_.upscale_factor)) {
+    return 1.0f;
+  }
+
+  /* 3.0 is the largest ratio the DLSS presets are built for (UltraPerformance),
+   * and it is also the *bottom* of that preset's dynamic-resolution window, so
+   * asking for exactly 3.0 sits on the edge where integer rounding of the
+   * render size can fall outside it. Stay just inside: the default 2.9 gives
+   * 262x147 out of 762x428 where 3.0 gives the boundary value 254x142. */
+  float total = min(target, 3.0f);
+
+  /* ...and the render buffer still has to be big enough for DLSS to accept it.
+   * denoiser_dlss.cpp refuses to create a feature at 128x96 or less, a refused
+   * create makes every later evaluation fail, and a failed denoise on a buffer
+   * this much smaller than the frame is what painted most of the viewport black
+   * during playback (see PathTrace::denoise). A 370x280 viewport asks for
+   * 127x96 at 2.9 -- under the floor -- so the factor has to come down instead.
+   *
+   * The floor is taken with a margin: scale_buffer_params truncates twice (once
+   * for the resolution divider, once for the upscale) so the buffer can land a
+   * pixel below what the ratio says. FALCON_DLSS_PLAYBACK_MIN sets it; 0 turns
+   * the clamp off and restores the 2026-08-31 behaviour. */
+  static const int floor_w = getenv("FALCON_DLSS_PLAYBACK_MIN") ?
+                                 atoi(getenv("FALCON_DLSS_PLAYBACK_MIN")) :
+                                 132;
+  if (floor_w > 0) {
+    const float floor_h = floor_w * 96.0f / 128.0f;
+    const int divider = max(state_.resolution_divider, 1);
+    const float width = float(buffer_params_.width) / float(divider);
+    const float height = float(buffer_params_.height) / float(divider);
+    if (width > 0.0f && height > 0.0f) {
+      total = min(total, min(width / float(floor_w), height / floor_h));
+    }
+  }
+
+  if (!(total > denoiser_params_.upscale_factor)) {
+    return 1.0f;
+  }
+  return total / denoiser_params_.upscale_factor;
+}
+
+int RenderScheduler::stream_sample_base() const
+{
+  /* Every stream update starts a fresh frame, so num_rendered_samples is reset to zero each time
+   * (see the reset next to num_dlss_stream_samples). Without a base the start sample therefore
+   * falls back to sample_offset_ on every update: Cycles re-renders the *same* sample indices, RR
+   * is handed the same noise over and over, and a pattern that repeats is exactly what a temporal
+   * denoiser cannot average away -- it reads as detail and gets sharpened instead (measured on
+   * classroom 2026-08-31: 16 stream updates reach RMSE 7.161 where 16 accumulated samples reach
+   * 5.275, while the sharpness overshoots to 432 against 305).
+   *
+   * The pre-roll passes already solve this by walking preroll_sample_base_ along the sequence;
+   * this is the same thing for the stream. FALCON_DLSS_STREAM_SEQUENCE=0 restores the old
+   * behaviour. */
+  static const bool enabled = getenv("FALCON_DLSS_STREAM_SEQUENCE") ?
+                                  atoi(getenv("FALCON_DLSS_STREAM_SEQUENCE")) != 0 :
+                                  true;
+  return (enabled && use_dlss_stream()) ? state_.num_dlss_stream_samples : 0;
 }
 
 RenderWork RenderScheduler::get_render_work()
@@ -297,13 +671,115 @@ RenderWork RenderScheduler::get_render_work()
 
   const double time_now = time_dt();
 
+  if (preroll_passes_left_ < 0) {
+    preroll_passes_left_ = get_dlss_preroll_passes();
+    /* Keep what was decided: preroll_passes_left_ counts down, and the status
+     * line, the metadata and the stderr trace all have to show the same N. */
+    preroll_passes_total_ = preroll_passes_left_;
+    preroll_history_was_cold_ = dlss_history_cold_;
+    if (getenv("FALCON_DLSS_DEBUG")) {
+      fprintf(stderr,
+              "[preroll] bg=%d anim=%d cold=%d cut=%d use=%d type=%d carry=%d -> passes=%d\n",
+              int(background_),
+              int(is_animation_),
+              int(dlss_history_cold_),
+              int(dlss_history_cut_pending_),
+              int(denoiser_params_.use),
+              int(denoiser_params_.type),
+              int(denoiser_params_.carry_history),
+              preroll_passes_left_);
+    }
+    /* The cut has been answered: this frame's work carries the pre-roll. */
+    dlss_history_cut_pending_ = false;
+  }
+
+  /* A DLSS-RR pre-roll pass finished: render the same frame once more from a
+   * fresh part of the sample sequence, so RR folds an independent estimate into
+   * the history it hands to the frame that is kept. */
+  /* The pass is over when the frame is, which with adaptive sampling on -- the
+   * default, and on in every scene here -- is well before the sample count is
+   * reached. Waiting for the count meant the pre-roll never restarted at all:
+   * the tree scene stops around 19 of its 32 samples, so the seven passes the
+   * scene asked for were silently never rendered, on the first frame or after
+   * a cut. */
+  const int preroll_pass_samples = get_pass_num_samples();
+  const bool preroll_pass_over = state_.num_rendered_samples >= preroll_pass_samples ||
+                                 (state_.num_rendered_samples > 0 && done());
+
+  /* The pass has to reach the denoiser, or it warms nothing.
+   *
+   * A pass ends either at its sample count or at the time limit. Only the first
+   * of those is noticed inside the work that renders the last sample (done() is
+   * evaluated there, and work_need_denoise() denoises on it); the time limit and
+   * the adaptive-sampling finish are only seen at the top of the *next* call --
+   * which is this restart, and it wipes the pass before anything denoises it.
+   * With one denoise per frame (the default since dlss_final_denoise_only) there
+   * are no intra-frame rounds left to cover for that, so in a time-limited scene
+   * every pre-roll pass ran without a single RR evaluation: the tree scene
+   * logged 16 evaluations over 16 frames with seven pre-roll passes asked for.
+   * The history stayed cold and only the cost remained (+21 s on the first
+   * frame, +26 s per cut). Denoise the finished pass first, restart on the next
+   * call. */
+  if (preroll_passes_left_ > 0 && preroll_pass_over && denoiser_params_.use &&
+      !state_.last_work_tile_was_denoised && !tile_manager_.has_multiple_tiles())
+  {
+    RenderWork render_work;
+    render_work.resolution_divider = state_.resolution_divider;
+    render_work.denoised_resolution_divider = state_.resolution_divider;
+    render_work.resolution_divider *= denoiser_params_.upscale_factor;
+    render_work.tile.denoise = true;
+    render_work.denoise_preroll_pass = true;
+    render_work.denoise_same_frame_restart = preroll_same_frame_restart_;
+
+    if (getenv("FALCON_DLSS_DEBUG")) {
+      fprintf(stderr, "[preroll] denoise pass end, %d passes left\n", preroll_passes_left_);
+    }
+
+    update_state_for_render_work(render_work);
+    return render_work;
+  }
+
+  if (preroll_passes_left_ > 0 && preroll_pass_over) {
+    preroll_passes_left_--;
+    preroll_sample_base_ += preroll_pass_samples;
+    state_.num_rendered_samples = 0;
+    state_.last_dlss_denoise_samples = 0;
+    state_.last_display_update_sample = -1;
+    state_.path_trace_finished = false;
+    /* The time limit is what actually ends a frame here, and it stays raised
+     * once hit -- so without clearing it the second pre-roll pass is declared
+     * finished before it renders a sample, and the seven passes the scene asks
+     * for become one. Each pass is a full render of the frame, so each gets the
+     * limit; a frame that pre-rolls costs (passes + 1) times a normal one, and
+     * only the first frame and the frame after each cut ever pre-roll. */
+    state_.time_limit_reached = false;
+    state_.start_render_time = 0.0;
+    preroll_same_frame_restart_ = true;
+
+    if (getenv("FALCON_DLSS_DEBUG")) {
+      fprintf(stderr, "[preroll] restart, %d passes left\n", preroll_passes_left_);
+    }
+  }
+
   if (done()) {
     RenderWork render_work;
     render_work.resolution_divider = state_.resolution_divider;
     render_work.denoised_resolution_divider = state_.resolution_divider;
     if (denoiser_params_.use) {
-      render_work.resolution_divider *= denoiser_params_.upscale_factor;
+      render_work.resolution_divider *= denoiser_params_.upscale_factor *
+                                        playback_upscale_factor();
     }
+
+    /* The clean-up denoise of a frame whose last sampling work did not denoise
+     * (a time-limited frame ends between works) is still a denoise of this same
+     * frame: it has to carry the same pre-roll flags as the in-line one, or
+     * DLSS-RR sees a frame transition and PREROLL_MODE=2 drops the history on
+     * the pre-rolled frame itself -- exactly the frame the pre-roll was warming
+     * (observed as reset=1 on the kept frame of the tree scene). */
+    render_work.denoise_preroll_pass = preroll_passes_left_ > 0;
+    render_work.denoise_same_frame_restart = preroll_same_frame_restart_ ||
+                                             (use_dlss_stream_final() &&
+                                              state_.num_dlss_stream_samples > 0);
 
     if (!set_postprocess_render_work(&render_work)) {
       set_full_frame_render_work(&render_work);
@@ -343,14 +819,33 @@ RenderWork RenderScheduler::get_render_work()
   render_work.resolution_divider = state_.resolution_divider;
   render_work.denoised_resolution_divider = state_.resolution_divider;
   if (denoiser_params_.use) {
-    render_work.resolution_divider *= denoiser_params_.upscale_factor;
+    render_work.resolution_divider *= denoiser_params_.upscale_factor * playback_upscale_factor();
+
+    /* Viewport stream mode (carry OFF): continuous DLSS rendering restarts the
+     * sample counter so every update is a fresh sample converged by the RR
+     * history alone. Keep the running total so done() can honor the viewport
+     * sample limit. With carry ON the viewport accumulates the buffer like a
+     * final render instead (samples actually add up; DLSS re-denoises the
+     * progressively cleaner buffer), so the counter must keep advancing. */
+    if (use_dlss_stream()) {
+      state_.num_dlss_stream_samples += state_.num_rendered_samples;
+      state_.num_rendered_samples = 0;
+    }
   }
 
   render_work.path_trace.start_sample = get_start_sample_to_path_trace();
   render_work.path_trace.num_samples = get_num_samples_to_path_trace();
   render_work.path_trace.sample_offset = get_sample_offset();
 
-  render_work.init_render_buffers = (render_work.path_trace.start_sample == get_sample_offset());
+  /* Each pre-roll pass starts from an empty buffer: it is a fresh render of the
+   * frame, not a continuation of the previous pass. */
+  render_work.init_render_buffers = (render_work.path_trace.start_sample ==
+                                     get_sample_offset() + preroll_sample_base_ +
+                                         stream_sample_base());
+  render_work.denoise_preroll_pass = preroll_passes_left_ > 0;
+  render_work.denoise_same_frame_restart = preroll_same_frame_restart_ ||
+                                           (use_dlss_stream_final() &&
+                                            state_.num_dlss_stream_samples > 0);
 
   /* NOTE: Rebalance scheduler requires current number of samples to not be advanced forward. */
   render_work.rebalance = work_need_rebalance();
@@ -483,7 +978,8 @@ void RenderScheduler::report_work_begin(const RenderWork &render_work)
    * because it might be wrongly 0. Check for whether path tracing is actually happening as it is
    * expected to happen in the first work. */
   if (render_work.resolution_divider == pixel_size_ && render_work.path_trace.num_samples != 0 &&
-      render_work.path_trace.start_sample == get_sample_offset())
+      render_work.path_trace.start_sample ==
+          get_sample_offset() + preroll_sample_base_ + stream_sample_base())
   {
     state_.start_render_time = time_dt();
   }
@@ -832,7 +1328,11 @@ int RenderScheduler::calculate_num_samples_per_update() const
 
 int RenderScheduler::get_start_sample_to_path_trace() const
 {
-  return sample_offset_ + state_.num_rendered_samples;
+  /* Each pre-roll pass renders the same frame again from a different part of the
+   * sample sequence, so that RR gets an independent estimate to fold into its
+   * history rather than the same one over again. */
+  return sample_offset_ + preroll_sample_base_ + stream_sample_base() +
+         state_.num_rendered_samples;
 }
 
 /* Round number of samples to the closest power of two.
@@ -871,7 +1371,7 @@ int RenderScheduler::get_num_samples_to_path_trace() const
   /* Always start full resolution render  with a single sample. Gives more instant feedback to
    * artists, and allows to gather information for a subsequent path tracing works. Do it in the
    * headless mode as well, to give some estimate of how long samples are taking. */
-  if (state_.num_rendered_samples == 0) {
+  if (state_.num_rendered_samples == 0 && state_.last_display_update_sample == -1) {
     return 1;
   }
 
@@ -886,7 +1386,9 @@ int RenderScheduler::get_num_samples_to_path_trace() const
    * more than N samples. */
   const int num_samples_pot = round_num_samples_to_power_of_2(num_samples_per_update);
 
-  const int max_num_samples_to_render = sample_offset_ + num_samples_ - path_trace_start_sample;
+  const int max_num_samples_to_render = sample_offset_ + preroll_sample_base_ +
+                                        stream_sample_base() + get_pass_num_samples() -
+                                        path_trace_start_sample;
 
   int num_samples_to_render = min(num_samples_pot, max_num_samples_to_render);
 
@@ -958,7 +1460,28 @@ int RenderScheduler::get_num_samples_to_path_trace() const
                                 min(num_samples_to_occupy, max_num_samples_to_render));
   }
 
-  if (limit_samples_per_update_) {
+  /* DLSS-RR in the final render: keep update batches small so the temporal
+   * history accumulates over several denoise rounds within the frame. The
+   * batch grows with the rendered sample count (updates at samples 1, 2, 4,
+   * 8, ...), keeping the denoise overhead logarithmic in the sample count.
+   * FALCON_DLSS_FINAL_DENOISE_ONLY=1 disables the intra-frame rounds (one
+   * denoise at the final sample; inter-frame carry provides the history) for
+   * A/B-ing whether the same-frame re-denoises bake residual noise into the
+   * history as static detail. */
+  if (use_dlss_stream_final()) {
+    return 1;
+  }
+
+  if (background_ && denoiser_params_.use && denoiser_params_.type == DENOISER_DLSS &&
+      !dlss_final_denoise_only())
+  {
+    const int growing_batch = max(1, state_.num_rendered_samples);
+    num_samples_to_render = min(num_samples_to_render, growing_batch);
+  }
+
+  if (limit_samples_per_update_ &&
+      !(!background_ && denoiser_params_.use && denoiser_params_.type == DENOISER_DLSS))
+  {
     num_samples_to_render = min(limit_samples_per_update_, num_samples_to_render);
   }
 
@@ -1036,6 +1559,31 @@ bool RenderScheduler::work_need_denoise(bool &delayed, bool &ready_to_display)
   }
 
   if (background_) {
+    /* DLSS-RR is temporal: re-denoise while the frame is still sampling so the
+     * history accumulates within the frame (the final-sample denoise is handled
+     * by done() above), but skip the earliest rounds. Below ~8 samples the
+     * buffer is still close to raw, and RR bakes that noise into its history as
+     * static surface detail -- the grain that showed up on desks and walls.
+     * Skipping the rounds entirely is not the answer either: the result then
+     * leans on the warped previous frame alone and smears at texture/geometry
+     * boundaries and under changing light. classroom 30f/32spp vs a 1024spp
+     * reference: every-round 27.83 dB / flicker 3.83, from-8-spp 28.37 / 3.84,
+     * final-only 28.81 / 4.07.
+     * FALCON_DLSS_DENOISE_MIN_SPP overrides the threshold (1 = every round);
+     * FALCON_DLSS_FINAL_DENOISE_ONLY=1 skips the intra-frame rounds entirely. */
+    if (denoiser_params_.type == DENOISER_DLSS) {
+      if (use_dlss_stream_final()) {
+        return true;
+      }
+      if (dlss_final_denoise_only()) {
+        return false;
+      }
+      static const int min_spp = getenv("FALCON_DLSS_DENOISE_MIN_SPP") ?
+                                     atoi(getenv("FALCON_DLSS_DENOISE_MIN_SPP")) :
+                                     8;
+      return state_.num_rendered_samples >= min_spp;
+    }
+
     /* Background render, only denoise when rendering the last sample. */
     /* TODO(sergey): Follow similar logic to viewport, giving an overview of how final denoised
      * image looks like even for the background rendering. */
@@ -1043,6 +1591,27 @@ bool RenderScheduler::work_need_denoise(bool &delayed, bool &ready_to_display)
   }
 
   /* Viewport render. */
+
+  if (denoiser_params_.type == DENOISER_DLSS) {
+    if (denoiser_params_.carry_history) {
+      /* Accumulating viewport (carry ON): re-denoising after every sample
+       * feeds RR a nearly identical noise pattern, which its temporal model
+       * locks onto as if it were static scene detail (grain gets rendered as
+       * texture). Re-denoise only when the buffer changed substantially --
+       * the sample count doubled, mirroring the final-render progressive
+       * cadence -- and hold the previous denoised result in between. */
+      const int last = state_.last_dlss_denoise_samples;
+      if (last == 0 || state_.num_rendered_samples <= last ||
+          state_.num_rendered_samples >= 2 * last)
+      {
+        state_.last_dlss_denoise_samples = state_.num_rendered_samples;
+        return true;
+      }
+      delayed = true;
+      return false;
+    }
+    return true;
+  }
 
   /* Navigation might render multiple samples at a lower resolution. Those are not to be counted as
    * final samples. */

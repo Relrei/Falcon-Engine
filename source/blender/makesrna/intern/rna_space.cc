@@ -2666,8 +2666,41 @@ static void seq_build_proxy(bContext *C, PointerRNA *ptr)
   ED_area_tag_redraw(CTX_wm_area(C));
 }
 
+/**
+ * 戻す口。`FALCON_VSE_PROXY_ENDJOB_KEEP_READERS=0` で切ると、従来どおり
+ * Proxy Render Size を代入するたびにシーケンサのキャッシュを全部捨てる。
+ */
+static bool seq_render_size_cleanup_only_on_change()
+{
+  static const bool enabled = [] {
+    const char *env = getenv("FALCON_VSE_PROXY_ENDJOB_KEEP_READERS");
+    if (env == nullptr || env[0] == '\0') {
+      return true;
+    }
+    return atoi(env) != 0;
+  }();
+  return enabled;
+}
+
+/**
+ * Set by #rna_SequenceEditor_render_size_set and consumed by the update callback that RNA runs
+ * right after it, on the same (main) thread. Defaults back to true so that an update which did
+ * not go through the setter keeps the original "always clean up" behaviour.
+ */
+static bool g_seq_render_size_changed = true;
+
+static void rna_SequenceEditor_render_size_set(PointerRNA *ptr, int value)
+{
+  SpaceSeq *sseq = static_cast<SpaceSeq *>(ptr->data);
+  g_seq_render_size_changed = (int(sseq->render_size) != value);
+  sseq->render_size = eSpaceSeq_Proxy_RenderSize(value);
+}
+
 static void rna_SequenceEditor_render_size_update(bContext *C, PointerRNA *ptr)
 {
+  const bool changed = g_seq_render_size_changed;
+  g_seq_render_size_changed = true;
+
   const bool is_sequencer = CTX_wm_space_seq(C) != nullptr;
   Scene *scene = is_sequencer ? CTX_data_sequencer_scene(C) : CTX_data_scene(C);
   if (scene == nullptr) {
@@ -2675,7 +2708,9 @@ static void rna_SequenceEditor_render_size_update(bContext *C, PointerRNA *ptr)
   }
 
   seq_build_proxy(C, ptr);
-  seq::cache_cleanup(scene, seq::CacheCleanup::All);
+  if (changed || !seq_render_size_cleanup_only_on_change()) {
+    seq::cache_cleanup(scene, seq::CacheCleanup::All);
+  }
 }
 
 static bool rna_SequenceEditor_clamp_view_get(PointerRNA *ptr)
@@ -3302,6 +3337,17 @@ static void rna_FileSelectPrams_filter_glob_set(PointerRNA *ptr, const char *val
 
   /* Remove stupid things like last group being a wildcard-only one. */
   BLI_path_extension_glob_validate(params->filter_glob);
+}
+
+static void rna_FileSelectParams_group_sequences_update(Main * /*bmain*/,
+                                                       Scene * /*scene*/,
+                                                       PointerRNA *ptr)
+{
+  /* Falcon: picked by hand (the toggle in the top bar or in the Filter popover), so this is the
+   * browser's setting from now on: an embedded browser keeps it when the file is read again, and
+   * a dialog hands it on to the next dialog of its kind (#ED_fileselect_params_to_userdef()). */
+  FileSelectParams *params = static_cast<FileSelectParams *>(ptr->data);
+  params->group_sequences |= FILE_GROUP_SEQUENCES_CHOSEN;
 }
 
 static PointerRNA rna_FileSelectParams_filter_id_get(PointerRNA *ptr)
@@ -6873,6 +6919,7 @@ static void rna_def_space_sequencer(BlenderRNA *brna)
   prop = RNA_def_property(srna, "proxy_render_size", PROP_ENUM, PROP_NONE);
   RNA_def_property_enum_sdna(prop, nullptr, "render_size");
   RNA_def_property_enum_items(prop, proxy_render_size_items);
+  RNA_def_property_enum_funcs(prop, nullptr, "rna_SequenceEditor_render_size_set", nullptr);
   RNA_def_property_ui_text(prop,
                            "Proxy Render Size",
                            "Display preview using full resolution or different proxy resolutions");
@@ -7783,6 +7830,16 @@ static void rna_def_fileselect_params(BlenderRNA *brna)
   RNA_def_property_boolean_negative_sdna(prop, nullptr, "flag", FILE_HIDE_DOT);
   RNA_def_property_ui_text(prop, "Show Hidden", "Show hidden dot files");
   RNA_def_property_update(prop, NC_SPACE | ND_SPACE_FILE_PARAMS, nullptr);
+
+  prop = RNA_def_property(srna, "use_group_sequences", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_sdna(prop, nullptr, "group_sequences", FILE_GROUP_SEQUENCES);
+  RNA_def_property_ui_text(prop,
+                           "Group Image Sequences",
+                           "Show a numbered image sequence as a single movie-like item instead of "
+                           "one item per frame");
+  RNA_def_property_update(prop,
+                          NC_SPACE | ND_SPACE_FILE_PARAMS,
+                          "rna_FileSelectParams_group_sequences_update");
 
   prop = RNA_def_property(srna, "sort_method", PROP_ENUM, PROP_NONE);
   RNA_def_property_enum_sdna(prop, nullptr, "sort");

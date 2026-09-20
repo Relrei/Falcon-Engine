@@ -2,6 +2,11 @@
  *
  * SPDX-License-Identifier: Apache-2.0 */
 
+#ifdef WITH_FALCON_SHARC
+#  include <cstdlib>
+#  include <cstring>
+#endif
+
 #include "BKE_appdir.hh"
 #include "BKE_geometry_set.hh"
 #include "BKE_object_types.hh"
@@ -583,7 +588,46 @@ void BlenderSync::sync_integrator(blender::ViewLayer &b_view_layer,
     integrator->set_denoiser_prefilter(denoise_params.prefilter);
     integrator->set_denoiser_quality(denoise_params.quality);
     integrator->set_denoiser_upscale_factor(denoise_params.upscale_factor);
+    integrator->set_denoiser_carry_history(denoise_params.carry_history);
+    integrator->set_denoiser_preroll_passes(denoise_params.preroll_passes);
+    integrator->set_denoiser_preroll_passes_cut(denoise_params.preroll_passes_cut);
+    integrator->set_denoiser_cut_warmup(denoise_params.cut_warmup);
   }
+
+#ifdef WITH_FALCON_SHARC
+  /* Falcon knobs. Until now these only existed as process-global environment
+   * variables, which meant the viewport and the final render could not disagree
+   * and nothing was saved with the file. Read them from the scene here; the
+   * environment still overrides in device_update() for the A/B harnesses. */
+  {
+    const int sharc_mode = get_enum(cscene, "falcon_sharc_mode", 4, FALCON_SHARC_MODE_OFF);
+    integrator->set_falcon_sharc_mode(sharc_mode);
+    /* The bake operator has always driven both grids from the one cell size. */
+    integrator->set_falcon_sharc_cell(get_float(cscene, "falcon_photon_cell"));
+    integrator->set_falcon_sharc_alpha(get_float(cscene, "falcon_sharc_alpha"));
+    integrator->set_falcon_sharc_keep(get_float(cscene, "falcon_sharc_keep"));
+    integrator->set_falcon_sharc_cache(ustring(get_string(cscene, "falcon_sharc_cache")));
+    integrator->set_falcon_sharc_gate(get_boolean(cscene, "falcon_sharc_gate"));
+    integrator->set_falcon_sharc_gate_low(get_float(cscene, "falcon_sharc_gate_low"));
+    integrator->set_falcon_sharc_gate_high(get_float(cscene, "falcon_sharc_gate_high"));
+    integrator->set_falcon_dispersion_b(get_float(cscene, "falcon_photon_dispersion"));
+    integrator->set_falcon_photon_radius(get_float(cscene, "falcon_photon_radius"));
+    integrator->set_falcon_photon_point_radius_m(get_float(cscene, "falcon_photon_point_radius"));
+    integrator->set_falcon_photon_point_normal_deg(
+        get_float(cscene, "falcon_photon_point_normal_deg"));
+    integrator->set_falcon_photon_point_gain(get_float(cscene, "falcon_photon_point_gain"));
+    integrator->set_falcon_lt_gain(get_float(cscene, "falcon_lt_gain"));
+    integrator->set_falcon_lt_splat_radius(get_float(cscene, "falcon_lt_blur"));
+    integrator->set_falcon_lt_visibility(get_boolean(cscene, "falcon_lt_visibility"));
+    integrator->set_falcon_lt_direct(get_boolean(cscene, "falcon_lt_direct"));
+    integrator->set_falcon_das_map(ustring(get_string(cscene, "falcon_das_map")));
+    integrator->set_falcon_das_strength(get_float(cscene, "falcon_das_strength"));
+    integrator->set_falcon_error_map(ustring(get_string(cscene, "falcon_error_map")));
+    integrator->set_falcon_error_cell(get_float(cscene, "falcon_error_cell"));
+    integrator->set_falcon_error_threshold(get_float(cscene, "falcon_error_threshold"));
+    integrator->set_falcon_error_raise_alpha(get_boolean(cscene, "falcon_error_raise_alpha"));
+  }
+#endif
 
   /* UPDATE_NONE as we don't want to tag the integrator as modified (this was done by the
    * set calls above), but we need to make sure that the dependent things are tagged. */
@@ -659,10 +703,53 @@ void BlenderSync::sync_film(blender::ViewLayer &b_view_layer,
   }
 
   /* Denoising passes. */
-  film->set_denoising_pass_follow_reflections(
-      get_boolean(crl, "denoising_pass_follow_reflections"));
-  film->set_denoising_pass_use_albedo_roughness_weighting(
-      get_boolean(crl, "denoising_pass_use_albedo_roughness_weighting"));
+  bool follow_reflections = get_boolean(crl, "denoising_pass_follow_reflections");
+  /* Followed guides are Monte-Carlo noisy on specular/refractive surfaces
+   * (each sample defers along a randomly sampled lobe). OIDN prefilters its
+   * guides so it copes; DLSS-RR consumes them raw and bakes the guide noise
+   * into glass as speckle. Force first-surface guides when the active
+   * denoiser is DLSS.
+   *
+   * This is not just a glass-vs-metal trade: following the reflections is worse
+   * for polished metal too (classroom frame 20 vs a 1024spp reference: chrome
+   * chair legs 29.59 -> 29.19 dB, whole frame 29.82 -> 29.71). The guide noise
+   * costs more than the reflected detail buys. FALCON_DLSS_FOLLOW_REFLECTIONS
+   * re-enables them to re-run that comparison. */
+  const bool active_dlss = get_boolean(cscene,
+                                       preview ? "use_preview_denoising" : "use_denoising") &&
+                           get_enum(cscene,
+                                    preview ? "preview_denoiser" : "denoiser",
+                                    DENOISER_NUM,
+                                    DENOISER_NONE) == DENOISER_DLSS;
+  if (active_dlss && getenv("FALCON_DLSS_FOLLOW_REFLECTIONS") == nullptr) {
+    follow_reflections = false;
+  }
+  film->set_denoising_pass_follow_reflections(follow_reflections);
+
+  /* Albedo split. Cycles sorts a closure's albedo into the diffuse or the specular guide by its
+   * roughness (smoothstep over 0..0.15), which exists so OIDN's single albedo guide stays useful.
+   * DLSS-RR is handed both albedos *and* the roughness, so it can weight the two itself; sorting
+   * by roughness on our side means every surface rougher than 0.15 reports zero specular albedo.
+   * Measured on the tree scene (2026-08-31): SpecularAlbedo is min=max=mean=0 over the whole
+   * frame, because nothing in it is smoother than 0.15. Splitting by closure type instead is the
+   * other branch that is already implemented in film_write_denoising_features_surface.
+   *
+   * Off by default until the A/B is measured; FALCON_DLSS_ALBEDO_LOBE_SPLIT=1 turns it on. */
+  bool albedo_roughness_weighting = get_boolean(crl,
+                                                "denoising_pass_use_albedo_roughness_weighting");
+  if (active_dlss && getenv("FALCON_DLSS_ALBEDO_LOBE_SPLIT") != nullptr) {
+    albedo_roughness_weighting = false;
+  }
+  film->set_denoising_pass_use_albedo_roughness_weighting(albedo_roughness_weighting);
+
+  /* Primary surface replacement: give DLSS-RR the virtual image behind a delta mirror instead of
+   * the mirror itself, which is the hole NVIDIA left open in their own Cycles integration
+   * ("specular motion vectors... deferred for now... the quality of reflections suffers a bit").
+   *
+   * Off by default: it fires correctly (the guides change only on mirror pixels) but measurably
+   * costs quality on the mirror test scene -- 0.5 to 1.4 dB against a 1024spp reference, with the
+   * same temporal flicker. FALCON_DLSS_PSR=1 turns it on to keep investigating. */
+  film->set_denoising_pass_psr(active_dlss && getenv("FALCON_DLSS_PSR") != nullptr);
 }
 
 /* Render Layer */
@@ -898,6 +985,56 @@ void BlenderSync::sync_render_passes(blender::RenderLayer &b_rlay,
   }
 
   scene->film->set_pass_alpha_threshold(b_view_layer.pass_alpha_threshold);
+
+#ifdef WITH_FALCON_SHARC
+  /* Falcon SHARC warmup/live deposit into the cache using the Position pass, so
+   * force it on for those modes regardless of the view layer's pass settings
+   * (otherwise the deposit silently finds no Position pass and does nothing).
+   * Only add it if the render layer did not already request it. */
+  {
+    /* The mode now normally comes from the scene (see sync_integrator); the
+     * environment variable still wins so the harnesses keep working. */
+    blender::PointerRNA sharc_scene_ptr = RNA_id_pointer_create(&b_scene->id);
+    blender::PointerRNA sharc_cscene = RNA_pointer_get(&sharc_scene_ptr, "cycles");
+    int sharc_mode = get_enum(sharc_cscene, "falcon_sharc_mode", 4, FALCON_SHARC_MODE_OFF);
+    if (const char *mode = getenv("FALCON_SHARC_MODE")) {
+      sharc_mode = (strcmp(mode, "warmup") == 0) ? FALCON_SHARC_MODE_WARMUP :
+                   (strcmp(mode, "blend") == 0)  ? FALCON_SHARC_MODE_BLEND :
+                   (strcmp(mode, "live") == 0)   ? FALCON_SHARC_MODE_LIVE :
+                                                   FALCON_SHARC_MODE_OFF;
+    }
+    if (sharc_mode == FALCON_SHARC_MODE_WARMUP || sharc_mode == FALCON_SHARC_MODE_LIVE) {
+      bool has_position = false;
+      for (const Pass *pass : scene->passes) {
+        if (pass->get_type() == PASS_POSITION) {
+          has_position = true;
+          break;
+        }
+      }
+      if (!has_position) {
+        pass_add(scene, PASS_POSITION, "Position");
+      }
+      /* Also force the Diffuse Direct/Indirect passes so warmup can measure the
+       * scene's GI dominance (indirect / (direct + indirect)) and auto-gate the
+       * SHARC blend: SHARC helps GI-dominated scenes but hurts direct-lit ones. */
+      bool has_diff_dir = false, has_diff_ind = false;
+      for (const Pass *pass : scene->passes) {
+        if (pass->get_type() == PASS_DIFFUSE_DIRECT) {
+          has_diff_dir = true;
+        }
+        else if (pass->get_type() == PASS_DIFFUSE_INDIRECT) {
+          has_diff_ind = true;
+        }
+      }
+      if (!has_diff_dir) {
+        pass_add(scene, PASS_DIFFUSE_DIRECT, "Diffuse Direct");
+      }
+      if (!has_diff_ind) {
+        pass_add(scene, PASS_DIFFUSE_INDIRECT, "Diffuse Indirect");
+      }
+    }
+  }
+#endif
 }
 
 void BlenderSync::free_data_after_sync(blender::Depsgraph &b_depsgraph)
@@ -1034,6 +1171,32 @@ bool BlenderSync::get_session_pause(blender::Scene &b_scene, bool background)
   return (background) ? false : get_boolean(cscene, "preview_pause");
 }
 
+bool BlenderSync::is_dlss_viewport_denoise(blender::Scene &b_scene,
+                                           const DeviceInfo &denoise_device_info)
+{
+  blender::PointerRNA scene_rna_ptr = RNA_id_pointer_create(&b_scene.id);
+  blender::PointerRNA cscene = RNA_pointer_get(&scene_rna_ptr, "cycles");
+
+  if (!get_boolean(cscene, "use_preview_denoising")) {
+    return false;
+  }
+
+  DenoiserType type = (DenoiserType)get_enum(
+      cscene, "preview_denoiser", DENOISER_NUM, DENOISER_NONE);
+  if (type == DENOISER_NONE) {
+    /* Automatic: resolve through the same call get_denoise_params uses. */
+    type = Denoiser::automatic_viewport_denoiser_type(denoise_device_info);
+  }
+
+  return type == DENOISER_DLSS;
+}
+
+bool BlenderSync::is_dlss_denoise_active(const Scene *scene)
+{
+  return scene != nullptr && scene->integrator->get_use_denoise() &&
+         scene->integrator->get_denoiser_type() == DENOISER_DLSS;
+}
+
 SessionParams BlenderSync::get_session_params(blender::RenderEngine &b_engine,
                                               blender::UserDef &b_preferences,
                                               blender::Scene &b_scene,
@@ -1134,9 +1297,40 @@ SessionParams BlenderSync::get_session_params(blender::RenderEngine &b_engine,
   if (background) {
     params.use_auto_tile = true;
     params.tile_size = max(get_int(cscene, "tile_size"), 8);
+
+    /* DLSS denoises the whole frame in one piece, so a tiled frame comes back
+     * written at the wrong stride. The tile size is not a memory limit -- auto
+     * tiling splits purely on this number -- so a 3440x1440 frame gets cut in
+     * two against the 2048 default and the render is refused (see
+     * Session::update_scene) even though it fits in VRAM with room to spare.
+     * Raise the tile size to cover the frame instead of making the user find
+     * this setting. Measured: 3440x1440 renders in 28s and 4K in 46s this way,
+     * both pixel-clean across where the seam would have been; 5K is where DLSS
+     * itself gives up ("GPU denoiser creation has failed"), which the guard
+     * still reports. */
+    const bool dlss_final = get_boolean(cscene, "use_denoising") &&
+                            get_enum(cscene, "denoiser", DENOISER_NUM, DENOISER_NONE) ==
+                                DENOISER_DLSS;
+    if (dlss_final) {
+      const int pct = b_scene.r.size;
+      const int frame_w = (b_scene.r.xsch * pct) / 100;
+      const int frame_h = (b_scene.r.ysch * pct) / 100;
+      const int frame_max = max(frame_w, frame_h);
+      if (params.tile_size < frame_max) {
+        params.tile_size = frame_max;
+      }
+    }
   }
   else {
     params.use_auto_tile = false;
+
+    if (is_dlss_viewport_denoise(b_scene, params.denoise_device)) {
+      /* Disable resolution divider with DLSS */
+      params.use_resolution_divider = false;
+      if (getenv("FALCON_DLSS_DEBUG")) {
+        fprintf(stderr, "[dlss] resolution divider disabled (viewport denoiser resolves to DLSS)\n");
+      }
+    }
   }
 
   return params;
@@ -1153,6 +1347,16 @@ DenoiseParams BlenderSync::get_denoise_params(blender::Scene &b_scene,
     DENOISER_INPUT_RGB_ALBEDO_NORMAL = 3,
 
     DENOISER_INPUT_NUM,
+  };
+
+  enum DenoiserDLSSQuality {
+    DENOISER_DLSS_MODE_DLAA = 0,
+    DENOISER_DLSS_MODE_QUALITY = 1,
+    DENOISER_DLSS_MODE_BALANCED = 2,
+    DENOISER_DLSS_MODE_PERF = 3,
+    DENOISER_DLSS_MODE_ULTRA_PERF = 4,
+
+    DENOISER_DLSS_MODE_NUM,
   };
 
   DenoiseParams denoising;
@@ -1182,6 +1386,79 @@ DenoiseParams BlenderSync::get_denoise_params(blender::Scene &b_scene,
         denoising.use = false;
       }
     }
+
+    if (denoising.type == DENOISER_DLSS) {
+      /* Final-render DLSS-RR (experimental): full guide-pass set, mirroring the
+       * viewport configuration below. The upscale mode defaults to None (DLAA);
+       * the reduced-resolution modes trade fidelity for render time. */
+      denoising.start_sample = 0;
+      /* Carry the RR history across animation frames (measured best temporal
+       * stability); OFF restores the old per-frame reset. */
+      denoising.carry_history = get_boolean(cscene, "denoising_carry_history");
+      /* Extra re-renders of the first animation frame that only fill the RR
+       * history; the kept pass is the last one. */
+      denoising.preroll_passes = get_int(cscene, "denoising_preroll_passes");
+      /* The same count for the frame that opens each cut; 0 = reuse the above. */
+      denoising.preroll_passes_cut = get_int(cscene, "denoising_preroll_passes_cut");
+      /* Warm the RR history up on the frame a camera-bound marker opens (see
+       * BlenderSession::clear_denoiser_history_on_cut). Final renders only. */
+      denoising.cut_warmup = get_boolean(cscene, "denoising_cut_warmup");
+
+      switch ((DenoiserDLSSQuality)get_enum(
+          cscene, "denoising_upscale_quality", DENOISER_DLSS_MODE_NUM, DENOISER_DLSS_MODE_DLAA))
+      {
+        default:
+        case DENOISER_DLSS_MODE_DLAA:
+          denoising.quality = DENOISER_QUALITY_HIGH;
+          denoising.upscale_factor = 1.0f;
+          break;
+        case DENOISER_DLSS_MODE_QUALITY:
+          denoising.quality = DENOISER_QUALITY_HIGH;
+          denoising.upscale_factor = 1.0f / 0.66666667f;
+          break;
+        case DENOISER_DLSS_MODE_BALANCED:
+          denoising.quality = DENOISER_QUALITY_BALANCED;
+          denoising.upscale_factor = 1.0f / 0.58f;
+          break;
+        case DENOISER_DLSS_MODE_PERF:
+          denoising.quality = DENOISER_QUALITY_FAST;
+          denoising.upscale_factor = 2.0f;
+          break;
+        case DENOISER_DLSS_MODE_ULTRA_PERF:
+          denoising.quality = DENOISER_QUALITY_FAST;
+          denoising.upscale_factor = 3.0f;
+          break;
+      }
+
+      denoising.passes = DENOISER_PASS_ALBEDO | DENOISER_PASS_SPECULAR_ALBEDO |
+                         DENOISER_PASS_NORMAL | DENOISER_PASS_ROUGHNESS | DENOISER_PASS_DEPTH |
+                         DENOISER_PASS_MOTION | DENOISER_PASS_SPECULAR_MOTION;
+      /* Transmission passes feed the ColorBeforeTransparency guide, which tells
+       * RR which part of the pixel came through a transmissive surface. */
+      if (getenv("FALCON_DLSS_NO_TRANSP_GUIDE") == nullptr) {
+        denoising.passes |= DENOISER_PASS_TRANSMISSION;
+      }
+      /* Specular hit distance: RR builds the specular motion from it, so
+       * reflections move with what they reflect instead of with the surface. */
+      if (getenv("FALCON_DLSS_NO_SPECULAR_HIT_DISTANCE") == nullptr) {
+        denoising.passes |= DENOISER_PASS_SPECULAR_HIT_DISTANCE;
+      }
+      /* FALCON_DLSS_EMISSIVE_GUIDE=1: hand RR GBuffer_Emissive. An emitter's own
+       * colour is material, not noisy lighting; without it RR has to guess. */
+      if (const char *eg = getenv("FALCON_DLSS_EMISSIVE_GUIDE")) {
+        if (atoi(eg) != 0) {
+          denoising.passes |= DENOISER_PASS_EMISSION;
+        }
+      }
+      /* FALCON_DLSS_LAYER_GUIDES=1: also hand RR ColorBeforeParticles and
+       * ColorBeforeFog (the latter = colour minus the volume passes). */
+      if (const char *lg = getenv("FALCON_DLSS_LAYER_GUIDES")) {
+        if (atoi(lg) != 0) {
+          denoising.passes |= DENOISER_PASS_VOLUME;
+        }
+      }
+      return denoising;
+    }
   }
   else {
     /* Viewport Denoising */
@@ -1204,6 +1481,87 @@ DenoiseParams BlenderSync::get_denoise_params(blender::Scene &b_scene,
       if (denoising.type == DENOISER_NONE) {
         denoising.use = false;
       }
+    }
+
+    if (denoising.type == DENOISER_DLSS) {
+      /* Disable denoising when DLSS is not supported. */
+      if (!Denoiser::is_device_supported(denoising.type, denoise_device_info)) {
+        denoising.use = false;
+      }
+
+      denoising.start_sample = 0;
+      /* Carry the RR history across navigation restarts, aligned by the
+       * interactive motion passes (see MOTION_PASS_INTERACTIVE). OFF restores
+       * the old reset-on-restart behaviour. */
+      denoising.carry_history = get_boolean(cscene, "preview_denoising_carry_history");
+
+      switch ((DenoiserDLSSQuality)get_enum(cscene,
+                                            "preview_denoising_upscale_quality",
+                                            DENOISER_DLSS_MODE_NUM,
+                                            DENOISER_DLSS_MODE_BALANCED))
+      {
+        case DENOISER_DLSS_MODE_DLAA:
+          denoising.quality = DENOISER_QUALITY_HIGH;
+          denoising.upscale_factor = 1.0f;
+          break;
+        case DENOISER_DLSS_MODE_QUALITY:
+          denoising.quality = DENOISER_QUALITY_HIGH;
+          denoising.upscale_factor = 1.0f / 0.66666667f;
+          break;
+        default:
+        case DENOISER_DLSS_MODE_BALANCED:
+          denoising.quality = DENOISER_QUALITY_BALANCED;
+          denoising.upscale_factor = 1.0f / 0.58f;
+          break;
+        case DENOISER_DLSS_MODE_PERF:
+          denoising.quality = DENOISER_QUALITY_FAST;
+          denoising.upscale_factor = 2.0f;
+          break;
+        case DENOISER_DLSS_MODE_ULTRA_PERF:
+          denoising.quality = DENOISER_QUALITY_FAST;
+          denoising.upscale_factor = 3.0f;
+          break;
+      }
+
+      if (getenv("FALCON_DLSS_DEBUG")) {
+        fprintf(stderr,
+                "[sync/viewport] upscale_quality=%d -> upscale=%.3f carry=%d\n",
+                get_enum(cscene,
+                         "preview_denoising_upscale_quality",
+                         DENOISER_DLSS_MODE_NUM,
+                         DENOISER_DLSS_MODE_BALANCED),
+                denoising.upscale_factor,
+                int(denoising.carry_history));
+      }
+
+      denoising.passes = DENOISER_PASS_ALBEDO | DENOISER_PASS_SPECULAR_ALBEDO |
+                         DENOISER_PASS_NORMAL | DENOISER_PASS_ROUGHNESS | DENOISER_PASS_DEPTH |
+                         DENOISER_PASS_MOTION | DENOISER_PASS_SPECULAR_MOTION;
+      /* Transmission passes feed the ColorBeforeTransparency guide, which tells
+       * RR which part of the pixel came through a transmissive surface. */
+      if (getenv("FALCON_DLSS_NO_TRANSP_GUIDE") == nullptr) {
+        denoising.passes |= DENOISER_PASS_TRANSMISSION;
+      }
+      /* Specular hit distance: RR builds the specular motion from it, so
+       * reflections move with what they reflect instead of with the surface. */
+      if (getenv("FALCON_DLSS_NO_SPECULAR_HIT_DISTANCE") == nullptr) {
+        denoising.passes |= DENOISER_PASS_SPECULAR_HIT_DISTANCE;
+      }
+      /* FALCON_DLSS_EMISSIVE_GUIDE=1: hand RR GBuffer_Emissive. An emitter's own
+       * colour is material, not noisy lighting; without it RR has to guess. */
+      if (const char *eg = getenv("FALCON_DLSS_EMISSIVE_GUIDE")) {
+        if (atoi(eg) != 0) {
+          denoising.passes |= DENOISER_PASS_EMISSION;
+        }
+      }
+      /* FALCON_DLSS_LAYER_GUIDES=1: also hand RR ColorBeforeParticles and
+       * ColorBeforeFog (the latter = colour minus the volume passes). */
+      if (const char *lg = getenv("FALCON_DLSS_LAYER_GUIDES")) {
+        if (atoi(lg) != 0) {
+          denoising.passes |= DENOISER_PASS_VOLUME;
+        }
+      }
+      return denoising;
     }
   }
 

@@ -4,6 +4,8 @@
 
 #include "integrator/path_trace.h"
 
+#include "kernel/integrator/falcon_sharc_size.h"
+
 #include "device/cpu/device.h"
 #include "device/device.h"
 
@@ -12,6 +14,7 @@
 #include "integrator/path_trace_tile.h"
 #include "integrator/render_scheduler.h"
 
+#include "scene/integrator.h"
 #include "scene/pass.h"
 #include "scene/scene.h"
 
@@ -24,7 +27,45 @@
 #include "util/tbb.h"
 #include "util/time.h"
 
+#ifdef WITH_FALCON_SHARC
+#  include "util/hash.h"
+#  include <cmath>
+#  include <cstdint>
+#  include <cstdio>
+#  include <cstdlib>
+#  include <cstring>
+#endif
+
 CCL_NAMESPACE_BEGIN
+
+#ifdef WITH_FALCON_SHARC
+/* Host-side replica of the SHARC world-space cell hash. Must stay in sync with
+ * falcon_sharc_hash() / falcon_sharc_cell_size() in
+ * kernel/integrator/falcon_sharc.h.
+ *
+ * The cell size is a RUNTIME value and has to be passed in. It used to be a
+ * hard-coded 0.2 here while the kernel looked cells up at the scene's cell size
+ * (0.05 by default), so warmup deposited into one grid and blend read another:
+ * the lookups missed and the cache did nothing. Measured 2026-07-30 on
+ * classroom -- taking the cache in full (alpha=1) moved the image by 1%, and
+ * the whole 4M table held 2408 cells because the deposits were keyed at 0.2. */
+static const float FALCON_SHARC_HOST_CELL_SIZE_FALLBACK = 0.2f;
+static const unsigned int FALCON_SHARC_HOST_CELL_COUNT = FALCON_SHARC_CELL_COUNT;
+static const unsigned int FALCON_SHARC_HOST_CELL_MASK = FALCON_SHARC_HOST_CELL_COUNT - 1u;
+static const int FALCON_SHARC_HOST_CELL_STRIDE = 4;
+
+static inline unsigned int falcon_sharc_host_hash(float px,
+                                                  float py,
+                                                  float pz,
+                                                  const float cell_size)
+{
+  const float inv = 1.0f / cell_size;
+  const unsigned int gx = (unsigned int)((int)floorf(px * inv));
+  const unsigned int gy = (unsigned int)((int)floorf(py * inv));
+  const unsigned int gz = (unsigned int)((int)floorf(pz * inv));
+  return hash_uint3(gx, gy, gz) & FALCON_SHARC_HOST_CELL_MASK;
+}
+#endif
 
 PathTrace::PathTrace(Device *device,
                      Device *denoise_device,
@@ -215,10 +256,240 @@ void PathTrace::render_pipeline(RenderWork render_work)
     render_scheduler_.set_limit_samples_per_update(limit);
   }
 
+#ifdef WITH_FALCON_SHARC
+  /* In blend mode, load the warmup cache onto the device (read-only) before
+   * rendering so the camera-hit kernel can blend with it. In warmup mode the
+   * device cache stays zero, so the kernel blend is a no-op. */
+  {
+    /* Both "blend" (offline 2-pass) and "live" (viewport temporal accumulation)
+     * seed the device cache from the file before rendering so the camera-hit
+     * kernel can blend with it. In "live" the same file is re-loaded and re-saved
+     * every refresh, so the cache accumulates across frames.
+     *
+     * Mode and path come from the scene now (Integrator::device_update resolves
+     * the socket against the environment override), not from getenv here. */
+    const int sharc_mode = device_scene_->falcon_sharc_mode;
+    if (sharc_mode == FALCON_SHARC_MODE_BLEND || sharc_mode == FALCON_SHARC_MODE_LIVE) {
+      const char *cache_path = device_scene_->falcon_sharc_cache_path.c_str();
+      float *cache = device_scene_->falcon_sharc_cache.data();
+      const size_t cache_floats = device_scene_->falcon_sharc_cache.size();
+      FILE *cf = fopen(cache_path, "rb");
+      size_t got = 0;
+      if (cf) {
+        got = fread(cache, sizeof(float), cache_floats, cf);
+        fclose(cf);
+        device_scene_->falcon_sharc_cache.copy_to_device();
+      }
+      LOG_INFO << "Falcon SHARC: loaded " << got << "/" << cache_floats
+               << " cache floats from " << cache_path << " onto device for in-kernel blend";
+    }
+  }
+#endif
+
   path_trace(render_work);
   if (render_cancel_.is_requested) {
     return;
   }
+
+#ifdef WITH_FALCON_SHARC
+  /* In warmup mode, deposit this render's converged color into the cache and save
+   * it for the blend run (the device blend was a no-op since the cache was empty).
+   * The per-pixel first-hit world position comes from the Position pass (no
+   * kernel-writable buffer, unlike the standalone 5.2 version). In blend mode
+   * there is nothing to do -- the kernel already blended into the combined pass. */
+  if (path_trace_works_.size() == 1) {
+    /* Falcon Photon GPU bake: download the cache the kernel filled and save it
+     * in the same format the host tracer writes. */
+    const char *pmode = getenv("FALCON_PHOTON_MODE");
+    LOG_INFO << "Falcon Photon: save-hook check, pmode=" << (pmode ? pmode : "null")
+             << " cache_size=" << device_scene_->falcon_sharc_cache.size();
+    if (pmode && strcmp(pmode, "bake") == 0 &&
+        device_scene_->falcon_sharc_cache.size() != 0) {
+      device_scene_->falcon_sharc_cache.copy_from_device();
+      const char *cache_path = device_scene_->falcon_sharc_cache_path.c_str();
+      FILE *f = fopen(cache_path, "wb");
+      if (f) {
+        fwrite(device_scene_->falcon_sharc_cache.data(),
+               sizeof(float),
+               device_scene_->falcon_sharc_cache.size(),
+               f);
+        fclose(f);
+        LOG_INFO << "Falcon Photon: GPU-baked cache saved to " << cache_path;
+      }
+
+      /* Point map (Round 9): save the raw photon points the bake appended.
+       * Format: {magic 'FPH1', uint32 count} + count * 9 floats. Only when
+       * FALCON_PHOTON_POINTS names the output file. */
+      const char *pts_env = getenv("FALCON_PHOTON_POINTS");
+      if (pts_env && device_scene_->falcon_photon_points.size() != 0 &&
+          device_scene_->falcon_photon_pcount.size() != 0) {
+        device_scene_->falcon_photon_pcount.copy_from_device();
+        uint32_t n = device_scene_->falcon_photon_pcount.data()[0];
+        const uint32_t max_pts = (uint32_t)(device_scene_->falcon_photon_points.size() / 9);
+        if (n > max_pts) {
+          n = max_pts; /* counter keeps counting past the cap; clamp */
+        }
+        device_scene_->falcon_photon_points.copy_from_device();
+        FILE *pf = fopen(pts_env, "wb");
+        if (pf) {
+          const uint32_t header[2] = {0x46504831u, n};
+          fwrite(header, sizeof(uint32_t), 2, pf);
+          fwrite(device_scene_->falcon_photon_points.data(), sizeof(float), (size_t)n * 9, pf);
+          fclose(pf);
+          LOG_INFO << "Falcon Photon: point map saved, " << n << " points to " << pts_env;
+        }
+      }
+    }
+
+    const bool is_warmup = device_scene_->falcon_sharc_mode == FALCON_SHARC_MODE_WARMUP;
+    const bool is_live = device_scene_->falcon_sharc_mode == FALCON_SHARC_MODE_LIVE;
+    if (is_warmup || is_live) {
+      /* The grid the kernel will look up with -- deposit into the same one. */
+      const float kernel_cell = device_scene_->data.integrator.falcon_sharc_cell_size;
+      const float host_cell_size = (kernel_cell > 1e-4f) ? kernel_cell :
+                                                           FALCON_SHARC_HOST_CELL_SIZE_FALLBACK;
+      const char *cache_path = device_scene_->falcon_sharc_cache_path.c_str();
+      path_trace_works_[0]->copy_render_buffers_from_device();
+      const RenderBuffers *rb = path_trace_works_[0]->get_render_buffers();
+      const BufferParams &p = rb->params;
+      const int combined_offset = p.get_pass_offset(PASS_COMBINED);
+      const int position_offset = p.get_pass_offset(PASS_POSITION);
+      if (combined_offset == PASS_UNUSED || position_offset == PASS_UNUSED) {
+        LOG_INFO << "Falcon SHARC: needs both the Combined and Position passes "
+                 << "(enable the Position pass); skipping deposit";
+      }
+      else {
+        const float *buf = rb->buffer.data();
+        float *cache = device_scene_->falcon_sharc_cache.data();
+        const size_t cache_floats = device_scene_->falcon_sharc_cache.size();
+        const int w = p.width, h = p.height, stride = p.stride;
+        const int pass_stride = p.pass_stride;
+        const int num_samples = max(render_scheduler_.get_num_rendered_samples(), 1);
+        const float inv_s = 1.0f / num_samples;
+        size_t deposited = 0;
+        if (is_warmup) {
+          /* Warmup rebuilds the cache from scratch each render. */
+          memset(cache, 0, cache_floats * sizeof(float));
+        }
+        else {
+          /* Live temporal accumulation: decay every cell once so old frames fade
+           * out with an exponential recency window (FALCON_SHARC_KEEP, default
+           * 0.9). Decaying sum and count together leaves sum/count (the estimate)
+           * unchanged but bounds how much history a cell keeps -- this is what
+           * lets a static viewport converge while a moving one still adapts. */
+          const float keep = device_scene_->falcon_sharc_keep;
+          for (size_t i = 0; i < cache_floats; i++) {
+            cache[i] *= keep;
+          }
+        }
+        /* Within-cell dispersion, written next to the cache as a sidecar.
+         *
+         * How wrong is it to answer a path with this cell's mean? Not "how
+         * noisy is the mean" -- two warmup bakes at different seeds agree to
+         * 1e-6 here, because a cell averages ~18 pixels x 64 spp (measured
+         * 2026-07-30, and it is why the seed-pair version of this measurement
+         * was useless). The mean is wrong where the radiance genuinely VARIES
+         * inside the cell: geometry detail, a shadow edge, view dependence.
+         * That is a spread, so accumulate sum and sum-of-squares of luminance
+         * and let the tooling turn it into a relative standard deviation. */
+        std::vector<double> lum_sum(FALCON_SHARC_HOST_CELL_COUNT, 0.0);
+        std::vector<double> lum_sq(FALCON_SHARC_HOST_CELL_COUNT, 0.0);
+        for (int y = 0; y < h; y++) {
+          for (int x = 0; x < w; x++) {
+            const int idx = p.offset + x + y * stride;
+            const float *pos = buf + (size_t)idx * pass_stride + position_offset;
+            /* Position pass is overwrite (not sample-averaged); (0,0,0) means the
+             * camera ray missed all geometry, so skip it. */
+            if (pos[0] == 0.0f && pos[1] == 0.0f && pos[2] == 0.0f) {
+              continue;
+            }
+            const unsigned int cell = falcon_sharc_host_hash(
+                pos[0], pos[1], pos[2], host_cell_size);
+            const float *px = buf + (size_t)idx * pass_stride + combined_offset;
+            const size_t cbase = (size_t)cell * FALCON_SHARC_HOST_CELL_STRIDE;
+            const double l = (0.2126 * px[0] + 0.7152 * px[1] + 0.0722 * px[2]) * inv_s;
+            lum_sum[cell] += l;
+            lum_sq[cell] += l * l;
+            cache[cbase + 0] += px[0] * inv_s;
+            cache[cbase + 1] += px[1] * inv_s;
+            cache[cbase + 2] += px[2] * inv_s;
+            cache[cbase + 3] += 1.0f;
+            deposited++;
+          }
+        }
+        if (is_live) {
+          /* Push the updated cache back so this session's next frame blends with
+           * it (the file save keeps cross-process/headless accumulation working
+           * too). */
+          device_scene_->falcon_sharc_cache.copy_to_device();
+        }
+        FILE *cf = fopen(cache_path, "wb");
+        if (cf) {
+          fwrite(cache, sizeof(float), cache_floats, cf);
+          fclose(cf);
+          LOG_INFO << "Falcon SHARC " << (is_live ? "live" : "warmup") << ": " << num_samples
+                   << " spp, deposited " << deposited << " pixels, cache " << cache_path;
+        }
+
+        /* Sidecar: relative standard deviation of luminance inside each cell,
+         * negative where nothing landed. Same 4M layout as the cache so the
+         * tooling can hand it to the kernel's error-field slot unchanged. */
+        {
+          const string var_path = string(cache_path) + ".spread";
+          std::vector<float> spread(FALCON_SHARC_HOST_CELL_COUNT, -1.0f);
+          for (size_t c = 0; c < FALCON_SHARC_HOST_CELL_COUNT; c++) {
+            const float n = cache[c * FALCON_SHARC_HOST_CELL_STRIDE + 3];
+            if (n >= 1.0f) {
+              const double mean = lum_sum[c] / n;
+              const double var = max(lum_sq[c] / n - mean * mean, 0.0);
+              spread[c] = (mean > 1e-9) ? (float)(sqrt(var) / mean) : 0.0f;
+            }
+          }
+          FILE *vf = fopen(var_path.c_str(), "wb");
+          if (vf) {
+            const uint32_t header[2] = {0x46454631u, (uint32_t)FALCON_SHARC_HOST_CELL_COUNT};
+            fwrite(header, sizeof(uint32_t), 2, vf);
+            fwrite(&host_cell_size, sizeof(float), 1, vf);
+            fwrite(spread.data(), sizeof(float), spread.size(), vf);
+            fclose(vf);
+            LOG_INFO << "Falcon SHARC: cell spread written to " << var_path;
+          }
+        }
+
+        /* Measure GI dominance for the auto-gate: luminance of Diffuse Indirect
+         * over Diffuse Direct + Indirect. SHARC (a radiance cache) helps when
+         * indirect light dominates and hurts direct-lit scenes (Phase0 data), so
+         * the blend run reads this ratio to scale alpha. Written as a one-float
+         * sidecar next to the cache; the blend run picks it up. */
+        const int dd_offset = p.get_pass_offset(PASS_DIFFUSE_DIRECT);
+        const int di_offset = p.get_pass_offset(PASS_DIFFUSE_INDIRECT);
+        if (dd_offset != PASS_UNUSED && di_offset != PASS_UNUSED) {
+          double sum_direct = 0.0, sum_indirect = 0.0;
+          for (int y = 0; y < h; y++) {
+            for (int x = 0; x < w; x++) {
+              const int idx = p.offset + x + y * stride;
+              const float *dd = buf + (size_t)idx * pass_stride + dd_offset;
+              const float *di = buf + (size_t)idx * pass_stride + di_offset;
+              /* Rec.709 luminance, scaled to converged (per-sample) value. */
+              sum_direct += (0.2126 * dd[0] + 0.7152 * dd[1] + 0.0722 * dd[2]) * inv_s;
+              sum_indirect += (0.2126 * di[0] + 0.7152 * di[1] + 0.0722 * di[2]) * inv_s;
+            }
+          }
+          const double total = sum_direct + sum_indirect;
+          const float gi_ratio = total > 1e-6 ? (float)(sum_indirect / total) : 0.0f;
+          string meta_path = string(cache_path) + ".meta";
+          FILE *mf = fopen(meta_path.c_str(), "w");
+          if (mf) {
+            fprintf(mf, "%.6f\n", gi_ratio);
+            fclose(mf);
+            LOG_INFO << "Falcon SHARC: GI ratio " << gi_ratio << " (indirect/total), "
+                     << meta_path;
+          }
+        }
+      }
+    }
+  }
+#endif
 
   /* Update the guiding field using the training data/samples collected during the rendering
    * iteration/progression. */
@@ -522,6 +793,18 @@ void PathTrace::adaptive_sample(RenderWork &render_work)
   }
 }
 
+void PathTrace::clear_denoiser_temporal_history()
+{
+  if (denoiser_) {
+    denoiser_->clear_temporal_history();
+  }
+}
+
+void PathTrace::set_denoiser_frame(const int frame)
+{
+  denoiser_frame_ = frame;
+}
+
 void PathTrace::set_denoiser_params(const DenoiseParams &params)
 {
   if (!params.use) {
@@ -537,8 +820,14 @@ void PathTrace::set_denoiser_params(const DenoiseParams &params)
 
   Device *effective_denoise_device;
   Device *cpu_fallback_device = cpu_device_.get();
-  const DenoiseParams effective_denoise_params = get_effective_denoise_params(
+  DenoiseParams effective_denoise_params = get_effective_denoise_params(
       denoise_device_, cpu_fallback_device, params, interop_device, effective_denoise_device);
+
+  /* Carrying the DLSS-RR temporal history is allowed in both modes now:
+   * final (background) renders carry it across animation frames
+   * (denoising_carry_history), the viewport carries it across navigation
+   * restarts aligned by the interactive motion passes
+   * (preview_denoising_carry_history). Each mode's sync sets its own flag. */
 
   bool need_to_recreate_denoiser = false;
   if (denoiser_) {
@@ -546,7 +835,9 @@ void PathTrace::set_denoiser_params(const DenoiseParams &params)
 
     const bool is_cpu_denoising = old_denoiser_params.type == DENOISER_OPENIMAGEDENOISE &&
                                   old_denoiser_params.use_gpu == false;
-    const bool requested_gpu_denoising = effective_denoise_params.type == DENOISER_OPTIX ||
+    const bool always_gpu_denoising = effective_denoise_params.type == DENOISER_DLSS ||
+                                      effective_denoise_params.type == DENOISER_OPTIX;
+    const bool requested_gpu_denoising = always_gpu_denoising ||
                                          (effective_denoise_params.type ==
                                               DENOISER_OPENIMAGEDENOISE &&
                                           effective_denoise_params.use_gpu == true);
@@ -564,7 +855,7 @@ void PathTrace::set_denoiser_params(const DenoiseParams &params)
     /* Optix Denoiser is not supporting CPU devices, so use_gpu option is not
      * shown in the UI and changes in the option value should not be checked. */
     if (old_denoiser_params.type == effective_denoise_params.type &&
-        (is_same_denoising_device_type || effective_denoise_params.type == DENOISER_OPTIX))
+        (is_same_denoising_device_type || always_gpu_denoising))
     {
       denoiser_->set_params(effective_denoise_params);
     }
@@ -595,6 +886,15 @@ void PathTrace::set_denoiser_params(const DenoiseParams &params)
   }
   else {
     render_scheduler_.set_denoiser_params(effective_denoise_params);
+  }
+
+  if (getenv("FALCON_DLSS_DEBUG")) {
+    fprintf(stderr,
+            "[path_trace] in=%.3f effective=%.3f scheduler=%.3f\n",
+            params.upscale_factor,
+            effective_denoise_params.upscale_factor,
+            (denoise_device_ && denoiser_) ? denoiser_->get_params().upscale_factor :
+                                             effective_denoise_params.upscale_factor);
   }
 }
 
@@ -627,6 +927,39 @@ void PathTrace::denoise(const RenderWork &render_work)
   }
 
   LOG_DEBUG << "Perform denoising work.";
+
+  denoiser_->set_same_frame_restart(render_work.denoise_same_frame_restart);
+  denoiser_->set_preroll_pass(render_work.denoise_preroll_pass);
+  denoiser_->set_frame(denoiser_frame_);
+
+  {
+    /* The specular hit distance is a world-space length; RR needs the camera
+     * matrices to place the reflection it describes.
+     *
+     * NGX wants these row-major and left-multiply (v * M). Cycles stores its
+     * matrices row-major but right-multiply (M * v), so they have to be
+     * transposed -- NVIDIA's own sample gets away with passing glm matrices
+     * untouched precisely because glm's column-major storage already amounts to
+     * the transpose. Handing ours over as-is (which is what the first attempt at
+     * this did) feeds RR a garbled matrix, and it quietly ignores the guide.
+     *
+     * Cycles keeps world->camera and world->NDC; view->clip is world->NDC with
+     * the camera undone, and NDC ([0,1]) remapped to clip ([-1,1]). */
+    const KernelCamera &cam = device_scene_->data.cam;
+
+    const ProjectionTransform camera_to_world(transform_inverse(cam.worldtocamera));
+    ProjectionTransform ndc_to_clip = projection_identity();
+    ndc_to_clip.x = make_float4(2.0f, 0.0f, 0.0f, -1.0f);
+    ndc_to_clip.y = make_float4(0.0f, 2.0f, 0.0f, -1.0f);
+
+    const ProjectionTransform world_to_view(cam.worldtocamera);
+    const ProjectionTransform view_to_clip = ndc_to_clip * cam.worldtondc * camera_to_world;
+
+    const ProjectionTransform world_to_view_ngx = projection_transpose(world_to_view);
+    const ProjectionTransform view_to_clip_ngx = projection_transpose(view_to_clip);
+
+    denoiser_->set_camera_matrices(&world_to_view_ngx.x.x, &view_to_clip_ngx.x.x);
+  }
 
   const double start_time = time_dt();
 
@@ -666,6 +999,30 @@ void PathTrace::denoise(const RenderWork &render_work)
                                 device_scene_->data.integrator.pixel_jitter))
   {
     render_state_.has_denoised_result = true;
+  }
+  else {
+    /* A failed denoise used to leave the flag on from whatever frame denoised
+     * last, and update_display() reads it to pick *both* the pass it shows and
+     * the size of the display texture. While the render buffer and the denoised
+     * buffer were the same size that only meant a stale picture. Since playback
+     * renders smaller and lets DLSS upscale (RenderScheduler::playback_upscale_factor)
+     * they differ by up to 2.9x, so a failed denoise sizes the texture to the
+     * full frame and then fills it out of a buffer a third of that -- the rest
+     * of the viewport stays at whatever the texture held, i.e. black.
+     *
+     * DLSS fails exactly there: it refuses to create a feature for a render
+     * buffer of 128x96 or less (denoiser_dlss.cpp), which an ordinary viewport
+     * divided by 2.9 falls under, and every evaluation after a refused create
+     * fails too.
+     *
+     * So say what is true -- this frame has no denoised result -- and let the
+     * display fall back to the noisy pass, which is the size it claims to be.
+     * FALCON_DLSS_KEEP_STALE_DENOISED=1 restores the old behaviour. */
+    static const bool keep_stale = getenv("FALCON_DLSS_KEEP_STALE_DENOISED") &&
+                                   atoi(getenv("FALCON_DLSS_KEEP_STALE_DENOISED")) != 0;
+    if (!keep_stale) {
+      render_state_.has_denoised_result = false;
+    }
   }
 
   render_scheduler_.report_denoise_time(render_work, time_dt() - start_time);
@@ -911,7 +1268,11 @@ void PathTrace::cancel()
 {
   thread_scoped_lock lock(render_cancel_.mutex);
 
-  render_cancel_.is_requested = true;
+  /* Only cancel in the middle of rendering when there is at least one sample in the output.
+   * Otherwise interactivity becomes bad. */
+  if (get_num_samples_in_buffer() > 1) {
+    render_cancel_.is_requested = true;
+  }
 
   while (render_cancel_.is_rendering) {
     render_cancel_.condition.wait(lock);

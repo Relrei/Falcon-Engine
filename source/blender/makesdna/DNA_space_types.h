@@ -442,7 +442,14 @@ struct FileSelectParams {
   eFileDisplayType display = FILE_DEFAULTDISPLAY;
   /** Details toggles (file size, creation date, etc.) */
   eFileDetails details_flags = {};
-  char _pad1 = {};
+  /**
+   * Falcon: fold numbered image sequences into a single "movie like" entry.
+   * #eFileSel_Params_GroupSequences flags. Default is on when the browser was opened by a Video
+   * Sequencer operator or shares its screen with a Video Sequencer, off otherwise; a value picked
+   * with the toggle is kept (#FILE_GROUP_SEQUENCES_CHOSEN).
+   * The environment variable `FALCON_FILE_SEQUENCE_GROUP=0` disables it everywhere.
+   */
+  char group_sequences = 0;
 
   /** Filter when (flags & FILE_FILTER) is true. */
   int filter = 0;
@@ -601,6 +608,13 @@ struct FileDirEntry {
   eFileEntry_Flag flags = {};
   /* eFileAttributes defined in BLI_fileops.h */
   int attributes = 0;
+
+  /**
+   * Falcon: for #FILE_TYPE_IMAGE_SEQUENCE entries, the first and last frame number of the folded
+   * sequence (both zero when this is not a folded sequence).
+   */
+  int seq_first = 0;
+  int seq_last = 0;
 };
 
 /**

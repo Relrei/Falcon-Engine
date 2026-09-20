@@ -6,6 +6,7 @@
 
 #include "device/device.h"
 
+#include "integrator/denoiser_dlss.h"
 #include "integrator/denoiser_oidn.h"
 #include "session/display_driver.h"
 #ifdef WITH_OPENIMAGEDENOISE
@@ -102,6 +103,18 @@ bool use_gpu_oidn_denoiser(Device *denoiser_device, const DenoiseParams &params)
 #endif
 }
 
+bool use_dlss_denoiser(Device *denoiser_device, const DenoiseParams &params)
+{
+#ifdef WITH_DLSS
+  return (params.type == DENOISER_DLSS &&
+          DLSSDenoiser::is_device_supported(denoiser_device->info));
+#else
+  (void)denoiser_device;
+  (void)params;
+  return false;
+#endif
+}
+
 DenoiseParams get_effective_denoise_params(Device *denoiser_device,
                                            Device *cpu_fallback_device,
                                            const DenoiseParams &params,
@@ -131,7 +144,8 @@ DenoiseParams get_effective_denoise_params(Device *denoiser_device,
   const bool is_cpu_denoiser_device = single_denoiser_device->info.type == DEVICE_CPU;
   if (is_cpu_denoiser_device == false) {
     if (use_optix_denoiser(single_denoiser_device, effective_denoise_params) ||
-        use_gpu_oidn_denoiser(single_denoiser_device, effective_denoise_params))
+        use_gpu_oidn_denoiser(single_denoiser_device, effective_denoise_params) ||
+        use_dlss_denoiser(single_denoiser_device, effective_denoise_params))
     {
       /* Denoising parameters are correct and there is no need to fall back to CPU OIDN. */
       return effective_denoise_params;
@@ -170,6 +184,12 @@ unique_ptr<Denoiser> Denoiser::create(Device *denoiser_device,
       return make_unique<OIDNDenoiserGPU>(single_denoiser_device, effective_denoiser_params);
     }
 #endif
+
+#ifdef WITH_DLSS
+    if (use_dlss_denoiser(single_denoiser_device, effective_denoiser_params)) {
+      return make_unique<DLSSDenoiser>(single_denoiser_device, effective_denoiser_params);
+    }
+#endif
   }
 
   if (!openimagedenoise_supported()) {
@@ -182,8 +202,44 @@ unique_ptr<Denoiser> Denoiser::create(Device *denoiser_device,
                                    effective_denoiser_params);
 }
 
+bool Denoiser::is_device_supported(DenoiserType type, const DeviceInfo &denoise_device_info)
+{
+  switch (type) {
+#ifdef WITH_OPTIX
+    case DENOISER_OPTIX:
+      return OptiXDenoiser::is_device_supported(denoise_device_info);
+#endif
+#ifdef WITH_OPENIMAGEDENOISE
+    case DENOISER_OPENIMAGEDENOISE:
+      return OIDNDenoiserGPU::is_device_supported(denoise_device_info);
+#endif
+#ifdef WITH_DLSS
+    case DENOISER_DLSS:
+      return DLSSDenoiser::is_device_supported(denoise_device_info);
+#endif
+    default:
+      return false;
+  }
+}
+
 DenoiserType Denoiser::automatic_viewport_denoiser_type(const DeviceInfo &denoise_device_info)
 {
+  /* Falcon: prefer DLSS-RR in the viewport when the device can run it. Upstream's Automatic picks
+   * OpenImageDenoise, which is the better single frame but is re-run from scratch on every update;
+   * RR carries a temporal history, so it settles across updates and is markedly faster at high
+   * resolution (4K, 1spp: DLSS 2.74 s against OIDN-GPU 10.16 s, measured 2026-08-28).
+   * FALCON_DLSS_VIEWPORT_AUTO=0 restores the upstream preference. */
+#ifdef WITH_DLSS
+  {
+    static const bool prefer_dlss = getenv("FALCON_DLSS_VIEWPORT_AUTO") ?
+                                        atoi(getenv("FALCON_DLSS_VIEWPORT_AUTO")) != 0 :
+                                        true;
+    if (prefer_dlss && DLSSDenoiser::is_device_supported(denoise_device_info)) {
+      return DENOISER_DLSS;
+    }
+  }
+#endif
+
 #ifdef WITH_OPENIMAGEDENOISE
   if (denoise_device_info.type != DEVICE_CPU &&
       OIDNDenoiserGPU::is_device_supported(denoise_device_info))

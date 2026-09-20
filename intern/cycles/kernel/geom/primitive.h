@@ -370,4 +370,41 @@ primitive_motion_vector_backward_depth_delta(KernelGlobals kg, const ccl_private
   return make_float3(motion_pre.x, motion_pre.y, linear_depth_delta_pre);
 }
 
+/* Motion vector of the virtual image seen in a delta mirror (primary surface replacement).
+ *
+ * The reflected hit is mirrored through the reflector's plane before the camera step, so the
+ * vector describes where the reflection appears to be rather than where the mirror is. That is
+ * what the denoiser reprojects: a reflection slides across a mirror as the camera moves, and
+ * feeding it the mirror's own motion instead is what smears highlights on polished metal.
+ *
+ * Mirroring all three motion steps through the same plane assumes the reflector itself does not
+ * move; the caller only sets the plane up for static ones. */
+ccl_device_forceinline float3 primitive_motion_vector_backward_depth_delta_psr(
+    KernelGlobals kg,
+    const ccl_private ShaderData *sd,
+    const float3 mirror_n,
+    const float mirror_d)
+{
+  Transform tfm;
+  float3 motion_center, motion_pre, motion_post;
+  primitive_motion_data_without_camera(kg, sd, &motion_center, &motion_pre, &motion_post);
+
+  motion_center -= 2.0f * mirror_n * (dot(motion_center, mirror_n) - mirror_d);
+  motion_pre -= 2.0f * mirror_n * (dot(motion_pre, mirror_n) - mirror_d);
+  motion_post -= 2.0f * mirror_n * (dot(motion_post, mirror_n) - mirror_d);
+
+  /* Get camera-space vectors for linear depth delta. */
+  tfm = kernel_data.cam.worldtocamera;
+  float3 motion_center_cam = transform_point(&tfm, motion_center);
+  tfm = kernel_data.cam.motion_pass_pre;
+  float3 motion_pre_cam = transform_point(&tfm, motion_pre);
+
+  primitive_motion_data_camera_step(kg, &motion_center, &motion_pre, &motion_post);
+
+  motion_pre = motion_pre - motion_center;
+  float linear_depth_delta_pre = motion_pre_cam.z - motion_center_cam.z;
+
+  return make_float3(motion_pre.x, motion_pre.y, linear_depth_delta_pre);
+}
+
 CCL_NAMESPACE_END

@@ -327,6 +327,20 @@ void strip_open_anim_file(Scene *scene, Strip *strip, bool openfile)
   }
 }
 
+std::string strip_movie_source_path_get(const Scene *scene, const Strip *strip)
+{
+  if (strip->data == nullptr || strip->data->stripdata == nullptr) {
+    return {};
+  }
+
+  char filepath[FILE_MAX];
+  BLI_path_join(
+      filepath, sizeof(filepath), strip->data->dirpath, strip->data->stripdata->filename);
+  BLI_path_abs(filepath, ID_BLEND_PATH_FROM_GLOBAL(&scene->id));
+  BLI_path_normalize(filepath);
+  return std::string(filepath);
+}
+
 const Strip *strip_topmost_get(const Scene *scene, int frame)
 {
   Editing *ed = scene->ed;

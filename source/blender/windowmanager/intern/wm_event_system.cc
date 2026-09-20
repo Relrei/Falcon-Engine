@@ -2931,7 +2931,8 @@ static eHandlerActionFlag wm_handler_fileselect_do(bContext *C,
             continue;
           }
 
-          ED_fileselect_params_to_userdef(static_cast<SpaceFile *>(file_area->spacedata.first));
+          ED_fileselect_params_to_userdef(static_cast<SpaceFile *>(file_area->spacedata.first),
+                                          handler->op);
 
           if (file_area->spacedata.is_single()) {
             BLI_assert(root_win != &win);
@@ -2963,7 +2964,8 @@ static eHandlerActionFlag wm_handler_fileselect_do(bContext *C,
         }
 
         if (!temp_win && ctx_area->full) {
-          ED_fileselect_params_to_userdef(static_cast<SpaceFile *>(ctx_area->spacedata.first));
+          ED_fileselect_params_to_userdef(static_cast<SpaceFile *>(ctx_area->spacedata.first),
+                                          handler->op);
           ED_screen_full_prevspace(C, ctx_area);
         }
       }

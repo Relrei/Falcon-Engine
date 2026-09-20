@@ -127,8 +127,11 @@ void ED_fileselect_set_params_from_userdef(SpaceFile *sfile);
 /**
  * Update the user-preference data for the file space. In fact, this also contains some
  * non-FileSelectParams data, but we can safely ignore this.
+ *
+ * \param op: The operator that opened the file browser, or null. Passed separately because
+ * `sfile->op` is already cleared when a dialog closes (#file_cancel_exec(), #file_exec()).
  */
-void ED_fileselect_params_to_userdef(SpaceFile *sfile);
+void ED_fileselect_params_to_userdef(SpaceFile *sfile, const wmOperator *op);
 
 void ED_fileselect_init_layout(SpaceFile *sfile, ARegion *region);
 
@@ -151,6 +154,13 @@ bool ED_fileselect_layout_isect_rect(const FileLayout *layout,
 void ED_fileselect_layout_tilepos(const FileLayout *layout, int tile, int *x, int *y);
 
 void ED_operatormacros_file();
+
+/**
+ * Falcon: master switch for folding numbered image sequences into a single file browser entry.
+ * Returns false when `FALCON_FILE_SEQUENCE_GROUP=0` is set in the environment, in which case the
+ * file browser behaves exactly like before (one entry per frame).
+ */
+bool ED_fileselect_sequence_grouping_enabled();
 
 void ED_fileselect_clear(wmWindowManager *wm, SpaceFile *sfile);
 void ED_fileselect_clear_main_assets(wmWindowManager *wm, SpaceFile *sfile);

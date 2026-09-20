@@ -6,7 +6,10 @@
  * \ingroup edrend
  */
 
+#include <algorithm>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "MEM_guardedalloc.h"
@@ -49,6 +52,7 @@
 #include "WM_types.hh"
 
 #include "ED_render.hh"
+#include "ED_render_job.hh"
 #include "ED_screen.hh"
 #include "ED_util.hh"
 
@@ -94,7 +98,20 @@ struct RenderJob : public RenderJobBase {
   bool interface_locked;
   int frame_start;
   int frame_end;
+  /** Falcon: `scene->r.frame_step` at the start (for #RenderJobBase::falcon_frame_index). */
+  int falcon_frame_step;
 };
+
+/**
+ * Falcon (2026-09-20): show which frame of how many an animation render is on, next to the job
+ * name in the status bar ("Rendering sequence... 31 / 60"). The author: the VSE export seemed to
+ * stay at 0% and it was not clear what was happening. `FALCON_RENDER_FRAME_COUNT=0` hides it.
+ */
+static bool falcon_render_frame_count_enabled()
+{
+  const char *env = getenv("FALCON_RENDER_FRAME_COUNT");
+  return !(env && env[0] == '0');
+}
 
 /* called inside thread! */
 static bool image_buffer_calc_tile_rect(const RenderResult *rr,
@@ -485,6 +502,12 @@ static void image_renderinfo_cb(void *rjv, RenderStats *rs)
   RenderJob *rj = static_cast<RenderJob *>(rjv);
   RenderResult *rr;
 
+  if (rj->anim && rj->falcon_frame_total > 0) {
+    /* Warm-up frames before the start count as the first one. */
+    const int index = (rs->cfra - rj->frame_start) / std::max(1, rj->falcon_frame_step) + 1;
+    rj->falcon_frame_index = std::clamp(index, 1, int(rj->falcon_frame_total));
+  }
+
   rr = RE_AcquireResultRead(rj->re);
 
   if (rr) {
@@ -510,11 +533,27 @@ static void render_progress_update(void *rjv, float progress)
 {
   RenderJob *rj = static_cast<RenderJob *>(rjv);
 
+  /* Falcon: frames before the start (warm-up) gave a negative value ("-3%"). */
+  progress = std::clamp(progress, 0.0f, 1.0f);
+
   if (rj->progress && *rj->progress != progress) {
     *rj->progress = progress;
 
     /* make jobs timer to send notifier */
     *(rj->do_update) = true;
+
+    /* Falcon: `FALCON_RENDER_PROGRESS_LOG=1` prints every change, for the tests of the status bar. */
+    static const bool falcon_log = [] {
+      const char *env = getenv("FALCON_RENDER_PROGRESS_LOG");
+      return env && env[0] == '1';
+    }();
+    if (falcon_log) {
+      printf("FALCON_RENDER_PROGRESS %.4f %d/%d\n",
+             progress,
+             int(rj->falcon_frame_index),
+             int(rj->falcon_frame_total));
+      fflush(stdout);
+    }
   }
 }
 
@@ -1034,6 +1073,10 @@ static wmOperatorStatus screen_render_invoke(bContext *C, wmOperator *op, const 
   rj->area = area;
   rj->frame_start = frame_start;
   rj->frame_end = frame_end;
+  rj->falcon_frame_step = std::max(1, scene->r.frame_step);
+  if (is_animation && falcon_render_frame_count_enabled()) {
+    rj->falcon_frame_total = (frame_end - frame_start) / rj->falcon_frame_step + 1;
+  }
 
   BKE_color_managed_display_settings_copy(&rj->display_settings, &scene->display_settings);
   BKE_color_managed_view_settings_copy(&rj->view_settings, &scene->view_settings);
@@ -1255,6 +1298,23 @@ Scene *ED_render_job_get_current_scene(const bContext *C)
 {
   RenderJobBase *rj = render_job_get(C);
   return rj ? rj->current_scene : nullptr;
+}
+
+bool ED_render_job_frame_info(wmWindowManager *wm, const Scene *scene, int *r_index, int *r_total)
+{
+  const RenderJobBase *rj = static_cast<const RenderJobBase *>(
+      WM_jobs_customdata_from_type(wm, scene, WM_JOB_TYPE_RENDER));
+  if (rj == nullptr) {
+    return false;
+  }
+  const int total = rj->falcon_frame_total;
+  const int index = rj->falcon_frame_index;
+  if (total < 2 || index < 1) {
+    return false;
+  }
+  *r_index = std::min(index, total);
+  *r_total = total;
+  return true;
 }
 
 /* Motion blur curve preset */

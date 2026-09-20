@@ -495,6 +495,17 @@ void Device::tag_update()
   free_memory();
 }
 
+void Device::redetect_devices(const uint mask)
+{
+  const thread_scoped_lock lock(device_mutex);
+  if (mask & (DEVICE_MASK_CUDA | DEVICE_MASK_OPTIX)) {
+    /* OptiX devices are built from the CUDA list, so both are detected again together. */
+    devices_initialized_mask &= ~(DEVICE_MASK_CUDA | DEVICE_MASK_OPTIX);
+    cuda_devices().free_memory();
+    optix_devices().free_memory();
+  }
+}
+
 void Device::free_memory()
 {
   devices_initialized_mask = 0;

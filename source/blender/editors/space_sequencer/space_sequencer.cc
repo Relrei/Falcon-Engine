@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 
 #include "DNA_gpencil_legacy_types.h"
@@ -455,9 +456,80 @@ static void sequencer_main_region_init(wmWindowManager *wm, ARegion *region)
   WM_event_add_dropbox_handler(&region->runtime->handlers, lb);
 }
 
+/**
+ * 戻す口。`FALCON_VSE_FLIP_VIEW_FIX=0` で切ると、従来どおり
+ * 保存された `v2d.cur` をそのまま使う (= 反転時はチャンネル 1 が画面外)。
+ */
+static bool flip_view_fix_enabled()
+{
+  static const bool enabled = [] {
+    const char *env = getenv("FALCON_VSE_FLIP_VIEW_FIX");
+    if (env == nullptr || env[0] == '\0') {
+      return true;
+    }
+    return atoi(env) != 0;
+  }();
+  return enabled;
+}
+
+/**
+ * FALCON: チャンネルを上下反転させると、チャンネル 1 は一番大きい Y (128〜129) に座る。
+ * ところがファイルに保存されている `v2d.cur` は反転前の座標 (Y≈1〜9) なので、
+ * `File > New > Video Editing` を開いた直後にチャンネル 1 が画面の外に出る。
+ * 領域を**初めて描く時に限り**、`cur` を既定の範囲 (`timeline_init_boundbox`) の
+ * 上端へ平行移動する。
+ *
+ * ★寄せるのは `cur` が**反転前の座標**に見える時だけ。反転後に作者がスクロールして
+ * 保存した位置(= 反転後の座標)は、開き直しても動かさない。以前は無条件に寄せていたので、
+ * 「チャンネル 10〜20 を見て保存 → 開くとチャンネル 1 に戻る」= 保存したスクロール位置を
+ * 毎回捨てていた。
+ */
+static void sequencer_main_region_flip_view_init(const bContext *C, ARegion *region)
+{
+  if (!seq::channel_flip_enabled() || !flip_view_fix_enabled()) {
+    return;
+  }
+  SpaceSeq *sseq = CTX_wm_space_seq(C);
+  if (sseq == nullptr || sseq->runtime == nullptr || sseq->runtime->timeline_view_y_init_done) {
+    return;
+  }
+  sseq->runtime->timeline_view_y_init_done = true;
+
+  View2D *v2d = &region->v2d;
+  /* 反転後は、ふだん使うチャンネル (1〜64) が Y の**上半分** (65〜129) に座る
+   * (`channel_to_y(c) == MAX_CHANNELS + 1 - c`)。したがって `cur.ymax` が下半分に居る =
+   * その Y はチャンネル 65 以上を指している = 反転前の座標 (チャンネル == Y) がそのまま
+   * 保存されている、と読める。上半分に居るなら反転後の座標なので、作者が選んだ位置として
+   * そのままにする。
+   * ⚠ 引き換えに外れる 2 つ (どちらもチャンネル 65 以上を見ている場合で、Home で戻せる):
+   * 反転前の座標でチャンネル 65 以上を見て保存したファイルは寄せない / 反転後にチャンネル
+   * 65 以上を見て保存した位置は寄せてしまう。 */
+  if (v2d->cur.ymax >= seq::channel_to_y(seq::MAX_CHANNELS / 2)) {
+    return;
+  }
+
+  Scene *scene = CTX_data_sequencer_scene(C);
+  if (scene == nullptr) {
+    return;
+  }
+  rctf boundbox;
+  seq::timeline_init_boundbox(scene, &boundbox);
+
+  const float dy = boundbox.ymax - v2d->cur.ymax;
+  if (dy == 0.0f) {
+    return;
+  }
+  v2d->cur.ymin += dy;
+  v2d->cur.ymax += dy;
+  /* チャンネル名の列 (RGN_TYPE_CHANNELS) は自分の v2d で描くので、Y を写して
+   * 描き直しを付ける。これが無いと帯だけが反転前の位置に残る。 */
+  ui::view2d_sync(nullptr, CTX_wm_area(C), v2d, V2D_LOCK_COPY);
+}
+
 /* Strip editing timeline. */
 static void sequencer_main_region_draw(const bContext *C, ARegion *region)
 {
+  sequencer_main_region_flip_view_init(C, region);
   draw_timeline_seq(C, region);
 }
 
@@ -505,8 +577,11 @@ static void sequencer_main_clamp_view(const bContext *C, ARegion *region)
    * strips. */
   float bottom_channel_padding = UI_MARKER_MARGIN_Y * pixel_view_size_y;
   bottom_channel_padding = std::max(bottom_channel_padding, 1.0f);
-  /* Add the padding and make sure we have a margin of one channel in each direction. */
-  strip_boundbox.ymax += 1.0f + pad_top * pixel_view_size_y;
+  /* Add the padding and make sure we have a margin of one channel in each direction.
+   * Falcon: with a set number of channels (#seq::falcon_timeline_channels) the timeline ends at the
+   * top channel; more channels come from the "+" button of the channel region. */
+  const float falcon_margin_top = seq::falcon_timeline_channels(scene) ? 0.0f : 1.0f;
+  strip_boundbox.ymax += falcon_margin_top + pad_top * pixel_view_size_y;
   strip_boundbox.ymin -= bottom_channel_padding;
 
   /* If a strip has been deleted, don't move the view automatically, keep current range until it is

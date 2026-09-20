@@ -12,7 +12,10 @@
 
 #include "DNA_listBase.h"
 
+#include <string>
+
 #include "BLI_enum_flags.hh"
+#include "BLI_set.hh"
 
 namespace blender {
 
@@ -21,6 +24,7 @@ struct MovieClip;
 struct ReportList;
 struct bNodeTree;
 struct Scene;
+struct ImBuf;
 struct Strip;
 
 namespace seq {
@@ -38,7 +42,24 @@ bool relations_check_scene_recursion(Scene *scene, ReportList *reports);
  * Check if "strip_main" (indirectly) uses strip "strip".
  */
 bool relations_render_loop_check(Strip *strip_main, Strip *strip);
-void relations_free_imbuf(Scene *scene, ListBaseT<Strip> *seqbase, bool for_render);
+/**
+ * Close movie readers (and rebuild speed maps) of the strips in `seqbase`.
+ *
+ * `only_movie_paths` (Falcon): when not null, only the movie strips whose source file is in the
+ * set have their readers closed. Re-opening a movie strip means "open the file, seek to the
+ * previous key frame, decode forward to the wanted frame", which happens synchronously inside the
+ * preview draw, so dropping a reader that nothing invalidated costs a visible stall on the next
+ * redraw (measured 0.80 s for a 3440x1440 HEVC with a 250 frame key frame interval).
+ *
+ * The filter is keyed on the *file* rather than on the strip because one file is normally shared
+ * by several strips (cutting a clip in two leaves two strips on one file), and all of them have to
+ * re-open once a proxy for that file appears on disk. Speed map rebuilds and the meta recursion
+ * are unaffected by the filter.
+ */
+void relations_free_imbuf(Scene *scene,
+                          ListBaseT<Strip> *seqbase,
+                          bool for_render,
+                          const Set<std::string> *only_movie_paths = nullptr);
 
 /**
  * Invalidates various caches related to a given strip:
@@ -119,6 +140,12 @@ void cache_cleanup(Scene *scene, CacheCleanup mode);
 
 void cache_settings_changed(Scene *scene);
 bool is_cache_full(const Scene *scene);
+/**
+ * 空きメモリが「柔らかい下限」(`FALCON_VSE_MEM_SOFT_MB`・既定 4096) を割っているか。
+ * 真の間は**新しくキャッシュへ入れない**(既に入っている物は捨てない)。
+ * `is_cache_full()` の崖が来る手前で太るのを止めるための1段。
+ */
+bool cache_should_stop_growing(const Scene *scene);
 bool evict_caches_if_full(Scene *scene);
 
 void source_image_cache_iterate(Scene *scene,
@@ -132,6 +159,22 @@ void final_image_cache_iterate(Scene *scene,
 
 size_t source_image_cache_calc_memory_size(const Scene *scene);
 size_t final_image_cache_calc_memory_size(const Scene *scene);
+
+/**
+ * ★素材と仕上がりのキャッシュは**同じ `ImBuf` を共有することがある**(1 本のストリップで
+ * 前処理が要らない時、読んだ絵がそのまま仕上がりになる)。上の 2 本を足すとその絵を 2 回数えるので、
+ * `is_cache_full()` の `used` が実体の約 2 倍になり、**設定した上限の半分で「満杯」**になる。
+ * 実測(2026-09-21・FHD 1 本): `raw` と `final` が 2048 / 2048 と完全に一致し、RSS はその合計より小さい。
+ *
+ * こちらは実体(ポインタ)ごとに 1 回だけ数える。
+ * 戻す口: `FALCON_VSE_CACHE_DEDUP=0` で今までどおりの足し算に戻る。
+ *
+ * \note これは本家 Blender から続いている数え方で(9e4c26574a6・Aras Pranckevicius)、
+ * 2026-09-21 時点の upstream main にも同じ式が残っている。
+ */
+size_t caches_calc_memory_size_unique(const Scene *scene);
+void source_image_cache_collect_images(const Scene *scene, Set<const ImBuf *> &r_images);
+void final_image_cache_collect_images(const Scene *scene, Set<const ImBuf *> &r_images);
 
 bool exists_in_seqbase(const Strip *strip, const ListBaseT<Strip> *seqbase);
 
