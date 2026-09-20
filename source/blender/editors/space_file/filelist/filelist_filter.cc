@@ -6,9 +6,6 @@
  * \ingroup spfile
  */
 
-#include <algorithm>
-#include <string>
-
 #include "AS_asset_representation.hh"
 #include "AS_essentials_library.hh"
 
@@ -312,130 +309,6 @@ static void filelist_filter_and_sort_assets(FileList *filelist,
   filelist->filelist.entries_filtered_num = num_filtered;
 }
 
-/* -------------------------------------------------------------------- */
-/** \name Falcon: fold numbered image sequences into one entry
- *
- * `render0000.png` ... `render1350.png` are shown as a single `render[0000-1350].png` item that
- * behaves like a movie file. The real files are still in the list internally; all frames but the
- * first get #FileListInternEntry::seq_skip so that they are dropped while filtering. The entry
- * that survives keeps its own `relpath` (the first frame), so everything that resolves a path
- * through it stays valid; only the displayed name and the icon change, plus the expansion done in
- * #file_sfile_to_operator_ex() when the entry is handed over to an operator.
- * \{ */
-
-static void filelist_sequence_group_reset(FileList *filelist)
-{
-  for (FileListInternEntry &file : filelist->filelist_intern.entries) {
-    if (file.seq_name) {
-      MEM_delete(file.seq_name);
-      file.seq_name = nullptr;
-    }
-    file.seq_first = 0;
-    file.seq_last = 0;
-    file.seq_digits = 0;
-    file.seq_skip = false;
-    file.typeflag &= ~FILE_TYPE_IMAGE_SEQUENCE;
-  }
-}
-
-static void filelist_sequence_group_build(FileList *filelist)
-{
-  /* Key is `<head>\x01<tail>\x01<digits>`, so only files that share the exact same name pattern
-   * *and* the same amount of digits can end up in the same sequence. */
-  Map<std::string, Vector<FileListInternEntry *>> groups;
-
-  for (FileListInternEntry &file : filelist->filelist_intern.entries) {
-    if (file.typeflag & (FILE_TYPE_DIR | FILE_TYPE_BLENDERLIB)) {
-      continue;
-    }
-    if (!(file.typeflag & FILE_TYPE_IMAGE)) {
-      continue;
-    }
-    /* Aliases/shortcuts cannot be mixed with regular items in a multi-selection. */
-    if (file.redirection_path || !file.relpath) {
-      continue;
-    }
-
-    const char *filename = BLI_path_basename(file.relpath);
-    char head[FILE_MAX], tail[FILE_MAX];
-    ushort digits = 0;
-    const int framenr = BLI_path_sequence_decode(
-        filename, head, sizeof(head), tail, sizeof(tail), &digits);
-    if (digits == 0) {
-      /* No number in the name at all. */
-      continue;
-    }
-
-    std::string key = std::string(head) + '\x01' + tail + '\x01' + std::to_string(int(digits));
-    groups.lookup_or_add_default(key).append(&file);
-    file.seq_first = framenr;
-    file.seq_digits = digits;
-  }
-
-  for (Vector<FileListInternEntry *> &group : groups.values()) {
-    if (group.size() < 2) {
-      /* A single image is never a sequence. */
-      group[0]->seq_first = 0;
-      group[0]->seq_digits = 0;
-      continue;
-    }
-
-    std::sort(group.begin(), group.end(), [](const auto *a, const auto *b) {
-      return a->seq_first < b->seq_first;
-    });
-
-    /* Only fold a *complete* run. A gap means we do not know what the user wants, so leave the
-     * files alone rather than pretending frames exist. */
-    bool contiguous = true;
-    for (int i = 1; i < group.size(); i++) {
-      if (group[i]->seq_first != group[i - 1]->seq_first + 1) {
-        contiguous = false;
-        break;
-      }
-    }
-    if (!contiguous) {
-      for (FileListInternEntry *file : group) {
-        file->seq_first = 0;
-        file->seq_digits = 0;
-      }
-      continue;
-    }
-
-    FileListInternEntry *first = group.first();
-    const int frame_first = first->seq_first;
-    const int frame_last = group.last()->seq_first;
-    const ushort digits = first->seq_digits;
-
-    char head[FILE_MAX], tail[FILE_MAX];
-    BLI_path_sequence_decode(
-        BLI_path_basename(first->relpath), head, sizeof(head), tail, sizeof(tail), nullptr);
-
-    char name[FILE_MAX];
-    SNPRINTF(name,
-             "%s[%0*d-%0*d]%s",
-             head,
-             int(digits),
-             frame_first,
-             int(digits),
-             frame_last,
-             tail);
-
-    first->seq_name = BLI_strdup(name);
-    first->seq_first = frame_first;
-    first->seq_last = frame_last;
-    first->seq_digits = digits;
-    first->typeflag |= FILE_TYPE_IMAGE_SEQUENCE;
-
-    for (int i = 1; i < group.size(); i++) {
-      group[i]->seq_first = 0;
-      group[i]->seq_digits = 0;
-      group[i]->seq_skip = true;
-    }
-  }
-}
-
-/** \} */
-
 void filelist_filter(FileList *filelist)
 {
   int num_filtered = 0;
@@ -465,20 +338,10 @@ void filelist_filter(FileList *filelist)
     filelist->prepare_filter_fn(filelist, &filelist->filter_data);
   }
 
-  /* Falcon: (re)build the image sequence folding before filtering, it decides which entries are
-   * dropped below. */
-  filelist_sequence_group_reset(filelist);
-  if (filelist->filter_data.flags & FLF_GROUP_SEQUENCES) {
-    filelist_sequence_group_build(filelist);
-  }
-
   filtered_tmp = MEM_new_array_uninitialized<FileListInternEntry *>(num_files, __func__);
 
   /* Filter remap & count how many files are left after filter in a single loop. */
   for (FileListInternEntry &file : filelist->filelist_intern.entries) {
-    if (file.seq_skip) {
-      continue;
-    }
     if (filelist->filter_fn(&file, filelist->filelist.root, &filelist->filter_data)) {
       filtered_tmp[num_filtered++] = &file;
     }
@@ -516,16 +379,10 @@ void filelist_setfilter_options(FileList *filelist,
                                 const bool filter_assets_only,
                                 const bool filter_assets_hide_online,
                                 const bool filter_assets_hide_offline,
-                                const bool group_sequences,
                                 const char *filter_glob,
                                 const char *filter_search)
 {
   bool update = false;
-
-  if (((filelist->filter_data.flags & FLF_GROUP_SEQUENCES) != 0) != (group_sequences != 0)) {
-    filelist->filter_data.flags ^= FLF_GROUP_SEQUENCES;
-    update = true;
-  }
 
   if (((filelist->filter_data.flags & FLF_DO_FILTER) != 0) != (do_filter != 0)) {
     filelist->filter_data.flags ^= FLF_DO_FILTER;

@@ -60,15 +60,7 @@ DeviceScene::DeviceScene(Device *device)
       image_textures(device, "image_textures", MEM_GLOBAL),
       image_texture_tile_descriptors(device, "image_texture_tile_descriptors", MEM_GLOBAL),
       image_texture_tile_access_state(device, "image_texture_tile_access_state", MEM_GLOBAL),
-      image_texture_udims(device, "image_texture_udims", MEM_GLOBAL),
-      falcon_sharc_cache(device, "falcon_sharc_cache", MEM_GLOBAL),
-      falcon_photon_points(device, "falcon_photon_points", MEM_GLOBAL),
-      falcon_photon_pcount(device, "falcon_photon_pcount", MEM_GLOBAL),
-      falcon_photon_grid_start(device, "falcon_photon_grid_start", MEM_GLOBAL),
-      falcon_photon_grid_count(device, "falcon_photon_grid_count", MEM_GLOBAL),
-      falcon_photon_index(device, "falcon_photon_index", MEM_GLOBAL),
-      falcon_das_scale(device, "falcon_das_scale", MEM_GLOBAL),
-      falcon_error_field(device, "falcon_error_field", MEM_GLOBAL)
+      image_texture_udims(device, "image_texture_udims", MEM_GLOBAL)
 {
   memset((void *)&data, 0, sizeof(data));
 }

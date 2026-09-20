@@ -11,7 +11,6 @@
 #include "draw_model.bsl.hh"
 #include "draw_view.bsl.hh"
 #include "eevee_bxdf_lut_lib.bsl.hh"
-#include "eevee_camera_lib.bsl.hh"
 #include "eevee_hiz.bsl.hh"
 #include "eevee_nodetree_closures_lib.glsl"
 #include "eevee_pipeline.bsl.hh"
@@ -668,21 +667,11 @@ float3 coordinate_camera(float3 P)
     vP = P;
   }
   else {
-#ifdef MAT_GEOM_WORLD
     const ViewMatrices view = view_matrices_get();
+#ifdef MAT_GEOM_WORLD
     vP = view.normal_world_to_view(P);
 #else
-    [[resource_table]] const eevee::Uniform &uni = resource_table_get(eevee::Uniform);
-    const CameraData cam = uni.uniform_buf.camera;
-    if (is_panoramic(cam.type)) {
-      /* Panoramic camera render through per-face subviews.
-       * Can't use `view` here because that's only one subview, not the camera. */
-      vP = transform_point(cam.viewmat, P);
-    }
-    else {
-      const ViewMatrices view = view_matrices_get();
-      vP = view.point_world_to_view(P);
-    }
+    vP = view.point_world_to_view(P);
 #endif
   }
   vP.z = -vP.z;
@@ -698,25 +687,14 @@ float3 coordinate_screen(float3 P)
     window.xy = float2(0.5f);
   }
   else {
-#ifdef MAT_GEOM_WORLD
     const ViewMatrices view = view_matrices_get();
+#ifdef MAT_GEOM_WORLD
     window.xy = view.point_view_to_screen(interp.P).xy;
-    window.xy = window.xy * uni.uniform_buf.camera.uv_scale + uni.uniform_buf.camera.uv_bias;
 #else
-    const CameraData cam = uni.uniform_buf.camera;
-    if (is_panoramic(cam.type)) {
-      /* Panoramic camera render through per-face subviews.
-       * Can't use `view` here because that's only one subview, not the camera. */
-      float3 dir = P - cam.viewinv[3].xyz;
-      window.xy = fract(eevee::camera::uv_from_world(cam, dir) + cam.uv_bias);
-    }
-    else {
-      const ViewMatrices view = view_matrices_get();
-      /* TODO(fclem): Actual camera transform. */
-      window.xy = view.point_world_to_screen(P).xy;
-      window.xy = window.xy * cam.uv_scale + cam.uv_bias;
-    }
+    /* TODO(fclem): Actual camera transform. */
+    window.xy = view.point_world_to_screen(P).xy;
 #endif
+    window.xy = window.xy * uni.uniform_buf.camera.uv_scale + uni.uniform_buf.camera.uv_bias;
   }
   return window;
 }

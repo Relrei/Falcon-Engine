@@ -92,13 +92,6 @@ NODE_DEFINE(BufferParams)
   SOCKET_INT(full_width, "Full Width", 0);
   SOCKET_INT(full_height, "Full Height", 0);
 
-  SOCKET_INT(display_x, "Display X", 0);
-  SOCKET_INT(display_y, "Display Y", 0);
-  SOCKET_INT(display_width, "Display Width", 0);
-  SOCKET_INT(display_height, "Display Height", 0);
-  SOCKET_INT(display_full_width, "Display Full Width", 0);
-  SOCKET_INT(display_full_height, "Display Full Height", 0);
-
   SOCKET_STRING(layer, "Layer", ustring());
   SOCKET_STRING(view, "View", ustring());
   SOCKET_INT(samples, "Samples", 0);
@@ -246,14 +239,6 @@ bool BufferParams::modified(const BufferParams &other) const
     return true;
   }
 
-  if (display_x != other.display_x || display_y != other.display_y ||
-      display_width != other.display_width || display_height != other.display_height ||
-      display_full_width != other.display_full_width ||
-      display_full_height != other.display_full_height)
-  {
-    return true;
-  }
-
   if (offset != other.offset || stride != other.stride || pass_stride != other.pass_stride) {
     return true;
   }
@@ -332,6 +317,7 @@ void render_buffers_host_copy_denoised(RenderBuffers *dst,
   struct {
     int dst_offset;
     int src_offset;
+    int num_components;
   } pass_offsets[PASS_NUM];
 
   int num_passes = 0;
@@ -351,6 +337,8 @@ void render_buffers_host_copy_denoised(RenderBuffers *dst,
 
     pass_offsets[num_passes].dst_offset = dst_pass_offset;
     pass_offsets[num_passes].src_offset = src_pass_offset;
+    pass_offsets[num_passes].num_components =
+        Pass::get_info(pass_type, PassMode::DENOISED).num_components;
     ++num_passes;
   }
 
@@ -374,12 +362,11 @@ void render_buffers_host_copy_denoised(RenderBuffers *dst,
     for (int pass_offset_idx = 0; pass_offset_idx < num_passes; ++pass_offset_idx) {
       const int dst_pass_offset = pass_offsets[pass_offset_idx].dst_offset;
       const int src_pass_offset = pass_offsets[pass_offset_idx].src_offset;
+      const int num_components = pass_offsets[pass_offset_idx].num_components;
 
-      /* TODO(sergey): Support non-RGBA passes. */
-      dst_pixel[dst_pass_offset + 0] = src_pixel[src_pass_offset + 0];
-      dst_pixel[dst_pass_offset + 1] = src_pixel[src_pass_offset + 1];
-      dst_pixel[dst_pass_offset + 2] = src_pixel[src_pass_offset + 2];
-      dst_pixel[dst_pass_offset + 3] = src_pixel[src_pass_offset + 3];
+      for (int c = 0; c < num_components; ++c) {
+        dst_pixel[dst_pass_offset + c] = src_pixel[src_pass_offset + c];
+      }
     }
   }
 }

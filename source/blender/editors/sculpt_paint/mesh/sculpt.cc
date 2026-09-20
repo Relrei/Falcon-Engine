@@ -30,12 +30,6 @@
 #include "BLI_math_vector.hh"
 #include "BLI_rect.h"
 #include "BLI_set.hh"
-#include "BLI_time.h"
-
-#include "GPU_context.hh"
-
-#include "falcon_sculpt_gpu.hh"
-#include "falcon_sculpt_resident.hh"
 #include "BLI_span.hh"
 #include "BLI_task.h"
 #include "BLI_task.hh"
@@ -3408,123 +3402,6 @@ static const char *sculpt_brush_type_name(const Brush &brush)
   return "Sculpting";
 }
 
-/* ★1ダブの内訳を測る(2026-08-16 追加・`FALCON_SCULPT_TIMING=1` の時だけ)。
- *
- * ブラシのGPU化に入る前に、**どこで時間が消えているか**を知るために置く。
- * CPU側は既に TBB で PBVH ノード並列に回っているので、時間が法線の作り直しや
- * 描画バッファの転送で消えているなら、**ブラシ本体だけGPUへ移しても総時間は
- * ほとんど動かない**。上限を先に出さないまま書き始めるのが一番高くつく。
- *
- * Python 側(`sculpt.brush_stroke` を EXEC で叩く)からも測れるが、
- * あちらは元に戻せない・太さが効かない・機械の混み具合を拾うで数字が荒れた。
- * ここで測れば**ダブ1回の中身**がそのまま出る。
- *
- * 既定は無効。`getenv` は1回だけ引いて static に持つ(毎ダブ引かない)。 */
-namespace falcon_sculpt_timing {
-
-struct Totals {
-  /* update_step の3分割 */
-  double restore = 0.0;
-  double brush = 0.0;
-  double flush = 0.0;
-  /* brush の中をさらに4分割(合計は brush とほぼ一致する) */
-  double search = 0.0;
-  double undo_push = 0.0;
-  double normals = 0.0;
-  double kernel = 0.0;
-  int dabs = 0;
-  /* ★触った頂点数。時間だけ見ても「1頂点あたりいくらか」が出ない。
-   * 10ms が 70万頂点なら妥当、7万頂点なら遅すぎる、で次の一手が変わる。 */
-  int64_t verts = 0;
-  double radius = 0.0;
-  /* ★描画側は触った面の**角ごと**に位置を展開してGPUの頂点バッファへ入れ直す
-   * (`draw_pbvh.cc:extract_data_vert_mesh`)。頂点の共有をやめているので、
-   * 頂点数の何倍になっているかがそのまま毎ダブの無駄の大きさになる。
-   * 描画側で直接測ろうとしたが、ai-display の中では `update_positions_mesh` が
-   * 一度も呼ばれず測れなかった。**彫る側で同じ集合を数えて倍率だけ出す。** */
-  int64_t corners = 0;
-};
-
-static Totals g_totals;
-
-static bool enabled()
-{
-  static const bool on = (getenv("FALCON_SCULPT_TIMING") != nullptr);
-  return on;
-}
-
-static double now()
-{
-  return BLI_time_now_seconds();
-}
-
-static void report_and_reset()
-{
-  if (!enabled() || g_totals.dabs == 0) {
-    return;
-  }
-  const double total = g_totals.restore + g_totals.brush + g_totals.flush;
-  printf("FALCON_SCULPT ダブ%d回 合計%.3f秒 (1回あたり %.2fms)\n",
-         g_totals.dabs,
-         total,
-         1000.0 * total / double(g_totals.dabs));
-  printf("FALCON_SCULPT   元に戻す %6.2fms/回 (%4.1f%%)\n",
-         1000.0 * g_totals.restore / double(g_totals.dabs),
-         total > 0.0 ? 100.0 * g_totals.restore / total : 0.0);
-  printf("FALCON_SCULPT   ブラシ   %6.2fms/回 (%4.1f%%)  <- GPUで縮むのはここだけ\n",
-         1000.0 * g_totals.brush / double(g_totals.dabs),
-         total > 0.0 ? 100.0 * g_totals.brush / total : 0.0);
-  printf("FALCON_SCULPT   後始末   %6.2fms/回 (%4.1f%%)  法線・境界・描画バッファ\n",
-         1000.0 * g_totals.flush / double(g_totals.dabs),
-         total > 0.0 ? 100.0 * g_totals.flush / total : 0.0);
-  printf("FALCON_SCULPT   -- ブラシの中身 --\n");
-  const double n = double(g_totals.dabs);
-  printf("FALCON_SCULPT     ノード探索 %6.2fms/回 (%4.1f%%)\n",
-         1000.0 * g_totals.search / n, total > 0.0 ? 100.0 * g_totals.search / total : 0.0);
-  printf("FALCON_SCULPT     undo積み   %6.2fms/回 (%4.1f%%)  ★GPUでは縮まない\n",
-         1000.0 * g_totals.undo_push / n, total > 0.0 ? 100.0 * g_totals.undo_push / total : 0.0);
-  printf("FALCON_SCULPT     法線       %6.2fms/回 (%4.1f%%)\n",
-         1000.0 * g_totals.normals / n, total > 0.0 ? 100.0 * g_totals.normals / total : 0.0);
-  printf("FALCON_SCULPT     カーネル   %6.2fms/回 (%4.1f%%)  ★ここが本命\n",
-         1000.0 * g_totals.kernel / n, total > 0.0 ? 100.0 * g_totals.kernel / total : 0.0);
-  const double vpd = double(g_totals.verts) / n;
-  printf("FALCON_SCULPT   触った頂点 %.0f/回  半径 %.4f  カーネル %.1f ns/頂点\n",
-         vpd,
-         g_totals.radius / n,
-         vpd > 0.0 ? 1e9 * (g_totals.kernel / n) / vpd : 0.0);
-  const double cpd = double(g_totals.corners) / n;
-  printf("FALCON_SCULPT   描画側が作り直す角 %.0f/回 = 頂点の %.2f倍 (%.1fMB/回)\n",
-         cpd,
-         vpd > 0.0 ? cpd / vpd : 0.0,
-         cpd * 12.0 / 1024.0 / 1024.0);
-
-  /* ★undo の粒度(2026-08-25)。GPU常駐にした時、undo のために毎ダブ読み戻す必要が
-   * あるのか、それとも「新しく触れたノードの初回だけ」で済むのかを数字で出す。
-   * 位置と法線の2本を控えるので 1頂点 24 バイト。 */
-  const undo::falcon_stats::UndoCounters uc = undo::falcon_stats::get_counters();
-  if (uc.push_calls > 0) {
-    printf("FALCON_SCULPT   -- undo の粒度 --\n");
-    printf("FALCON_SCULPT     控えを取ったダブ %lld / %lld 回 (%.1f%%)\n",
-           (long long)uc.calls_with_new,
-           (long long)uc.push_calls,
-           100.0 * double(uc.calls_with_new) / double(uc.push_calls));
-    printf("FALCON_SCULPT     控えたノード %lld / 頂点 %lld (%.1fMB・位置+法線)\n",
-           (long long)uc.new_nodes,
-           (long long)uc.new_verts,
-           double(uc.new_verts) * 24.0 / 1024.0 / 1024.0);
-    printf("FALCON_SCULPT     控えの時間 合計%.1fms = %.3fms/ダブ (undo積みの %.0f%%)\n",
-           1000.0 * uc.fill_seconds,
-           1000.0 * uc.fill_seconds / double(uc.push_calls),
-           g_totals.undo_push > 0.0 ? 100.0 * uc.fill_seconds / g_totals.undo_push : 0.0);
-  }
-  undo::falcon_stats::reset_counters();
-
-  fflush(stdout);
-  g_totals = Totals();
-}
-
-}  // namespace falcon_sculpt_timing
-
 static void do_brush_action(const Depsgraph &depsgraph,
                             const Scene & /*scene*/,
                             Sculpt &sd,
@@ -3552,60 +3429,9 @@ static void do_brush_action(const Depsgraph &depsgraph,
     }
   }
 
-  /* ★内訳を1段深く測る(`FALCON_SCULPT_TIMING=1` の時だけ)。
-   * 「ブラシが99.7%」までは分かったが、その中身が
-   * ノード探索 / undo積み / 法線 / カーネル本体 のどれなのかで、
-   * **GPU化で何が縮むかが変わる**。undo積みが大半ならGPUでは縮まない。 */
-  const bool prf = falcon_sculpt_timing::enabled();
-  double t0 = prf ? falcon_sculpt_timing::now() : 0.0;
-  auto lap = [&](double &slot) {
-    if (prf) {
-      const double t = falcon_sculpt_timing::now();
-      slot += t - t0;
-      t0 = t;
-    }
-  };
-
   const brushes::CursorSampleResult cursor_sample_result = calc_brush_node_mask(
       depsgraph, ob, brush, memory);
   const IndexMask node_mask = cursor_sample_result.node_mask;
-  lap(falcon_sculpt_timing::g_totals.search);
-
-  if (prf) {
-    /* 触った頂点数を数える。Mesh 型だけでよい(GPU化の的がそこなので)。 */
-    bke::pbvh::Tree &pbvh_prf = *bke::object::pbvh_get(ob);
-    if (pbvh_prf.type() == bke::pbvh::Type::Mesh) {
-      const Span<bke::pbvh::MeshNode> nodes = pbvh_prf.nodes<bke::pbvh::MeshNode>();
-      int64_t n = 0;
-      node_mask.foreach_index([&](const int i) { n += nodes[i].verts().size(); });
-      falcon_sculpt_timing::g_totals.verts += n;
-
-      const Mesh &mesh_prf = *id_cast<const Mesh *>(ob.data);
-      const OffsetIndices<int> faces_prf = mesh_prf.faces();
-      int64_t corners = 0;
-      node_mask.foreach_index([&](const int i) {
-        for (const int face : nodes[i].faces()) {
-          corners += faces_prf[face].size();
-        }
-      });
-      falcon_sculpt_timing::g_totals.corners += corners;
-    }
-    falcon_sculpt_timing::g_totals.radius += double(ss.cache->radius);
-
-    /* ★GPU化の可否を決める1点: ダブの最中に GPU の文脈が生きているか。
-     * 生きていなければ、シェーダを作ることも走らせることもできず、
-     * 設計から変わる(描画のタイミングまで仕事を遅らせる形になる)。
-     * 何百行か書いた後に気づくと高くつくので、先にここだけ見る。 */
-    static bool ctx_reported = false;
-    if (!ctx_reported) {
-      ctx_reported = true;
-      printf("FALCON_SCULPT GPU文脈 = %s\n",
-             GPU_context_active_get() != nullptr ? "生きている" : "★無い");
-      fflush(stdout);
-    }
-    /* 数え終わった分を計時から外す(測る道具が測る対象を汚さない) */
-    t0 = falcon_sculpt_timing::now();
-  }
 
   /* Only act if some verts are inside the brush area. */
   if (node_mask.is_empty()) {
@@ -3622,7 +3448,6 @@ static void do_brush_action(const Depsgraph &depsgraph,
   if (!use_pixels) {
     push_undo_nodes(depsgraph, ob, brush, node_mask);
   }
-  lap(falcon_sculpt_timing::g_totals.undo_push);
 
   /* There are issues with the underlying normals cache / mesh data that can cause the data to
    * become out of date.
@@ -3642,7 +3467,6 @@ static void do_brush_action(const Depsgraph &depsgraph,
   }
 
   update_brush_local_mat(sd, ob);
-  lap(falcon_sculpt_timing::g_totals.normals);
 
   if (brush.deform_target == BRUSH_DEFORM_TARGET_CLOTH_SIM) {
     if (!ss.cache->cloth_sim) {
@@ -3838,10 +3662,6 @@ static void do_brush_action(const Depsgraph &depsgraph,
       cloth::do_simulation_step(depsgraph, sd, ob, *ss.cache->cloth_sim, node_mask);
     }
   }
-
-  /* ここまでが「カーネル本体」。自動スムーズ・トポロジーレイク・重力も
-   * 頂点を触る計算なので同じ側に入れる(全部GPUへ移す対象)。 */
-  lap(falcon_sculpt_timing::g_totals.kernel);
 
   /* Update average stroke position. */
   const float3 world_location = math::project_point(ob.object_to_world(), ss.cache->location);
@@ -4213,7 +4033,6 @@ static void smooth_brush_toggle_on(Main *bmain,
 
   toggle_settings.original_brush_size = BKE_brush_size_get(paint, smooth_brush);
   BKE_brush_size_set(paint, smooth_brush, cur_brush_size);
-  bke::brush::common_pressure_curves_init(*smooth_brush);
 }
 
 static void smooth_brush_toggle_off(Paint *paint, StrokeCache *cache)
@@ -4270,14 +4089,6 @@ static void mask_brush_toggle_on(Main *bmain, Paint *paint, StrokeToggleSettings
   const int cur_brush_size = BKE_brush_size_get(paint, cur_brush);
   toggle_settings.original_brush_size = BKE_brush_size_get(paint, mask_brush);
   BKE_brush_size_set(paint, mask_brush, cur_brush_size);
-
-  if (mask_brush->curve_distance_falloff) {
-    BKE_curvemapping_init(mask_brush->curve_distance_falloff);
-  }
-
-  if (mask_brush->curve_strength) {
-    BKE_curvemapping_init(mask_brush->curve_strength);
-  }
 }
 
 static void mask_brush_toggle_off(Paint *paint, StrokeCache *cache)
@@ -5317,7 +5128,6 @@ static void brush_stroke_init(bContext *C, const wmOperator *op)
   ToolSettings *tool_settings = CTX_data_tool_settings(C);
   Sculpt &sd = *tool_settings->sculpt;
   SculptSession &ss = *CTX_data_active_object(C)->runtime->sculpt_session;
-  const Brush *brush = BKE_paint_brush_for_read(&sd.paint);
 
   if (!G.background) {
     view3d_operator_needs_gpu(C);
@@ -5328,6 +5138,8 @@ static void brush_stroke_init(bContext *C, const wmOperator *op)
     ss.cache->toggle_settings = create_toggle_settings(*op, *CTX_data_main(C), sd.paint);
   }
 
+  Brush *brush = BKE_paint_brush(&sd.paint);
+  bke::brush::common_pressure_curves_init(*brush);
   brush_init_tex(sd, ss);
 
   const bool needs_colors = brush_type_is_paint(brush->sculpt_brush_type) &&
@@ -6111,7 +5923,6 @@ void SculptPaintStroke::stroke_cache_update(PointerRNA *ptr)
   cache.iteration_count++;
 }
 
-
 void SculptPaintStroke::update_step(wmOperator * /*op*/, PointerRNA *itemptr)
 {
   const Scene &scene = *this->scene;
@@ -6125,17 +5936,7 @@ void SculptPaintStroke::update_step(wmOperator * /*op*/, PointerRNA *itemptr)
 
   stroke_modifiers_check(depsgraph, this->vc.rv3d, sd, ob, &brush);
   stroke_cache_update(itemptr);
-
-  const bool prf = falcon_sculpt_timing::enabled();
-  double t0 = prf ? falcon_sculpt_timing::now() : 0.0;
-
   restore_from_undo_step_if_necessary(depsgraph, sd, ob);
-
-  if (prf) {
-    const double t = falcon_sculpt_timing::now();
-    falcon_sculpt_timing::g_totals.restore += t - t0;
-    t0 = t;
-  }
 
   if (dyntopo::stroke_is_dyntopo(ob, brush)) {
     do_symmetrical_brush_actions(
@@ -6147,12 +5948,6 @@ void SculptPaintStroke::update_step(wmOperator * /*op*/, PointerRNA *itemptr)
 
   /* Hack to fix noise texture tearing mesh. */
   sculpt_fix_noise_tear(sd, ob);
-
-  if (prf) {
-    const double t = falcon_sculpt_timing::now();
-    falcon_sculpt_timing::g_totals.brush += t - t0;
-    t0 = t;
-  }
 
   ss.cache->first_time = false;
   copy_v3_v3(ss.cache->last_location, ss.cache->location);
@@ -6172,11 +5967,6 @@ void SculptPaintStroke::update_step(wmOperator * /*op*/, PointerRNA *itemptr)
   else {
     flush_update_step(this->vc, *this->object, UpdateType::Position);
   }
-
-  if (prf) {
-    falcon_sculpt_timing::g_totals.flush += falcon_sculpt_timing::now() - t0;
-    falcon_sculpt_timing::g_totals.dabs++;
-  }
 }
 
 static void brush_exit_tex(Sculpt &sd)
@@ -6191,14 +5981,6 @@ static void brush_exit_tex(Sculpt &sd)
 
 void SculptPaintStroke::done(bool is_cancel, bool stroke_started)
 {
-  falcon_sculpt_timing::report_and_reset();
-  falcon_gpu::report_verify();
-  falcon_gpu::report_gpu_breakdown();
-  /* ★常駐しているGPU側の位置は、ここで「古い」印にする。次のストロークの初めに送り直す。
-   * ストロークの外(undo・モディファイア・別の編集)で位置が変わっていても追随できる。 */
-  falcon_resident::report_breakdown();
-  falcon_resident::invalidate();
-
   Object &ob = *this->object;
   SculptSession &ss = *ob.runtime->sculpt_session;
   Sculpt &sd = *this->sculpt_;

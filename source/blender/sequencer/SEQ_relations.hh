@@ -12,10 +12,7 @@
 
 #include "DNA_listBase.h"
 
-#include <string>
-
 #include "BLI_enum_flags.hh"
-#include "BLI_set.hh"
 
 namespace blender {
 
@@ -41,24 +38,7 @@ bool relations_check_scene_recursion(Scene *scene, ReportList *reports);
  * Check if "strip_main" (indirectly) uses strip "strip".
  */
 bool relations_render_loop_check(Strip *strip_main, Strip *strip);
-/**
- * Close movie readers (and rebuild speed maps) of the strips in `seqbase`.
- *
- * `only_movie_paths` (Falcon): when not null, only the movie strips whose source file is in the
- * set have their readers closed. Re-opening a movie strip means "open the file, seek to the
- * previous key frame, decode forward to the wanted frame", which happens synchronously inside the
- * preview draw, so dropping a reader that nothing invalidated costs a visible stall on the next
- * redraw (measured 0.80 s for a 3440x1440 HEVC with a 250 frame key frame interval).
- *
- * The filter is keyed on the *file* rather than on the strip because one file is normally shared
- * by several strips (cutting a clip in two leaves two strips on one file), and all of them have to
- * re-open once a proxy for that file appears on disk. Speed map rebuilds and the meta recursion
- * are unaffected by the filter.
- */
-void relations_free_imbuf(Scene *scene,
-                          ListBaseT<Strip> *seqbase,
-                          bool for_render,
-                          const Set<std::string> *only_movie_paths = nullptr);
+void relations_free_imbuf(Scene *scene, ListBaseT<Strip> *seqbase, bool for_render);
 
 /**
  * Invalidates various caches related to a given strip:
@@ -139,12 +119,6 @@ void cache_cleanup(Scene *scene, CacheCleanup mode);
 
 void cache_settings_changed(Scene *scene);
 bool is_cache_full(const Scene *scene);
-/**
- * 空きメモリが「柔らかい下限」(`FALCON_VSE_MEM_SOFT_MB`・既定 4096) を割っているか。
- * 真の間は**新しくキャッシュへ入れない**(既に入っている物は捨てない)。
- * `is_cache_full()` の崖が来る手前で太るのを止めるための1段。
- */
-bool cache_should_stop_growing(const Scene *scene);
 bool evict_caches_if_full(Scene *scene);
 
 void source_image_cache_iterate(Scene *scene,

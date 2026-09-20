@@ -8,16 +8,12 @@
  * \ingroup sequencer
  */
 
-#include <cstdlib>
-#include <string>
-
 #include "MEM_guardedalloc.h"
 
 #include "DNA_scene_types.h"
 #include "DNA_sequence_types.h"
 
 #include "BLI_listbase.h"
-#include "BLI_set.hh"
 
 #include "BKE_context.hh"
 
@@ -57,57 +53,17 @@ static void proxy_startjob(void *pjv, wmJobWorkerStatus *worker_status)
   }
 }
 
-/**
- * 戻す口。`FALCON_VSE_PROXY_ENDJOB_KEEP_READERS=0` で切ると、従来どおり
- * プロキシのジョブの終わりに **全ストリップ**の MovieReader を捨てる。
- *
- * 既定（ON）では、そのジョブが実際に焼いたストリップだけを捨てる。
- */
-static bool proxy_endjob_keep_readers_enabled()
-{
-  static const bool enabled = [] {
-    const char *env = getenv("FALCON_VSE_PROXY_ENDJOB_KEEP_READERS");
-    if (env == nullptr || env[0] == '\0') {
-      return true;
-    }
-    return atoi(env) != 0;
-  }();
-  return enabled;
-}
-
 static void proxy_endjob(void *pjv)
 {
   ProxyJob *pj = static_cast<ProxyJob *>(pjv);
   Editing *ed = editing_get(pj->scene);
-
-  /* Collect the media files this job actually (re)built proxies for, before the contexts are
-   * freed below. The key is the file, not the strip: when several strips share one file (a clip
-   * cut in two) only the first of them is queued, but all of them had their readers closed by
-   * #proxy_build_start and must re-open to pick the new proxy up. */
-  Set<std::string> built_paths;
-  const bool queue_was_empty = pj->queue.is_empty();
-  for (ProxyBuildContext *context : pj->queue) {
-    const std::string &source_path = proxy_build_context_source_path(context);
-    if (!source_path.empty()) {
-      built_paths.add(source_path);
-    }
-  }
 
   for (ProxyBuildContext *context : pj->queue) {
     proxy_build_finish(context);
   }
   pj->queue.clear();
 
-  if (!proxy_endjob_keep_readers_enabled()) {
-    /* Original behaviour: drop every movie reader in the scene, even when nothing was built. */
-    relations_free_imbuf(pj->scene, &ed->seqbase, false);
-  }
-  else if (!queue_was_empty) {
-    /* Only the strips reading a file whose proxy changed on disk need to be re-opened. An empty
-     * queue means this job did nothing at all (all proxies were up to date, or no strip had
-     * proxies enabled), so nothing is invalidated. */
-    relations_free_imbuf(pj->scene, &ed->seqbase, false, &built_paths);
-  }
+  relations_free_imbuf(pj->scene, &ed->seqbase, false);
 
   WM_main_add_notifier(NC_SCENE | ND_SEQUENCER, pj->scene);
 }

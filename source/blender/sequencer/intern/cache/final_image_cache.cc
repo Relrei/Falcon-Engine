@@ -100,10 +100,10 @@ ImBuf *final_image_cache_get(Scene *scene,
       return nullptr;
     }
     res = cache->map_.lookup_default(key, nullptr);
-    /* Acquire ownership before eviction or invalidation can release the cache reference. */
-    if (res) {
-      IMB_refImBuf(res);
-    }
+  }
+
+  if (res) {
+    IMB_refImBuf(res);
   }
   return res;
 }
@@ -117,10 +117,6 @@ void final_image_cache_put(Scene *scene,
                            ImBuf *image)
 {
   if (is_render) {
-    return;
-  }
-  /* 空きが柔らかい下限を割っている間は太らせない(既に入っている物は残す)。 */
-  if (cache_should_stop_growing(scene)) {
     return;
   }
 

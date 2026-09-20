@@ -690,8 +690,7 @@ static std::string wm_window_title_text(
     }
   }
 
-  /* バージョン文字列が「Falcon Render v0.3 beta「Blender …」」を含むため "Blender" は前置しない。 */
-  win_title.append(fmt::format(" - {}", BKE_blender_version_string()));
+  win_title.append(fmt::format(" - Blender {}", BKE_blender_version_string()));
 
   return win_title;
 }

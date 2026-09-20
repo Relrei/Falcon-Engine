@@ -98,34 +98,6 @@ class DeviceScene {
   device_vector<uint8_t> image_texture_tile_access_state;
   device_vector<KernelImageUDIM> image_texture_udims;
 
-  /* Falcon SHARC read-only radiance cache (host-filled during warmup). */
-  device_vector<float> falcon_sharc_cache;
-
-  /* Falcon Photon point map (Round 9): raw photon points + append counter
-   * (bake), and the host-built neighbor grid (add-mode lookup). */
-  device_vector<float> falcon_photon_points;
-  device_vector<uint> falcon_photon_pcount;
-  device_vector<uint> falcon_photon_grid_start;
-  device_vector<uint> falcon_photon_grid_count;
-  device_vector<uint> falcon_photon_index;
-
-  /* Falcon DAS per-pixel adaptive-threshold scale map (host-loaded from
-   * FALCON_DAS_MAP, built by the OIDN probe script). */
-  device_vector<float> falcon_das_scale;
-
-  /* Falcon error field: measured relative error per world cell, one float per
-   * SHARC hash slot (negative = the probe never filled that cell). Drives path
-   * termination in shade_surface. */
-  device_vector<float> falcon_error_field;
-
-  /* Falcon knobs the render loop needs but the kernel does not, resolved once in
-   * Integrator::device_update() (scene socket, environment variable wins). Host
-   * side only, so changing them never rebuilds the kernel. Mode values match
-   * FalconSharcMode in scene/integrator.h (0 off, 1 warmup, 2 blend, 3 live). */
-  int falcon_sharc_mode = 0;
-  string falcon_sharc_cache_path = "/tmp/falcon_sharc_cache.bin";
-  float falcon_sharc_keep = 0.9f;
-
   KernelData data;
 
   DeviceScene(Device *device);

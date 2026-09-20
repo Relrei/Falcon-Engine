@@ -437,7 +437,7 @@ static void sequencer_file_drop_channel_frame_set(bContext *C,
 
   float frame_start, channel;
   ui::view2d_region_to_view(&region->v2d, event->mval[0], event->mval[1], &frame_start, &channel);
-  RNA_int_set(op->ptr, "channel", seq::y_to_channel(channel));
+  RNA_int_set(op->ptr, "channel", int(channel));
   RNA_int_set(op->ptr, "frame_start", int(frame_start));
 }
 
@@ -450,43 +450,9 @@ static bool op_invoked_by_drop_event(const wmOperator *op)
   return sad->is_drop_event;
 }
 
-/**
- * 戻す口。`FALCON_VSE_ADD_RESPECT_ARGS=0` で切ると、従来どおり
- * `move_strips` が立っている限り常にマウス追従になる。
- */
-static bool add_respect_args_enabled()
-{
-  static const bool enabled = [] {
-    const char *env = getenv("FALCON_VSE_ADD_RESPECT_ARGS");
-    if (env == nullptr || env[0] == '\0') {
-      return true;
-    }
-    return atoi(env) != 0;
-  }();
-  return enabled;
-}
-
 static bool can_move_strips(const wmOperator *op)
 {
   PropertyRNA *prop = RNA_struct_find_property(op->ptr, "move_strips");
-
-  if (add_respect_args_enabled()) {
-    /* FALCON: background には ghost window が無いので `TRANSFORM_OT_seq_slide` を
-     * InvokeDefault で呼べない (`win->runtime->eventstate` が NULL のまま渡る)。 */
-    if (G.background) {
-      return false;
-    }
-    /* FALCON: EXEC で呼ばれ、かつ置き場が明示されている時だけ、マウス追従をやめる。
-     * ★`OP_IS_INVOKE` で分けるのが要点: 対話経路では
-     * `sequencer_generic_invoke_xy__internal()` が自分で `RNA_int_set` してしまうので、
-     * `is_set` だけで判定すると UI の Add > Movie まで殺してしまう。 */
-    if ((op->flag & OP_IS_INVOKE) == 0 &&
-        (RNA_struct_property_is_set(op->ptr, "channel") ||
-         RNA_struct_property_is_set(op->ptr, "frame_start")))
-    {
-      return false;
-    }
-  }
 
   return prop != nullptr && RNA_property_boolean_get(op->ptr, prop) &&
          (op->flag & OP_IS_REPEAT) == 0 && !op_invoked_by_drop_event(op);
@@ -667,7 +633,7 @@ static bool load_data_init_from_operator(seq::LoadData *load_data, bContext *C, 
         &region->v2d, mouse_region.x, mouse_region.y, &mouse_view.x, &mouse_view.y);
 
     load_data->start_frame = std::trunc(mouse_view.x);
-    load_data->channel = seq::y_to_channel(mouse_view.y);
+    load_data->channel = std::trunc(mouse_view.y);
   }
   return true;
 }

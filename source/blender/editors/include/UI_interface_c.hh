@@ -16,7 +16,6 @@
 
 #include "BLI_compiler_attrs.h"
 #include "BLI_enum_flags.hh"
-#include "BLI_span.hh"
 #include "BLI_string_ref.hh"
 #include "BLI_string_utf8_symbols.h"
 #include "BLI_sys_types.h" /* size_t */
@@ -2168,13 +2167,6 @@ void button_drag_set_rna(Button *but, PointerRNA *ptr);
  * \param path: The path to drag. The passed string may be destructed, button keeps a copy.
  */
 void button_drag_set_path(Button *but, const char *path);
-/**
- * Enable dragging several paths from this button, as if the user had selected them all.
- * \param paths: The paths to drag, must not be empty. The passed strings may be destructed, the
- * button keeps a copy. The first one is what single-path drop targets (#WM_drag_get_single_path(),
- * #WM_drag_get_path_file_type()) see.
- */
-void button_drag_set_path(Button *but, Span<const char *> paths);
 void button_drag_set_name(Button *but, const char *name);
 
 /**
@@ -2182,14 +2174,6 @@ void button_drag_set_name(Button *but, const char *name);
  * \param path: The path to drag. The passed string may be destructed, button keeps a copy.
  */
 void button_drag_set_image(Button *but, const char *path, int icon, const ImBuf *imb, float scale);
-/**
- * Multi-path version of #button_drag_set_image(). Sets #BUT_DRAG_FULL_BUT so the full button can
- * be dragged.
- * \param paths: The paths to drag, must not be empty. The passed strings may be destructed, the
- * button keeps a copy.
- */
-void button_drag_set_image(
-    Button *but, Span<const char *> paths, int icon, const ImBuf *imb, float scale);
 
 /* Panels
  *

@@ -65,13 +65,6 @@ struct SpaceSeq_Runtime : public NonCopyable {
   int rename_channel_index = 0;
   float timeline_clamp_custom_range = 0;
 
-  /**
-   * FALCON: チャンネルの上下反転が入っている時、タイムラインを初めて描く時に
-   * 一度だけ `v2d.cur` を反転後の座標へ読み替えたか。保存済みの `cur` は
-   * 反転前 (チャンネル 1 が Y≈1) のままなので、放っておくとチャンネル 1 が画面外に出る。
-   */
-  bool timeline_view_y_init_done = false;
-
   SeqScopes scopes;
 
   std::shared_ptr<asset::AssetItemTree> assets_for_menu;

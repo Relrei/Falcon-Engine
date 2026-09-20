@@ -21,7 +21,6 @@
 
 #include "DEG_depsgraph_query.hh"
 
-#include "DNA_camera_types.h"
 #include "DNA_lightprobe_types.h"
 #include "DNA_modifier_types.h"
 
@@ -84,15 +83,9 @@ void Instance::init()
     if (rv3d && (rv3d->persp == RV3D_CAMOB)) {
       camera = v3d->camera;
     }
-    /* Panoramic camera need the full film, none of the border resize below apply.
-     * TODO: passepartout crop is unsupported for panoramic camera.
-     * Could reuse the uv_scale/uv_bias remap already used for camera shift (see Camera::sync). */
-    const bool is_panoramic_camera =
-        camera && camera->type == OB_CAMERA &&
-        reinterpret_cast<const blender::Camera *>(camera->data)->type == CAM_PANO;
 
     if (camera) {
-      if (!is_panoramic_camera && (scene->r.mode & R_BORDER)) {
+      if (scene->r.mode & R_BORDER) {
         if (draw_ctx->is_viewport_image_render() || draw_ctx->is_viewport_xr()) {
           rect.xmin = scene->r.border.xmin * size[0];
           rect.ymin = scene->r.border.ymin * size[1];

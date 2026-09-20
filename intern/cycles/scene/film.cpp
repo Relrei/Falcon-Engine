@@ -127,7 +127,6 @@ NODE_DEFINE(Film)
   SOCKET_BOOLEAN(denoising_pass_use_albedo_roughness_weighting,
                  "Denoising Pass Albedo Roughness Weighting",
                  true);
-  SOCKET_BOOLEAN(denoising_pass_psr, "Denoising Pass Primary Surface Replacement", false);
 
   return type;
 }
@@ -208,10 +207,6 @@ void Film::device_update(Device *device, DeviceScene *dscene, Scene *scene)
   kfilm->pass_denoising_roughness = PASS_UNUSED;
   kfilm->pass_denoising_depth = PASS_UNUSED;
   kfilm->pass_denoising_backward_motion = PASS_UNUSED;
-  kfilm->pass_denoising_specular_hit_distance = PASS_UNUSED;
-  /* Distance reported for a specular ray that escaped to the environment. Large
-   * enough to read as "far away" without being infinite, which RR would reject. */
-  kfilm->specular_hit_distance_far = 1e4f;
   kfilm->pass_sample_count = PASS_UNUSED;
   kfilm->pass_render_time = PASS_UNUSED;
   kfilm->pass_adaptive_aux_buffer = PASS_UNUSED;
@@ -399,9 +394,6 @@ void Film::device_update(Device *device, DeviceScene *dscene, Scene *scene)
       case PASS_DENOISING_NORMAL:
         kfilm->pass_denoising_normal = kfilm->pass_stride;
         break;
-      case PASS_DENOISING_SPECULAR_HIT_DISTANCE:
-        kfilm->pass_denoising_specular_hit_distance = kfilm->pass_stride;
-        break;
       case PASS_DENOISING_ROUGHNESS:
         kfilm->pass_denoising_roughness = kfilm->pass_stride;
         break;
@@ -482,9 +474,6 @@ void Film::device_update(Device *device, DeviceScene *dscene, Scene *scene)
   }
   if (denoising_pass_use_albedo_roughness_weighting) {
     kfilm->denoising_pass_options_flag |= DENOISING_PASS_USE_ALBEDO_ROUGHNESS_WEIGHTING;
-  }
-  if (denoising_pass_psr) {
-    kfilm->denoising_pass_options_flag |= DENOISING_PASS_PSR;
   }
 
   clear_modified();
@@ -601,20 +590,6 @@ void Film::update_passes(Scene *scene)
     }
     if (denoiser_passes & DENOISER_PASS_BACKWARD_MOTION) {
       add_auto_pass(scene, PASS_DENOISING_BACKWARD_MOTION);
-    }
-    if (denoiser_passes & DENOISER_PASS_TRANSMISSION) {
-      add_auto_pass(scene, PASS_TRANSMISSION_DIRECT);
-      add_auto_pass(scene, PASS_TRANSMISSION_INDIRECT);
-    }
-    if (denoiser_passes & DENOISER_PASS_SPECULAR_HIT_DISTANCE) {
-      add_auto_pass(scene, PASS_DENOISING_SPECULAR_HIT_DISTANCE);
-    }
-    if (denoiser_passes & DENOISER_PASS_EMISSION) {
-      add_auto_pass(scene, PASS_EMISSION);
-    }
-    if (denoiser_passes & DENOISER_PASS_VOLUME) {
-      add_auto_pass(scene, PASS_VOLUME_DIRECT);
-      add_auto_pass(scene, PASS_VOLUME_INDIRECT);
     }
   }
 

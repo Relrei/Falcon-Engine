@@ -152,13 +152,6 @@ void ED_fileselect_layout_tilepos(const FileLayout *layout, int tile, int *x, in
 
 void ED_operatormacros_file();
 
-/**
- * Falcon: master switch for folding numbered image sequences into a single file browser entry.
- * Returns false when `FALCON_FILE_SEQUENCE_GROUP=0` is set in the environment, in which case the
- * file browser behaves exactly like before (one entry per frame).
- */
-bool ED_fileselect_sequence_grouping_enabled();
-
 void ED_fileselect_clear(wmWindowManager *wm, SpaceFile *sfile);
 void ED_fileselect_clear_main_assets(wmWindowManager *wm, SpaceFile *sfile);
 

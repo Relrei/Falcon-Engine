@@ -10,9 +10,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <string>
-
-#include "BLI_vector.hh"
 
 #include "DNA_space_types.h"
 struct BlendHandle;
@@ -60,7 +57,6 @@ void filelist_setfilter_options(FileList *filelist,
                                 bool filter_assets_only,
                                 bool filter_assets_hide_online,
                                 bool filter_assets_hide_offline,
-                                bool group_sequences,
                                 const char *filter_glob,
                                 const char *filter_search);
 /**
@@ -93,24 +89,6 @@ void filelist_free_icons();
 void filelist_file_get_full_path(const FileList *filelist,
                                  const FileDirEntry *file,
                                  char r_filepath[/*FILE_MAX_LIBEXTRA*/ 1282]);
-/**
- * Falcon: the real file names a (possibly folded) entry stands for.
- *
- * A #FILE_TYPE_IMAGE_SEQUENCE entry is a whole image sequence folded into one item, so it stands
- * for every frame in `seq_first..seq_last`. This returns one name per frame, in frame order. Any
- * other entry stands for itself and yields #FileDirEntry::relpath alone.
- *
- * Names are relative to the file list root, exactly like #FileDirEntry::relpath, so
- * #filelist_dir() (or the directory part of #filelist_file_get_full_path()) turns them into full
- * paths.
- */
-Vector<std::string> filelist_file_expand_names(const FileDirEntry *file);
-/**
- * Falcon: #filelist_file_expand_names() as full paths, i.e. what the file browser hands out when
- * it has to name real files on disk (drag & drop). Never empty.
- */
-Vector<std::string> filelist_file_expand_full_paths(const FileList *filelist,
-                                                    const FileDirEntry *file);
 bool filelist_file_is_preview_pending(const FileList *filelist, const FileDirEntry *file);
 void filelist_online_asset_preview_request(const bContext *C, FileDirEntry *entry);
 ImBuf *filelist_file_get_preview_image(const FileDirEntry *file);

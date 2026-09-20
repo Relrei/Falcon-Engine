@@ -62,12 +62,6 @@ struct ProxyBuildContext {
   Main *bmain = nullptr;
   Scene *scene = nullptr;
   Strip *strip = nullptr;
-
-  /**
-   * Absolute path of the media file the strip this context was created from reads (`strip` above
-   * is a duplicate of it). Empty for non-movie strips.
-   */
-  std::string source_path;
 };
 
 IMB_Proxy_Size rendersize_to_proxysize(eSpaceSeq_Proxy_RenderSize render_size)
@@ -429,9 +423,6 @@ bool proxy_build_start(Main *bmain,
     context->bmain = bmain;
     context->scene = scene;
     context->strip = strip_new;
-    if (strip->type == STRIP_TYPE_MOVIE) {
-      context->source_path = strip_movie_source_path_get(scene, strip);
-    }
 
     context->view_id = i; /* only for images */
 
@@ -692,11 +683,6 @@ void proxy_build_finish(ProxyBuildContext *context)
   seq_free_strip_recurse(nullptr, context->strip, true);
 
   MEM_delete(context);
-}
-
-const std::string &proxy_build_context_source_path(const ProxyBuildContext *context)
-{
-  return context->source_path;
 }
 
 void proxy_set(Strip *strip, bool value)

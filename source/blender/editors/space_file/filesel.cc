@@ -32,7 +32,6 @@
 #include "MEM_guardedalloc.h"
 
 #include "BLI_fileops.h"
-#include "BLI_listbase_iterator.hh"
 #include "BLI_fnmatch.h"
 #include "BLI_math_base.h"
 #include "BLI_path_utils.hh"
@@ -99,60 +98,6 @@ static void fileselect_initialize_params_common(SpaceFile *sfile, FileSelectPara
   /* Switching thumbnails needs to recalc layout #28809. */
   if (sfile->layout) {
     sfile->layout->dirty = true;
-  }
-}
-
-bool ED_fileselect_sequence_grouping_enabled()
-{
-  /* Read once: the environment cannot change while Blender runs, and this is called per redraw. */
-  static const bool enabled = []() {
-    const char *env = BLI_getenv("FALCON_FILE_SEQUENCE_GROUP");
-    return !(env && STREQ(env, "0"));
-  }();
-  return enabled;
-}
-
-/**
- * Falcon: whether the file browser opened by \a op should fold numbered image sequences by
- * default. Only the Video Sequencer wants this; opening an image as a texture or in the Image
- * Editor must keep showing one entry per file.
- */
-static bool fileselect_sequence_grouping_default(const wmOperator *op)
-{
-  if (!ED_fileselect_sequence_grouping_enabled()) {
-    return false;
-  }
-  if (op == nullptr || op->type == nullptr) {
-    return false;
-  }
-  return STRPREFIX(op->type->idname, "SEQUENCER_OT_");
-}
-
-void fileselect_ensure_sequence_grouping_default(const bScreen *screen, SpaceFile *sfile)
-{
-  if (sfile == nullptr || sfile->op != nullptr) {
-    /* A browser opened by an operator keeps the operator based default, see
-     * #fileselect_sequence_grouping_default(). Its (temporary) screen has no sequencer anyway. */
-    return;
-  }
-  FileSelectParams *params = sfile->params;
-  if (params == nullptr || sfile->runtime == nullptr ||
-      sfile->runtime->sequence_grouping_default_done)
-  {
-    return;
-  }
-  sfile->runtime->sequence_grouping_default_done = true;
-
-  if (!ED_fileselect_sequence_grouping_enabled() || screen == nullptr) {
-    return;
-  }
-  /* An embedded browser that shares its screen with a Video Sequencer (the "Video Editing"
-   * workspace) is there to bring footage in, so fold numbered image sequences by default. */
-  for (const ScrArea &area : screen->areabase) {
-    if (area.spacetype == SPACE_SEQ) {
-      params->group_sequences = 1;
-      break;
-    }
   }
 }
 
@@ -277,7 +222,6 @@ static FileSelectParams *fileselect_ensure_updated_file_params(SpaceFile *sfile)
     }
 
     params->flag = eFileSel_Params_Flag{};
-    params->group_sequences = fileselect_sequence_grouping_default(op) ? 1 : 0;
     if (is_directory == true && is_filename == false && is_filepath == false && is_files == false)
     {
       params->flag |= FILE_DIRSEL_ONLY;
@@ -1583,12 +1527,12 @@ void ED_fileselect_ensure_default_filepath(bContext *C, wmOperator *op, const ch
 Vector<std::string> ED_fileselect_selected_files_full_paths(const SpaceFile *sfile)
 {
   Vector<std::string> paths;
+  char path[FILE_MAX_LIBEXTRA];
   for (const int i : IndexRange(filelist_files_ensure(sfile->files))) {
     if (filelist_entry_is_selected(sfile->files, i)) {
-      /* Falcon: a folded image sequence stands for all of its frames, so hand out every one of
-       * them (same enumeration as #file_ops.cc and #file_draw.cc). */
       const FileDirEntry *entry = filelist_file(sfile->files, i);
-      paths.extend(filelist_file_expand_full_paths(sfile->files, entry));
+      filelist_file_get_full_path(sfile->files, entry, path);
+      paths.append(path);
     }
   }
   return paths;

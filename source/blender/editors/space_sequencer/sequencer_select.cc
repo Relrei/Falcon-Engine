@@ -99,7 +99,7 @@ Strip *strip_under_mouse_get(const Scene *scene, const View2D *v2d, const int mv
   ui::view2d_region_to_view(v2d, mval[0], mval[1], &mouse_co[0], &mouse_co[1]);
 
   Vector<Strip *> visible = sequencer_visible_strips_get(scene, v2d);
-  int mouse_channel = seq::y_to_channel(mouse_co[1]);
+  int mouse_channel = int(mouse_co[1]);
   for (Strip *strip : visible) {
     if (strip->channel != mouse_channel) {
       continue;
@@ -117,11 +117,6 @@ VectorSet<Strip *> all_strips_from_context(bContext *C)
 {
   Scene *scene = CTX_data_sequencer_scene(C);
   Editing *ed = seq::editing_get(scene);
-  if (ed == nullptr) {
-    /* The scene has no sequence editor yet (for example a freshly created scene that a file is
-     * being dropped into). There are no strips, and `seqbase`/`channels` would be null. */
-    return {};
-  }
   ListBaseT<Strip> *seqbase = seq::active_seqbase_get(ed);
   ListBaseT<SeqTimelineChannel> *channels = seq::channels_displayed_get(ed);
 
@@ -302,8 +297,8 @@ rctf strip_bounds_get(const Scene *scene, const Strip *strip)
   rctf bounds;
   bounds.xmin = strip->left_handle();
   bounds.xmax = strip->right_handle(scene);
-  bounds.ymin = seq::channel_to_y(strip->channel) + STRIP_OFSBOTTOM;
-  bounds.ymax = seq::channel_to_y(strip->channel) + STRIP_OFSTOP;
+  bounds.ymin = strip->channel + STRIP_OFSBOTTOM;
+  bounds.ymax = strip->channel + STRIP_OFSTOP;
   return bounds;
 }
 
@@ -1057,7 +1052,7 @@ static Vector<Strip *> padded_strips_under_mouse_get(const Scene *scene,
 
   Vector<Strip *> strips;
   for (Strip &strip : *ed->current_strips()) {
-    if (strip.channel != seq::y_to_channel(mouse_co[1])) {
+    if (strip.channel != int(mouse_co[1])) {
       continue;
     }
     if (strip.left_handle() > v2d->cur.xmax) {

@@ -96,10 +96,10 @@ void BKE_blender_free()
 /** \name Blender Version Access
  * \{ */
 
-static char blender_version_string[96] = "";
+static char blender_version_string[48] = "";
 
 /* Only includes patch if non-zero. */
-static char blender_version_string_compact[96] = "";
+static char blender_version_string_compact[48] = "";
 
 static void blender_version_init()
 {
@@ -127,50 +127,20 @@ static void blender_version_init()
 
   const char *version_suffix = BKE_blender_version_is_lts() ? " LTS" : "";
 
-  /* ---------------------------------------------------------------------------
-   * Falcon Render の表示名 (2026-08-25 作者指示)
-   *
-   * ★「() を消す日」は、すぐ下の kFalconBaseSuffix を "" にするだけでよい。
-   *   他の行は1行も触らなくてよい。画面に出る3箇所(スプラッシュ・タイトルバー・
-   *   `--version`)と bpy.app.version_string は、すべてこの文字列を読んでいる。
-   *
-   *   例:  const char *kFalconBaseSuffix = "";   →  画面は「Falcon Render」
-   *
-   * 括弧の中身は「土台にした Blender の版」。表示から消しても、土台の版は
-   * 内部データ側に残るので後から確認できる(2026-08-25 に実測で確認済み):
-   *   - .blend ヘッダの整数        : "BLENDER17-01v0502" の末尾 0502 = 5.2
-   *   - bpy.app.version            : (5, 2, 0)
-   *   - bpy.app.version_file       : .blend に書く版(整数タプル)
-   * この表示文字列自体は .blend には1バイトも入らない(strings で0件を確認済み)。
-   *
-   * ⚠ ここは文字列リテラルで、BLENDER_VERSION からは自動生成していない。
-   *   土台の Blender を別の版へ上げた時は、この1行も合わせて書き換えること。
-   * --------------------------------------------------------------------------- */
-  /* ★2026-09-01 作者指示: 画面に出る名前は**2つだけ**。
-   *
-   *   「Falcon Render」       = リアルタイムで進む最新。**版を名乗らない**
-   *   「Falcon Render v0.4」  = 切り離しなどを行って配布向けに調整したもの
-   *
-   * ★分ける鍵は FALCON_DIST(配布向けに切り出したか)であって、
-   *   FALCON_BUILD_FLAVOR(GPU の実験機能を入れるか)ではない。
-   *   2026-08-29〜08-31 は flavor が「配布用」と「GPU実験を外す」を兼ねていたため、
-   *   **配布物でない正本まで v0.4 を名乗っていた**。それを直した。
-   *
-   * 配布の版を上げる時は、下の1行だけ書き換える。ここ以外に文言を増やさないこと。
-   * 土台の Blender の版は表示に出さない(.desktop と README に書く)。 */
-#ifdef FALCON_DIST_BUILD
-  const char *kFalconName = "Falcon Render v0.4.1";
-#else
-  const char *kFalconName = "Falcon Render";
-#endif
+  SNPRINTF_UTF8(blender_version_string,
+                "%d.%01d.%d%s%s",
+                BLENDER_VERSION / 100,
+                BLENDER_VERSION % 100,
+                BLENDER_VERSION_PATCH,
+                version_suffix,
+                version_cycle);
 
-  SNPRINTF_UTF8(blender_version_string, "%s", kFalconName);
-
-  SNPRINTF_UTF8(blender_version_string_compact, "%s", kFalconName);
-
-  /* 表示から版数を外したので、これらは現在どこにも出ない。
-   * 上の cycle 判定(不正な値の BLI_assert)は残したいので、変数だけ黙らせる。 */
-  UNUSED_VARS(version_cycle, version_cycle_compact, version_suffix);
+  SNPRINTF_UTF8(blender_version_string_compact,
+                "%d.%01d.%d%s",
+                BLENDER_VERSION / 100,
+                BLENDER_VERSION % 100,
+                BLENDER_VERSION_PATCH,
+                version_cycle_compact);
 }
 
 const char *BKE_blender_version_string()

@@ -21,7 +21,6 @@ namespace blender {
 struct ARegion;
 struct ARegionType;
 struct bContextDataResult;
-struct bScreen;
 struct FileAssetSelectParams;
 struct FileSelectParams;
 struct FolderList;
@@ -145,14 +144,6 @@ extern "C" const char *file_context_dir[]; /* doc access */
 
 void fileselect_refresh_params(SpaceFile *sfile);
 /**
- * Falcon: pick the default for #FileSelectParams.group_sequences of a browser that was *not*
- * opened by an operator (an embedded file browser, e.g. the one in the "Video Editing"
- * workspace). Such a browser is used to bring footage in when it sits next to a Video Sequencer,
- * so numbered image sequences are folded there by default. Runs once per browser, so the
- * "Group Image Sequences" filter toggle keeps whatever the user set.
- */
-void fileselect_ensure_sequence_grouping_default(const bScreen *screen, SpaceFile *sfile);
-/**
  * Sets #FileSelectParams.file (name of selected file)
  */
 void fileselect_file_set(bContext *C, SpaceFile *sfile, int index);
@@ -225,12 +216,6 @@ struct SpaceFile_Runtime {
   ReportList is_blendfile_readable_reports;
 
   BannersState banners_state;
-
-  /* Falcon: set once #fileselect_ensure_sequence_grouping_default() ran for this browser, so the
-   * default is only a default: the "Group Image Sequences" toggle is not overruled afterwards.
-   * Runtime data, so the default is evaluated again after a file read or when an area is created.
-   */
-  bool sequence_grouping_default_done;
 };
 
 /**

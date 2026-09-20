@@ -1676,14 +1676,9 @@ void file_sfile_to_operator_ex(
           FileDirEntry *file = filelist_file(sfile->files, i);
           /* Cannot (currently) mix regular items and alias/shortcuts in multiple selection. */
           if (!file->redirection_path) {
-            /* Falcon: a folded image sequence stands for every one of its frames. Hand the
-             * operator the real files so that e.g. `SEQUENCER_OT_image_strip_add` builds a
-             * single strip out of them, exactly as if the user had selected them all. */
-            for (const std::string &name : filelist_file_expand_names(file)) {
-              RNA_property_collection_add(op->ptr, prop, &itemptr);
-              RNA_string_set(&itemptr, "name", name.c_str());
-              num_files++;
-            }
+            RNA_property_collection_add(op->ptr, prop, &itemptr);
+            RNA_string_set(&itemptr, "name", file->relpath);
+            num_files++;
           }
         }
       }

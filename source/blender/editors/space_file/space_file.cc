@@ -213,9 +213,6 @@ static void file_refresh(const bContext *C, ScrArea *area)
   FSMenu *fsmenu = ED_fsmenu_get();
 
   fileselect_refresh_params(sfile);
-  /* Falcon: embedded browsers (no operator) fold numbered image sequences when their screen also
-   * holds a Video Sequencer. Done here because this is the first place with a screen at hand. */
-  fileselect_ensure_sequence_grouping_default(CTX_wm_screen(C), sfile);
   folder_history_list_ensure_for_active_browse_mode(sfile);
 
   if (sfile->runtime != nullptr) {
@@ -262,8 +259,6 @@ static void file_refresh(const bContext *C, ScrArea *area)
       (params->flag & FILE_ASSETS_ONLY) != 0,
       /*filter_assets_hide_online=*/!show_assets_online,
       /*filter_assets_hide_offline=*/!show_assets_offline,
-      /*group_sequences=*/(params->group_sequences != 0) &&
-          ED_fileselect_sequence_grouping_enabled(),
       params->filter_glob,
       params->filter_search);
   if (asset_params) {

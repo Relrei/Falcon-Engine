@@ -22,10 +22,6 @@
 #include "node_shader_util.hh"
 #include "node_util.hh"
 
-#ifdef WITH_MATERIALX
-#  include "materialx/node_ramp_blend.h"
-#endif
-
 #include "FN_multi_function_builder.hh"
 
 #include "NOD_multi_function.hh"
@@ -660,15 +656,13 @@ NODE_SHADER_MATERIALX_BEGIN
   if (data->clamp_factor) {
     factor = factor.clamp();
   }
-  NodeItem res = empty();
+  NodeItem res = factor.mix(value1, value2);
   if (data->data_type == SOCK_RGBA) {
-    res = materialx::ramp_blend(data->blend_type, value1, value2, factor);
+    /* TODO: Apply data->blend_type */
+
     if (data->clamp_result) {
       res = res.clamp();
     }
-  }
-  else {
-    res = factor.mix(value1, value2);
   }
   return res;
 }

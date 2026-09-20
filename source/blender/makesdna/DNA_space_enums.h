@@ -687,13 +687,6 @@ enum eFileSel_File_Types : int {
   FILE_TYPE_OBJECT_IO = (1 << 17),
   FILE_TYPE_USD = (1 << 18),
   FILE_TYPE_VOLUME = (1 << 19),
-  /**
-   * Falcon: a *virtual* entry standing for a whole numbered image sequence
-   * (`name0001.png` ... `name1351.png`), folded into a single item by the file browser.
-   * Always set together with #FILE_TYPE_IMAGE; #FileDirEntry::relpath still points at the
-   * first real frame on disk.
-   */
-  FILE_TYPE_IMAGE_SEQUENCE = (1 << 20),
 
   FILE_TYPE_ASSET = (1 << 28),
   /** Set together with #FILE_TYPE_ASSET when the asset is hosted online, not on disk. */

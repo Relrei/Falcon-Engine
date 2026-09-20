@@ -37,15 +37,7 @@ NODE_SHADER_MATERIALX_BEGIN
 #ifdef WITH_MATERIALX
 {
   NodeItem color = get_input_value("Color", NodeItem::Type::Color3);
-  /* ★`ND_luminance_color3` の lumacoeffs の既定は **ACEScg**
-   *   (0.2722, 0.6741, 0.0537)で、Blender の係数(既定は Rec.709)ではない。
-   *   渡さないと GPU/Cycles と 10〜20% ずれる(2026-09-05・door-mat)。 */
-  float c[3];
-  IMB_colormanagement_get_luminance_coefficients(c);
-  return create_node(
-      "luminance",
-      NodeItem::Type::Color3,
-      {{"in", color}, {"lumacoeffs", val(MaterialX::Color3(c[0], c[1], c[2]))}});
+  return create_node("luminance", NodeItem::Type::Color3, {{"in", color}});
 }
 #endif
 NODE_SHADER_MATERIALX_END

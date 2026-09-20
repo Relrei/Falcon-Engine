@@ -191,7 +191,6 @@ class FILEBROWSER_PT_filter(FileBrowserPanel, Panel):
 
                 col.separator()
 
-        layout.prop(params, "use_group_sequences", text="Group Image Sequences")
         layout.prop(params, "show_hidden")
 
 

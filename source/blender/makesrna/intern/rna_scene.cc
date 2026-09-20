@@ -757,7 +757,6 @@ static const EnumPropertyItem eevee_resolution_scale_items[] = {
 #  include "BKE_idprop.hh"
 #  include "BKE_image.hh"
 #  include "BKE_image_format.hh"
-#  include "BKE_falcon_export_info.hh"
 #  include "BKE_layer.hh"
 #  include "BKE_lib_id.hh"
 #  include "BKE_main.hh"
@@ -1312,25 +1311,6 @@ static void rna_RenderSettings_stereoViews_begin(CollectionPropertyIterator *ite
 static std::optional<std::string> rna_RenderSettings_path(const PointerRNA * /*ptr*/)
 {
   return "render";
-}
-
-/* ★直近の書き出しで何が効いたか(切っただけの経路 / 符号化器 / 秒)。
- * 決めているのは `render/` と `imbuf/movie/` で、ここは読むだけ。保存しない。 */
-static std::string rna_RenderSettings_falcon_export_info_string(const PointerRNA *ptr)
-{
-  const Scene *scene = reinterpret_cast<const Scene *>(ptr->owner_id);
-  return blender::bke::falcon_export_info_get(scene);
-}
-
-static void rna_RenderSettings_falcon_last_export_info_get(PointerRNA *ptr, char *value)
-{
-  const std::string info = rna_RenderSettings_falcon_export_info_string(ptr);
-  memcpy(value, info.c_str(), info.size() + 1);
-}
-
-static int rna_RenderSettings_falcon_last_export_info_length(PointerRNA *ptr)
-{
-  return int(rna_RenderSettings_falcon_export_info_string(ptr).size());
 }
 
 static std::optional<std::string> rna_BakeSettings_path(const PointerRNA * /*ptr*/)
@@ -6912,15 +6892,6 @@ static void rna_def_scene_ffmpeg_settings(BlenderRNA *brna)
   RNA_def_property_ui_text(prop, "Lossless Output", "Use lossless output for video streams");
   RNA_def_property_update(prop, NC_SCENE | ND_RENDER_OPTIONS, nullptr);
 
-  prop = RNA_def_property(srna, "use_hardware_encoder", PROP_BOOLEAN, PROP_NONE);
-  RNA_def_property_boolean_negative_sdna(prop, nullptr, "flags", FFMPEG_NO_HARDWARE_ENCODER);
-  RNA_def_property_ui_text(prop,
-                           "GPU Encoding",
-                           "Encode H.264 and HEVC on the GPU (NVIDIA NVENC). Much faster than the "
-                           "CPU encoder; falls back to the CPU when no supported GPU is present");
-  RNA_def_property_update(prop, NC_SCENE | ND_RENDER_OPTIONS, nullptr);
-
-
   /* FFMPEG Audio. */
   prop = RNA_def_property(srna, "audio_codec", PROP_ENUM, PROP_NONE);
   RNA_def_property_enum_bitflag_sdna(prop, nullptr, "audio_codec");
@@ -7873,17 +7844,6 @@ static void rna_def_scene_render_data(BlenderRNA *brna)
                            "The quality used by denoise nodes during the compositing of final "
                            "renders if the nodes' quality option is set to Follow Scene");
   RNA_def_property_update(prop, NC_NODE | ND_DISPLAY, "rna_Scene_compositor_update");
-
-  prop = RNA_def_property(srna, "falcon_last_export_info", PROP_STRING, PROP_NONE);
-  RNA_def_property_string_funcs(prop,
-                                "rna_RenderSettings_falcon_last_export_info_get",
-                                "rna_RenderSettings_falcon_last_export_info_length",
-                                nullptr);
-  RNA_def_property_clear_flag(prop, PROP_EDITABLE | PROP_ANIMATABLE);
-  RNA_def_property_ui_text(prop,
-                           "Last Export Info",
-                           "What the last animation export actually did: whether the cut-only "
-                           "fast path was used, which encoder ran, and how long it took");
 
   /* Nestled Data. */
   /* *** Non-Animated *** */

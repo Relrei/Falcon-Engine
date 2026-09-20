@@ -217,13 +217,8 @@ static float update_overlay_strip_position_data(bContext *C, const int mval[2])
     int snap_delta;
     float2 snap_point;
 
-    const bool valid_snap = transform::snap_sequencer_calc_drag_drop(scene,
-                                                                      region,
-                                                                      start_frame,
-                                                                      end_frame,
-                                                                      seq::y_to_channel(channel),
-                                                                      &snap_delta,
-                                                                      &snap_point);
+    const bool valid_snap = transform::snap_sequencer_calc_drag_drop(
+        scene, region, start_frame, end_frame, channel, &snap_delta, &snap_point);
 
     if (valid_snap) {
       /* We snapped onto something! */
@@ -241,7 +236,7 @@ static float update_overlay_strip_position_data(bContext *C, const int mval[2])
   /* Check if there is a strip that would intersect with the new strip(s). */
   coords->is_intersecting = false;
   Strip dummy_strip{};
-  seq::strip_channel_set(&dummy_strip, seq::y_to_channel(coords->channel));
+  seq::strip_channel_set(&dummy_strip, coords->channel);
   dummy_strip.start = coords->start_frame;
   dummy_strip.len = coords->strip_length;
   dummy_strip.speed_factor = 1.0f;
@@ -426,10 +421,9 @@ static void draw_strip_in_view(bContext *C, wmWindow * /*win*/, wmDrag *drag, co
 
   StripsDrawBatch batch(&region->v2d);
 
-  const int base_channel = seq::y_to_channel(coords->channel);
   for (int i = 0; i < coords->num_channels; i++) {
-    float y1 = seq::channel_to_y(base_channel + i) + STRIP_OFSBOTTOM;
-    float y2 = seq::channel_to_y(base_channel + i) + STRIP_OFSTOP;
+    float y1 = floorf(coords->channel) + i + STRIP_OFSBOTTOM;
+    float y2 = floorf(coords->channel) + i + STRIP_OFSTOP;
 
     /* Audio strips sit at the bottom, video strips sit above them. */
     if (i < coords->num_audio) {
@@ -725,11 +719,13 @@ static void sequencer_dropboxes_add_to_lb(ListBaseT<wmDropBox> *lb)
   drop->on_exit = sequencer_drop_on_exit;
 }
 
-static bool image_drop_preview_poll(bContext * /*C*/, wmDrag *drag, const wmEvent * /*event*/)
+static bool image_drop_preview_poll(bContext *C, wmDrag *drag, const wmEvent * /*event*/)
 {
   if (drag->type == WM_DRAG_PATH) {
     const eFileSel_File_Types file_type = eFileSel_File_Types(WM_drag_get_path_file_type(drag));
-    if (file_type == FILE_TYPE_IMAGE) {
+    if (file_type == FILE_TYPE_IMAGE &&
+        test_single_file_handler_poll(C, drag, "SEQUENCER_FH_image_strip"))
+    {
       return true;
     }
   }
@@ -737,11 +733,13 @@ static bool image_drop_preview_poll(bContext * /*C*/, wmDrag *drag, const wmEven
   return WM_drag_is_ID_type(drag, ID_IM);
 }
 
-static bool movie_drop_preview_poll(bContext * /*C*/, wmDrag *drag, const wmEvent * /*event*/)
+static bool movie_drop_preview_poll(bContext *C, wmDrag *drag, const wmEvent * /*event*/)
 {
   if (drag->type == WM_DRAG_PATH) {
     const eFileSel_File_Types file_type = eFileSel_File_Types(WM_drag_get_path_file_type(drag));
-    if (file_type == FILE_TYPE_MOVIE) {
+    if (file_type == FILE_TYPE_MOVIE &&
+        test_single_file_handler_poll(C, drag, "SEQUENCER_FH_movie_strip"))
+    {
       return true;
     }
   }
@@ -749,11 +747,13 @@ static bool movie_drop_preview_poll(bContext * /*C*/, wmDrag *drag, const wmEven
   return WM_drag_is_ID_type(drag, ID_MC);
 }
 
-static bool sound_drop_preview_poll(bContext * /*C*/, wmDrag *drag, const wmEvent * /*event*/)
+static bool sound_drop_preview_poll(bContext *C, wmDrag *drag, const wmEvent * /*event*/)
 {
   if (drag->type == WM_DRAG_PATH) {
     const eFileSel_File_Types file_type = eFileSel_File_Types(WM_drag_get_path_file_type(drag));
-    if (file_type == FILE_TYPE_SOUND) {
+    if (file_type == FILE_TYPE_SOUND &&
+        test_single_file_handler_poll(C, drag, "SEQUENCER_FH_sound_strip"))
+    {
       return true;
     }
   }

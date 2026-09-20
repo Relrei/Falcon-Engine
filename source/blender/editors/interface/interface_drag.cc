@@ -62,20 +62,14 @@ void button_drag_set_rna(Button *but, PointerRNA *ptr)
   but->dragpoin = static_cast<void *>(ptr);
 }
 
-void button_drag_set_path(Button *but, Span<const char *> paths)
+void button_drag_set_path(Button *but, const char *path)
 {
-  BLI_assert(!paths.is_empty());
   but->dragtype = WM_DRAG_PATH;
   if (but->dragflag & BUT_DRAGPOIN_FREE) {
     WM_drag_data_free(but->dragtype, but->dragpoin);
   }
-  but->dragpoin = WM_drag_create_path_data(paths);
+  but->dragpoin = WM_drag_create_path_data(Span(&path, 1));
   but->dragflag |= BUT_DRAGPOIN_FREE;
-}
-
-void button_drag_set_path(Button *but, const char *path)
-{
-  button_drag_set_path(but, Span(&path, 1));
 }
 
 void button_drag_set_name(Button *but, const char *name)
@@ -88,17 +82,11 @@ void button_drag_set_name(Button *but, const char *name)
   but->dragpoin = (void *)name;
 }
 
-void button_drag_set_image(
-    Button *but, Span<const char *> paths, int icon, const ImBuf *imb, float scale)
-{
-  def_but_icon(but, icon, 0); /* no flag UI_HAS_ICON, so icon doesn't draw in button */
-  button_drag_set_path(but, paths);
-  button_drag_attach_image(but, imb, scale);
-}
-
 void button_drag_set_image(Button *but, const char *path, int icon, const ImBuf *imb, float scale)
 {
-  button_drag_set_image(but, Span(&path, 1), icon, imb, scale);
+  def_but_icon(but, icon, 0); /* no flag UI_HAS_ICON, so icon doesn't draw in button */
+  button_drag_set_path(but, path);
+  button_drag_attach_image(but, imb, scale);
 }
 
 void button_drag_free(Button *but)

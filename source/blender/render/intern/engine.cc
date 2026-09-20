@@ -14,9 +14,7 @@
 
 #include "BLI_listbase.h"
 #include "BLI_math_bits.h"
-#include "BLI_path_utils.hh"
 #include "BLI_string.h"
-#include "BLI_time.h"
 #include "BLI_utildefines.h"
 
 #include "DNA_layer_types.h"
@@ -167,43 +165,10 @@ static void engine_depsgraph_free(RenderEngine *engine)
   }
 }
 
-#ifdef WITH_PYTHON
-/**
- * Falcon: is the engine's Python object allowed to be torn down here?
- *
- * `BPY_DECREF_RNA_INVALIDATE()` only drops one reference. Blender's own RNA layer
- * keeps a cached `PyObject` in `engine->py_instance` and hands it out with an
- * extra `Py_INCREF` (`bpy_rna.cc`), so the refcount is usually still above zero
- * afterwards: the object survives with an invalidated RNA pointer and `__del__`
- * does not run. For Cycles that means `engine.free()` is never reached and the
- * whole session -- 1.5-2.8 GiB of device memory for a 1080p frame -- stays alive
- * until the next file is loaded.
- *
- * Running `__del__` here instead is on time by definition: `RE_engine_free()` is
- * only called when the engine is being destroyed. Persistent Data does not go
- * through here at all (`RE_engine_render()` keeps the engine), so that path is
- * untouched. `FALCON_KEEP_SESSION=1` restores the old behaviour.
- */
-static bool falcon_free_engine_python_enabled()
-{
-  static const bool enabled = []() {
-    const char *env = BLI_getenv("FALCON_KEEP_SESSION");
-    /* On unless keeping the session is asked for explicitly. */
-    return env == nullptr || STREQ(env, "0");
-  }();
-  return enabled;
-}
-#endif
-
 void RE_engine_free(RenderEngine *engine)
 {
 #ifdef WITH_PYTHON
   if (engine->py_instance) {
-    if (falcon_free_engine_python_enabled()) {
-      /* Drop the engine's own resources (the Cycles session) while the RNA is
-       * still valid. Calling it again later from a real `__del__` is a no-op. */
-      BPY_call_method_no_args(engine->py_instance, "__del__");
-    }
     BPY_DECREF_RNA_INVALIDATE(engine->py_instance);
   }
 #endif
@@ -1477,55 +1442,6 @@ void RE_engine_gpu_context_unlock(RenderEngine *engine)
       BLI_mutex_unlock(&engine->blender_gpu_context_mutex);
     }
   }
-}
-
-/** \} */
-
-/* -------------------------------------------------------------------- */
-/** \name Falcon: viewport render engine eviction
- *
- * See the comment on `RE_falcon_evict_viewport_enabled()` in `RE_engine.h`.
- * All state here is main thread only: it is written by the render operator and
- * read by the external draw engine, both of which run on the main thread.
- * \{ */
-
-static bool falcon_evict_viewport_active = false;
-static double falcon_evict_viewport_finish_time = 0.0;
-
-bool RE_falcon_evict_viewport_enabled()
-{
-  static const bool enabled = []() {
-    const char *env = BLI_getenv("FALCON_CYCLES_EVICT_VIEWPORT");
-    /* On unless it is switched off explicitly. */
-    return env == nullptr || !STREQ(env, "0");
-  }();
-  return enabled;
-}
-
-bool RE_falcon_evict_viewport_is_active()
-{
-  return falcon_evict_viewport_active;
-}
-
-void RE_falcon_evict_viewport_set_active(const bool active)
-{
-  if (active == falcon_evict_viewport_active) {
-    /* Nothing was evicted for this render, so there is no rebuild to time. */
-    return;
-  }
-  falcon_evict_viewport_active = active;
-  /* Start the stopwatch for the rebuild when the render lets the viewports go. */
-  falcon_evict_viewport_finish_time = active ? 0.0 : BLI_time_now_seconds();
-}
-
-double RE_falcon_evict_viewport_take_rebuild_time()
-{
-  if (falcon_evict_viewport_finish_time == 0.0) {
-    return -1.0;
-  }
-  const double elapsed = BLI_time_now_seconds() - falcon_evict_viewport_finish_time;
-  falcon_evict_viewport_finish_time = 0.0;
-  return elapsed;
 }
 
 /** \} */

@@ -60,11 +60,6 @@ KERNEL_STRUCT_MEMBER(path, float, min_ray_pdf, KERNEL_FEATURE_PATH_TRACING)
 KERNEL_STRUCT_MEMBER(path, float, continuation_probability, KERNEL_FEATURE_PATH_TRACING)
 /* Throughput. */
 KERNEL_STRUCT_MEMBER(path, PackedSpectrum, throughput, KERNEL_FEATURE_PATH_TRACING)
-#ifdef __FALCON_SHARC__
-/* Falcon Dispersion: wavelength (nm) assigned at the path's first smooth
- * refractive scatter; 0 = unassigned. Reused by later dispersive hits. */
-KERNEL_STRUCT_MEMBER(path, float, dispersion_lambda, KERNEL_FEATURE_PATH_TRACING)
-#endif
 /* Factor to multiple with throughput to get remove any guiding PDFS.
  * Such throughput without guiding PDFS is used for Russian roulette termination. */
 KERNEL_STRUCT_MEMBER(path, float, unguided_throughput, KERNEL_FEATURE_PATH_GUIDING)
@@ -73,9 +68,6 @@ KERNEL_STRUCT_MEMBER(path, PackedSpectrum, pass_diffuse_weight, KERNEL_FEATURE_L
 KERNEL_STRUCT_MEMBER(path, PackedSpectrum, pass_glossy_weight, KERNEL_FEATURE_LIGHT_PASSES)
 /* Denoising. */
 KERNEL_STRUCT_MEMBER(path, PackedSpectrum, denoising_feature_throughput, KERNEL_FEATURE_DENOISING)
-/* Plane of the delta mirror the camera ray hit, for primary surface replacement. */
-KERNEL_STRUCT_MEMBER(path, packed_float3, psr_mirror_n, KERNEL_FEATURE_DENOISING)
-KERNEL_STRUCT_MEMBER(path, float, psr_mirror_d, KERNEL_FEATURE_DENOISING)
 /* Shader sorting. */
 /* TODO: compress as uint16? or leave out entirely and recompute key in sorting code? */
 KERNEL_STRUCT_MEMBER(path, uint32_t, shader_sort_key, KERNEL_FEATURE_PATH_TRACING)

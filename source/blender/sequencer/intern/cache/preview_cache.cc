@@ -148,10 +148,6 @@ static PreviewCacheItem *find_slot(PreviewCache *cache,
     }
   }
 
-  /* A slot is keyed as a unit: neither texture may survive a change of frame/view/size. */
-  if (best_slot != nullptr) {
-    best_slot->clear();
-  }
   return best_slot;
 }
 

@@ -73,17 +73,10 @@ NODE_SHADER_MATERIALX_BEGIN
   }
 
   NodeItem color = get_input_value("Color", NodeItem::Type::Color3);
-  NodeItem roughness = get_input_value("Roughness", NodeItem::Type::Float);
-  NodeItem anisotropy = get_input_value("Anisotropy", NodeItem::Type::Float);
+  NodeItem roughness = get_input_value("Roughness", NodeItem::Type::Vector2);
+  NodeItem anisotropy = get_input_value("Anisotropy", NodeItem::Type::Color3);
   NodeItem normal = get_input_link("Normal", NodeItem::Type::Vector3);
   NodeItem tangent = get_input_link("Tangent", NodeItem::Type::Vector3);
-
-  /* `conductor_bsdf` wants the two alpha values, not Blender's roughness.
-   * `roughness_anisotropy` does that conversion (same as the Principled node). */
-  NodeItem roughness_vector = create_node(
-      "roughness_anisotropy",
-      NodeItem::Type::Vector2,
-      {{"roughness", roughness}, {"anisotropy", anisotropy}});
 
   NodeItem artistic_ior = create_node("artistic_ior",
                                       NodeItem::Type::Multioutput,
@@ -97,7 +90,7 @@ NODE_SHADER_MATERIALX_BEGIN
                       {"tangent", tangent},
                       {"ior", ior_out},
                       {"extinction", extinction_out},
-                      {"roughness", roughness_vector}});
+                      {"roughness", roughness}});
 }
 #endif
 NODE_SHADER_MATERIALX_END

@@ -96,34 +96,5 @@ KERNEL_DATA_ARRAY_WRITABLE(uint8_t, image_texture_tile_access_state)
 KERNEL_DATA_ARRAY(KernelImageUDIM, image_texture_udims)
 KERNEL_DATA_ARRAY(KernelImageInfo, image_info)
 
-/* Falcon SHARC spatial hash radiance cache. Read-only from the kernel: the host
- * fills it during the warmup pass and uploads it, then the camera-hit blend only
- * looks it up. Allocated only when WITH_FALCON_SHARC, otherwise a null pointer.
- * (Cycles 4.5 has no kernel-writable data array, so unlike the standalone 5.2
- * version this is a plain read-only array and there is no per-pixel cell buffer;
- * the host deposits via the Position pass instead.) */
-KERNEL_DATA_ARRAY(float, falcon_sharc_cache)
-
-/* Falcon Photon point map (Round 9): raw photon points (stride 9: pos3, flux3,
- * normal3), bake-time append counter, and the host-built uniform neighbor grid
- * (cell = lookup radius; per-slot start/count into the sorted photon index).
- * Hash-slot collisions are resolved by the lookup's distance test. */
-KERNEL_DATA_ARRAY(float, falcon_photon_points)
-KERNEL_DATA_ARRAY(uint, falcon_photon_pcount)
-KERNEL_DATA_ARRAY(uint, falcon_photon_grid_start)
-KERNEL_DATA_ARRAY(uint, falcon_photon_grid_count)
-KERNEL_DATA_ARRAY(uint, falcon_photon_index)
-
-/* Falcon DAS (denoiser-aware sampling): per-pixel adaptive-threshold scale map,
- * host-built from an OIDN probe residual (|denoised - noisy|). scale < 1 makes
- * the convergence check stricter (more samples where the denoiser struggles),
- * scale > 1 lets denoiser-easy pixels stop early. Read-only, indexed by
- * render_pixel_index; allocated only when FALCON_DAS_MAP is set. */
-KERNEL_DATA_ARRAY(float, falcon_das_scale)
-
-/* Falcon error field: one relative-error scalar per world cell (same hash as
- * the SHARC grid, its own cell size). Empty cells hold a negative value. */
-KERNEL_DATA_ARRAY(float, falcon_error_field)
-
 #undef KERNEL_DATA_ARRAY
 #undef KERNEL_DATA_ARRAY_WRITABLE

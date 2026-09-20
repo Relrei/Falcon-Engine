@@ -977,8 +977,7 @@ wmOperatorStatus sequencer_retiming_box_select_exec(bContext *C, wmOperator *op)
   Set<SeqRetimingKey *> and_keys;
 
   for (Strip *strip : sequencer_visible_strips_get(C)) {
-    const float strip_y = seq::channel_to_y(strip->channel);
-    if (strip_y < rectf.ymin || strip_y > rectf.ymax) {
+    if (strip->channel < rectf.ymin || strip->channel > rectf.ymax) {
       continue;
     }
     if (!seq::retiming_show_keys(strip)) {
