@@ -12,11 +12,12 @@ Blender 5.2.2 をもとにしたカスタムビルドです。このリポジト
 - VSE 連携アドオン(レンダーエンジン「VSE」と書き出しのプリセット)
 - F-Cycles: Cycles に光子(フォトン)・SHARC・分散を足し、コースティクスをチェック 1 つで出せるようにしたもの
 - DLSS の受け口とプラグインフォルダ(下の「DLSS」)
+- VSE のチャンネル: 段を 10 まで増やせるように・段の並びを上下逆にできるように(`FALCON_VSE_CHANNELS` / `FALCON_VSE_FLIP_CHANNELS`)
 
 ## ビルド(Linux x64)
 
 ★**事前ビルド済みライブラリ(`lib/`)はこのリポジトリに含めていません。**容量が大きく、
-本家が配っている物をそのまま使うためです。下の 1 行で取ってきてください(git-lfs が要ります)。
+本家が配っている物をそのまま使うためです。下の 2 で取ってきてください(git-lfs が要ります)。
 
 ```sh
 # 1) この木を取る
@@ -24,14 +25,18 @@ git clone https://github.com/Relrei/Falcon-Engine.git
 cd Falcon-Engine
 
 # 2) 本家の事前ビルド済みライブラリ(約 20GB・git-lfs が要ります)
-mkdir -p lib
-git clone --depth 1 -b blender-v5.2-release \
-    https://projects.blender.org/blender/lib-linux_x64.git lib/linux_x64
+make update                # ★本家の仕組み。枝を自分で選んで lib/linux_x64 へ入れてくれます
 
-# 3) 建てる(どちらでも同じです)
-make                       # 本家と同じ入口
-# もしくは cmake を直に:
-cmake -S . -B ../build-falcon \
+# 使えない時は手で取っても同じです(枝は main。版ごとの枝がある時は blender-vX.Y-release)
+mkdir -p lib
+git clone --depth 1 https://projects.blender.org/blender/lib-linux_x64.git lib/linux_x64
+
+# 3) 建てる(どちらか片方で結構です)
+make release               # 本家と同じ入口。出来上がりは ../build_linux_release/bin/blender
+
+# もしくは cmake を直に叩く
+# ★`-G Ninja` を付けてください。付けないと Makefile が出来るので次の ninja が動きません
+cmake -G Ninja -S . -B ../build-falcon \
       -C build_files/cmake/config/blender_release.cmake \
       -DLIBDIR=$PWD/lib/linux_x64 -DCMAKE_BUILD_TYPE=Release
 ninja -C ../build-falcon install     # 出来上がりは ../build-falcon/bin/blender
@@ -40,8 +45,9 @@ ninja -C ../build-falcon install     # 出来上がりは ../build-falcon/bin/bl
 | 置き場 | 何か |
 |---|---|
 | `lib/linux_x64` | 本家の事前ビルド済みライブラリ(上の 2 で取る)|
-| `../build-falcon` | ビルドの作業場所(木の外に置くのが本家の作法)|
-| `../build-falcon/bin/blender` | 出来上がりの実行ファイル |
+| `../build_linux_release/bin/blender` | `make release` で建てた時の実行ファイル |
+| `../build-falcon` | cmake を直に叩いた時の作業場所(木の外に置くのが本家の作法)|
+| `../build-falcon/bin/blender` | そちらで建てた時の実行ファイル |
 
 Windows / macOS は `lib-windows_x64` / `lib-macos_arm64` を同じ枝(`blender-v5.2-release`)から
 同じ場所(`lib/windows_x64` / `lib/macos_arm64`)へ取れば、あとは本家と同じ手順です。
@@ -91,4 +97,4 @@ NVIDIA と DLSS は NVIDIA Corporation の商標です。
 
 ---
 
-*English:* Falcon Engine is a custom build based on Blender 5.2.2. It builds with the same steps as upstream Blender (`make update && make`). It adds faster VSE export (a pass-through fast path and NVENC encoding, which needs an FFmpeg built with NVENC; the upstream precompiled FFmpeg has it disabled, so a plain build encodes on the CPU), VSE fixes, a VSE bridge add-on, and F-Cycles (Cycles with photon mapping, SHARC and dispersion for caustics). DLSS support is optional (`-DWITH_DLSS=ON -DDLSS_SDK_ROOT=...`); the NVIDIA DLSS SDK and runtime are not included. Place the runtime from the SDK, together with the `falcon_plugin.toml` manifest shown above, in `~/.config/blender/5.2/falcon_plugins/dlss/` (or `falcon_plugins/dlss/` next to the executable); the "NVIDIA DLSS denoiser" add-on then appears in Preferences > Add-ons, and enabling it offers DLSS as a denoiser. The separately built renderers (Dragon, Kajigata, Yotsuba4, Rapid) and features still in testing are not part of this repository. Issues track bugs and progress.
+*English:* Falcon Engine is a custom build based on Blender 5.2.2. It builds with the same steps as upstream Blender (`make update && make release`). It adds faster VSE export (a pass-through fast path and NVENC encoding, which needs an FFmpeg built with NVENC; the upstream precompiled FFmpeg has it disabled, so a plain build encodes on the CPU), VSE fixes, a VSE bridge add-on, and F-Cycles (Cycles with photon mapping, SHARC and dispersion for caustics). DLSS support is optional (`-DWITH_DLSS=ON -DDLSS_SDK_ROOT=...`); the NVIDIA DLSS SDK and runtime are not included. Place the runtime from the SDK, together with the `falcon_plugin.toml` manifest shown above, in `~/.config/blender/5.2/falcon_plugins/dlss/` (or `falcon_plugins/dlss/` next to the executable); the "NVIDIA DLSS denoiser" add-on then appears in Preferences > Add-ons, and enabling it offers DLSS as a denoiser. The separately built renderers (Dragon, Kajigata, Yotsuba4, Rapid) and features still in testing are not part of this repository. Issues track bugs and progress.
