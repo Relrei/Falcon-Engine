@@ -24,12 +24,14 @@ Blender 5.2.2 をもとにしたカスタムビルドです。このリポジト
 git clone https://github.com/Relrei/Falcon-Engine.git
 cd Falcon-Engine
 
-# 2) 本家の事前ビルド済みライブラリ(約 20GB・git-lfs が要ります)
-make update                # ★本家の仕組み。枝を自分で選んで lib/linux_x64 へ入れてくれます
+# 2) 本家の事前ビルド済みライブラリ(git-lfs が要ります)
+make update                # 本家と同じ入口。5.2 用の枝を選んで lib/linux_x64 へ入れてくれます
 
-# 使えない時は手で取っても同じです(枝は main。版ごとの枝がある時は blender-vX.Y-release)
+# 使えない時は手で取っても同じです。
+# ★枝(-b blender-v5.2-release)を必ず付けてください。付けないと 5.3 開発版の物が来てビルドが通りません
 mkdir -p lib
-git clone --depth 1 https://projects.blender.org/blender/lib-linux_x64.git lib/linux_x64
+git clone --depth 1 -b blender-v5.2-release \
+    https://projects.blender.org/blender/lib-linux_x64.git lib/linux_x64
 
 # 3) 建てる(どちらか片方で結構です)
 make release               # 本家と同じ入口。出来上がりは ../build_linux_release/bin/blender
@@ -40,6 +42,14 @@ cmake -G Ninja -S . -B ../build-falcon \
       -C build_files/cmake/config/blender_release.cmake \
       -DLIBDIR=$PWD/lib/linux_x64 -DCMAKE_BUILD_TYPE=Release
 ninja -C ../build-falcon install     # 出来上がりは ../build-falcon/bin/blender
+```
+
+★**Intel の GPU(oneAPI)のカーネルで止まる時**: 既定の設定はこれも焼きます。焼く時に使う
+dpcpp が**システムの C++ ヘッダ**を探すので、最小限のビルド環境(コンテナなど)では
+`fatal error: 'iostream' file not found` で止まります。Intel の GPU を使わないなら切ってください。
+
+```sh
+cmake -B ../build-falcon -DWITH_CYCLES_DEVICE_ONEAPI=OFF -DWITH_CYCLES_ONEAPI_BINARIES=OFF
 ```
 
 | 置き場 | 何か |

@@ -20,9 +20,15 @@ namespace blender::seq::brightcontrast_cpu {
 
 enum class Mode { Auto, Reference, Portable, AVX2 };
 
-inline Mode mode()
+/* ★2026-09-21 作者「GPU が弱くて GPU をあまり使わない仕事向けノートパソコンなどを
+ * 考慮すると拡張命令は残しておきたい」。
+ * 選び方を起動時の 1 回読みから**その場で変えられる**形にした(画面のつまみから触る)。
+ * 環境変数は「まだ誰も選んでいない時の既定」に下がる。
+ * ★安全の線は動かしていない: #select_float_kernel は CPU が本当に AVX2 を持っている時しか
+ * その核を返さないので、持たない機械で選んでも落ちずに携帯版で走る。 */
+inline Mode &mode_runtime()
 {
-  static const Mode selected = [] {
+  static Mode selected = [] {
     const char *value = std::getenv("FALCON_VSE_CPU_KERNEL");
     if (value && std::strcmp(value, "reference") == 0) {
       return Mode::Reference;
@@ -36,6 +42,16 @@ inline Mode mode()
     return Mode::Auto;
   }();
   return selected;
+}
+
+inline Mode mode()
+{
+  return mode_runtime();
+}
+
+inline void mode_set(const Mode requested)
+{
+  mode_runtime() = requested;
 }
 
 inline void make_byte_table(float mul, float add, unsigned char table[256])
@@ -112,8 +128,10 @@ inline FloatKernel select_float_kernel(Mode requested, bool available)
 
 inline FloatKernel float_kernel()
 {
-  static const FloatKernel kernel = select_float_kernel(mode(), avx2_available());
-  return kernel;
+  /* ★つまみで変えられるようになったので、1 回だけ選んで固めない。
+   * 中身は分岐 2 つなので、1 コマに 1 回のこの呼び出しでは測れない差しか出ない。 */
+  static const bool available = avx2_available();
+  return select_float_kernel(mode(), available);
 }
 
 }  // namespace blender::seq::brightcontrast_cpu

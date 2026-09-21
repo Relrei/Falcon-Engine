@@ -36,6 +36,8 @@ set(SRC
   SEQ_preview_cache.hh
   SEQ_proxy.hh
   SEQ_relations.hh
+  SEQ_falcon_timing.hh
+  SEQ_gpu_preview.hh
   SEQ_render.hh
   SEQ_retiming.hh
   SEQ_select.hh
@@ -98,6 +100,8 @@ set(SRC
   intern/proxy.cc
   intern/proxy.hh
   intern/proxy_job.cc
+  intern/falcon_timing.cc
+  intern/gpu_preview.cc
   intern/render.cc
   intern/render.hh
   intern/sequencer.cc
@@ -154,18 +158,26 @@ add_library(bf::sequencer ALIAS bf_sequencer)
 
 # Experimental SIMD probe flags for the color-correction modifiers (see modifier.hh
 # inline load/store). Mutually exclusive tiers, default OFF (see top-level CMakeLists.txt).
+# ★どの段で建てたかは、画面(シーンプロパティ)にも出す。ここで名札を渡しておく
+# (2026-09-21 作者「拡張命令は入ってる?」)。
+# ★名札は「文字列の define」にしない。空白や括弧が入ると ninja と shell を通る間に
+#   -DFALCON_VSE_SIMD_TIER="" (中身なし) に潰れて、コンパイルが止まった(2026-09-21 実測)。
+#   ので、ここでは印だけ渡して、文字列は C++ 側で選ぶ。
 if(WITH_VSE_AVX512 AND NOT MSVC)
   target_compile_options(bf_sequencer PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O3;-mavx512f;-mavx512bw;-mavx512dq;-mavx512vl;-mfma;-ffp-contract=off>
   )
+  target_compile_definitions(bf_sequencer PRIVATE FALCON_VSE_TIER_AVX512)
 elseif(WITH_VSE_AVX2 AND CXX_HAS_AVX2 AND NOT MSVC)
   target_compile_options(bf_sequencer PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O3;-mavx2;-mfma;-ffp-contract=off>
   )
+  target_compile_definitions(bf_sequencer PRIVATE FALCON_VSE_TIER_AVX2)
 elseif(WITH_VSE_O3 AND NOT MSVC)
   target_compile_options(bf_sequencer PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-O3>
   )
+  target_compile_definitions(bf_sequencer PRIVATE FALCON_VSE_TIER_O3)
 endif()
 
 # RNA_prototypes.hh

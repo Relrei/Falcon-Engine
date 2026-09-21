@@ -8,6 +8,8 @@
 
 #include "MEM_guardedalloc.h"
 
+#include <algorithm>
+
 #include "DNA_scene_types.h"
 #include "DNA_sound_types.h"
 
@@ -189,9 +191,12 @@ static float update_overlay_strip_position_data(bContext *C, const int mval[2])
    */
   ui::view2d_region_to_view(v2d, mval[0], mval[1], &coords->start_frame, &coords->channel);
   coords->start_frame = roundf(coords->start_frame);
-  if (coords->channel < 1.0f) {
-    coords->channel = 1;
-  }
+  /* ★`coords->channel` は段の番号ではなく**Y 座標**(この先で `y_to_channel` を通す)。
+   * 以前はここで「1 より小さければ 1」と丸めていたが、上下反転では Y=1 が**いちばん下の段
+   * (128)**なので、外へはみ出した落とし方が 128 段目に化けていた(2026-09-21 作者)。
+   * 段の番号へ直してから丸め、その段の Y に戻す = 反転していてもいなくても同じ意味になる。 */
+  const int drop_channel = std::clamp(seq::y_to_channel(coords->channel), 1, seq::MAX_CHANNELS);
+  coords->channel = seq::channel_to_y(drop_channel);
 
   float channel = coords->channel;
   float start_frame = coords->start_frame;
@@ -278,7 +283,12 @@ static void sequencer_drop_copy(bContext *C, wmDrag *drag, wmDropBox *drop)
     }
 
     RNA_int_set(drop->ptr, "frame_start", g_drop_coords.start_frame);
-    RNA_int_set(drop->ptr, "channel", g_drop_coords.channel);
+    /* ★★ここが「外から落とすと 128 段目に行く」の本体(2026-09-21 作者)。
+     * `g_drop_coords.channel` は**Y 座標**なので、そのまま段の番号として渡してはいけない。
+     * 反転していない時は Y == 段だったので気づけなかった。反転では段 1 の Y が 128。
+     * 絵(下描きの帯)の側は前から `y_to_channel` を通していたので、**見えている位置と
+     * 実際に置かれる段が食い違っていた**。 */
+    RNA_int_set(drop->ptr, "channel", seq::y_to_channel(g_drop_coords.channel));
     RNA_boolean_set(drop->ptr, "overlap_shuffle_override", true);
     RNA_boolean_set(drop->ptr, "skip_locked_or_muted_channels", false);
   }

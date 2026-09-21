@@ -89,9 +89,13 @@ void strip_channel_set(Strip *strip, int channel);
  * header, the static is still a single instance program-wide (inline-function semantics), so
  * every translation unit that includes this header shares the same cached value.
  */
-inline bool channel_flip_enabled()
+namespace falcon_flip_detail {
+/** The one runtime copy of the flag. Starts from `FALCON_VSE_FLIP_CHANNELS` (default on) and is
+ * then overwritten by the scene's saved value (#channel_flip_sync_from_scene) or by the toolbar
+ * button (#channel_flip_store). Inline function-local static = one instance program-wide. */
+inline bool &channel_flip_runtime()
 {
-  static const bool flip = []() {
+  static bool flip = []() {
     const char *env = std::getenv("FALCON_VSE_FLIP_CHANNELS");
     if (env == nullptr || env[0] == '\0') {
       return true;
@@ -100,6 +104,29 @@ inline bool channel_flip_enabled()
   }();
   return flip;
 }
+}  // namespace falcon_flip_detail
+
+inline bool channel_flip_enabled()
+{
+  return falcon_flip_detail::channel_flip_runtime();
+}
+
+/** Set the runtime flag only. Use #channel_flip_store to also save it with the .blend. */
+inline void channel_flip_set(const bool enable)
+{
+  falcon_flip_detail::channel_flip_runtime() = enable;
+}
+
+/** ★2026-09-21 作者「余白に上下反転のボタンが欲しい」= 起動時に 1 回読むだけの環境変数から、
+ * **その場で切り替えられる値**にした。保存先はチャンネル数と同じ場面の system property なので
+ * DNA は増えない。環境変数は「その場面がまだ何も持っていない時の既定」に下がった。
+ *
+ * 場面が値を持っていれば runtime へ写す。持っていなければ何もしない(環境変数の既定のまま)。
+ * VSE の時間軸を描く直前に呼ぶ = ファイルを開いた時・場面を切り替えた時に自動で追従する。 */
+void channel_flip_sync_from_scene(const Scene *scene);
+
+/** Set the runtime flag **and** save it on the scene (survives save/load). */
+void channel_flip_store(Scene *scene, bool enable);
 
 /**
  * Convert a strip channel number to the View2D Y coordinate used to draw/pick it.

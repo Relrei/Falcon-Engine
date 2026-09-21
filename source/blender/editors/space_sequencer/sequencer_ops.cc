@@ -142,6 +142,7 @@ void sequencer_operatortypes()
   WM_operatortype_append(SEQUENCER_OT_rename_channel);
   WM_operatortype_append(SEQUENCER_OT_channel_add);
   WM_operatortype_append(SEQUENCER_OT_channel_remove);
+  WM_operatortype_append(SEQUENCER_OT_channel_flip);
 
   sequencer_strip_modifier_add_asset_register();
 }

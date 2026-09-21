@@ -45,6 +45,8 @@
 #include "SEQ_sequencer.hh"
 #include "SEQ_time.hh"
 
+#include "SEQ_gpu_preview.hh"
+
 #include "prefetch.hh"
 #include "render.hh"
 
@@ -558,10 +560,50 @@ static bool seq_prefetch_must_skip_frame(PrefetchJob *pfjob)
   return seqbase_renders_scene_strip(scene, channels, seqbase, timeline_frame, state);
 }
 
+/**
+ * 先読みが再生ヘッドの何コマ先まで走るか。`FALCON_VSE_PREFETCH_WINDOW_S` 秒で指定し、
+ * 0(既定)なら上流どおり = タイムラインの端まで走る。
+ *
+ * ★なぜ要るか(2026-09-20 実測・メモリの少ない機械向け): 上流の先読みは端まで走り、
+ * 走った範囲は `source_image_cache_evict()` / `final_image_cache_evict()` が
+ * 「先読みの範囲は捨てない」規則で守る。その結果、キャッシュが上限に達すると
+ * **捨てられる物が 1 枚も無くなり、先読みジョブが眠る**。眠った後の再生は素の同期復号の
+ * 速さまで落ちる(FHD H.264 4 本で 4〜6fps -> 0.8〜1.5fps・仮)。
+ * 窓を切っておけば、守るのは「再生ヘッドの少し先」だけになり、後ろは常に捨てられるので、
+ * 予算が小さくても「貯めては入れ替える」形で回り続ける。
+ */
+static int seq_prefetch_window_frames(const Scene *scene)
+{
+  static const float window_sec = []() {
+    const char *env = getenv("FALCON_VSE_PREFETCH_WINDOW_S");
+    return (env == nullptr) ? 0.0f : std::max(0.0f, float(atof(env)));
+  }();
+  if (window_sec <= 0.0f) {
+    return std::numeric_limits<int>::max();
+  }
+  const float fps = float(scene->r.frs_sec) / std::max(float(scene->r.frs_sec_base), 1e-6f);
+  return std::max(1, int(window_sec * fps));
+}
+
+/** 先読みが走ってよい範囲。GPU 経路の時は仕上がりを置く輪の大きさで頭を押さえる。 */
+static int seq_prefetch_window_frames_effective(const Scene *scene)
+{
+  int frames = seq_prefetch_window_frames(scene);
+  if (gpu_preview_enabled() && gpu_preview_is_active()) {
+    /* ★輪より先へ行っても押し出されるだけ。行った先の仕事は丸ごと捨てることになる。 */
+    const int ahead = gpu_preview_ahead_frames();
+    if (ahead > 0) {
+      frames = std::min(frames, ahead);
+    }
+  }
+  return frames;
+}
+
 static bool seq_prefetch_need_suspend(PrefetchJob *pfjob)
 {
   return seq_prefetch_is_cache_full(pfjob->scene) || pfjob->is_scrubbing ||
-         (pfjob->num_frames_prefetched >= pfjob->timeline_length);
+         (pfjob->num_frames_prefetched >= pfjob->timeline_length) ||
+         (pfjob->num_frames_prefetched >= seq_prefetch_window_frames_effective(pfjob->scene));
 }
 
 static void seq_prefetch_do_suspend(PrefetchJob *pfjob)

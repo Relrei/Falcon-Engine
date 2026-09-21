@@ -1870,11 +1870,191 @@ def _draw_sequencer_header(self, context):
         _defer_ensure_sequencer_scene()
     # ★「+」から足して開いた時は msgbus が鳴らない。ここで入ったことに気づく(エンジン)。
     _auto_engine_notice(context)
-    space = context.space_data
-    if getattr(space, "view_type", 'SEQUENCER') == 'PREVIEW':
-        # プレビュー側にはストリップが無いので出さない。
+    # ★2026-09-21 作者「fit to strips は再生のタブに設置してほしい・シーケンサーのタブには
+    # おかず」。ボタンは #_draw_playback_popover(「再生」の吹き出し)へ移した。
+    # ここはシーンの用意と engine の知らせだけを続ける(描く物は無い)。
+
+
+def _draw_playback_footer(self, context):
+    """下の帯(再生の操作列・#SEQUENCER_HT_playback_controls)の右端に
+    「ストリップに合わせる」を置く。
+
+    ★2026-09-21 作者「そこに設置はわからなさすぎる」「ここにおきたい」= 開始/終了の
+    すぐ隣。いったん「再生」の吹き出しの中へ入れたが、吹き出しが縦に長く最下部だったので
+    見つからなかった。プロパティ側(#FALCON_VSE_PT_frame_range)は 1 行も触っていない。
+
+    プレビュー側にはストリップが無いので出さない。
+    """
+    space = getattr(context, "space_data", None)
+    if space is None or getattr(space, "view_type", 'SEQUENCER') == 'PREVIEW':
         return
-    self.layout.operator("falcon_vse.fit_frame_range", icon='ARROW_LEFTRIGHT')
+    layout = self.layout
+    layout.separator()
+    layout.operator("falcon_vse.fit_frame_range", icon='ARROW_LEFTRIGHT')
+
+
+# -----------------------------------------------------------------------------
+# シーンプロパティの「Falcon: この機械での効かせ方」 (2026-09-21)
+# -----------------------------------------------------------------------------
+#
+# 作者 2026-09-21「拡張命令や NVENC といった機能面のオンオフをできる項目を追加したい・
+# CPU GPU を自動検出で合う機種に応じて自動で有効無効をしたいけど手動でも可能にしたい」
+# 「レンダープロパティに入れず シーンプロパティを使おう」。
+
+
+def _machine_has_nvidia():
+    """NVIDIA の GPU が在るか(実測・無ければ False)。"""
+    try:
+        import subprocess
+        out = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                             capture_output=True, text=True, timeout=4)
+        return out.returncode == 0 and bool(out.stdout.strip())
+    except Exception:  # noqa: BLE001  機械に無いだけ
+        return False
+
+
+def _cpu_flags():
+    """この CPU が持っている拡張命令(Linux)。"""
+    flags = set()
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                if line.startswith("flags"):
+                    flags = set(line.split(":", 1)[1].split())
+                    break
+    except Exception:  # noqa: BLE001
+        pass
+    return flags
+
+
+_machine_cache = {}
+
+
+def machine_report():
+    """機械の見立て(1 回測って覚える)。"""
+    if not _machine_cache:
+        flags = _cpu_flags()
+        _machine_cache.update({
+            "gpu": _machine_has_nvidia(),
+            "avx2": "avx2" in flags,
+            "avx512": "avx512f" in flags,
+            "sse42": "sse4_2" in flags,
+        })
+    return _machine_cache
+
+
+def apply_auto(scene):
+    """自動: この機械に合う値へそろえる。手動の時は呼ばない。"""
+    m = machine_report()
+    try:
+        scene.falcon_vse_gpu_preview = bool(m["gpu"])
+        scene.render.ffmpeg.use_hardware_encoder = bool(m["gpu"])
+        # ★拡張命令は「自動」のまま(測って差が出なかったので既定は動かさない)。
+        #   手動にすれば AVX2 を選べる。持っていない CPU で選んでも落ちずに携帯版で走る。
+        scene.falcon_vse_cpu_kernel = 'AUTO'
+    except Exception as ex:  # noqa: BLE001  UI を止めない
+        print("falcon_vse_bridge:", ex)
+
+
+def _mode_update(self, context):
+    if self.falcon_accel_mode == 'AUTO':
+        apply_auto(self)
+
+
+# ★2026-09-21 作者「シーンプロパティ いらないものが多いから外せるものは外して」。
+# レンダー項目が VSE の時だけ、動画編集に関係のない札を畳む。**他のエンジンでは今までどおり**。
+# 消すのでなく `poll` を包むだけなので、engine を戻せばそのまま出る。
+_SCENE_PANELS_HIDDEN_FOR_VSE = (
+    "SCENE_PT_unit",                    # 長さ・質量・回転の単位
+    "SCENE_PT_keying_sets",             # キーイングセット
+    "SCENE_PT_keyframing_settings",
+    "SCENE_PT_keying_set_paths",
+    "SCENE_PT_physics",                 # 重力
+    "SCENE_PT_simulation",
+    "SCENE_PT_rigid_body_world",        # 剛体ワールド(下の 3 つも一緒に消える)
+    "SCENE_PT_rigid_body_world_settings",
+    "SCENE_PT_rigid_body_cache",
+    "SCENE_PT_rigid_body_field_weights",
+    "SCENE_PT_eevee_light_probes",      # ライトプローブ
+)
+
+# 包む前の poll。戻す時に使う。
+_scene_panel_polls = {}
+
+
+def _install_scene_panel_polls():
+    for name in _SCENE_PANELS_HIDDEN_FOR_VSE:
+        cls = getattr(bpy.types, name, None)
+        if cls is None or name in _scene_panel_polls:
+            continue
+        original = getattr(cls, "poll", None)
+        _scene_panel_polls[name] = original
+
+        def make(orig):
+            @classmethod
+            def poll(cls_, context):
+                scene = getattr(context, "scene", None)
+                if scene is not None and scene.render.engine == FALCON_VSE_ENGINE:
+                    return False
+                if orig is None:
+                    return True
+                return orig.__func__(cls_, context)
+            return poll
+
+        cls.poll = make(original)
+
+
+def _remove_scene_panel_polls():
+    for name, original in _scene_panel_polls.items():
+        cls = getattr(bpy.types, name, None)
+        if cls is None:
+            continue
+        if original is None:
+            try:
+                del cls.poll
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            cls.poll = original
+    _scene_panel_polls.clear()
+
+
+class FALCON_PT_machine(Panel):
+    """シーンプロパティの札。ここだけ見れば「この機械で何が効いているか」が分かる。"""
+    bl_space_type = 'PROPERTIES'
+    bl_region_type = 'WINDOW'
+    bl_context = "scene"
+    bl_label = "Falcon"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        scene = context.scene
+        m = machine_report()
+        auto = scene.falcon_accel_mode == 'AUTO'
+
+        layout.prop(scene, "falcon_accel_mode", expand=True)
+
+        col = layout.column()
+        col.enabled = not auto
+        col.prop(scene, "falcon_vse_gpu_preview")
+        col.prop(scene.render.ffmpeg, "use_hardware_encoder", text="GPU Encoding (NVENC)")
+        row = col.row()
+        row.enabled = (not auto) and m["avx2"]
+        row.prop(scene, "falcon_vse_cpu_kernel")
+
+        box = layout.box()
+        box.use_property_split = False
+        box.label(text="This machine", icon='SYSTEM')
+        row = box.row(); row.label(text="GPU (NVIDIA)"); row.label(text="Yes" if m["gpu"] else "No")
+        row = box.row(); row.label(text="AVX2")
+        row.label(text="Yes" if scene.falcon_cpu_has_avx2 else "No")
+        row = box.row(); row.label(text="AVX-512"); row.label(text="Yes" if m["avx512"] else "No")
+        row = box.row(); row.label(text="CPU Instructions (this build)")
+        row.label(text=scene.falcon_cpu_simd_tier)
+        box.label(text="Instruction set is fixed when the program is built", icon='INFO')
 
 
 # -----------------------------------------------------------------------------
@@ -2513,6 +2693,7 @@ _handlers = (
 
 classes = (
     FALCON_OT_vse_edit,
+    FALCON_PT_machine,
     FALCON_VSE_OT_fit_frame_range,
     FALCON_VSE_RenderEngine,
 ) + VSE_PANELS
@@ -2581,13 +2762,27 @@ def register():
     from bl_ui.space_sequencer import SEQUENCER_MT_add, SEQUENCER_HT_header
     SEQUENCER_MT_add.append(_draw_sequencer_add)
     SEQUENCER_HT_header.append(_draw_sequencer_header)
+    from bl_ui.space_sequencer import SEQUENCER_HT_playback_controls
+    SEQUENCER_HT_playback_controls.append(_draw_playback_footer)
     from bl_ui.space_filebrowser import FILEBROWSER_HT_header
     FILEBROWSER_HT_header.append(_on_browser_header_draw)
 
     for _panel in compat_panels():
         _panel.COMPAT_ENGINES.add(FALCON_VSE_ENGINE)
+    _install_scene_panel_polls()
 
     # 値の正本は `scene.render.engine`。これは一覧の見せ方だけの写し(保存しない)。
+    bpy.types.Scene.falcon_accel_mode = EnumProperty(
+        name="Acceleration",
+        description="Pick what runs on the GPU. Automatic follows what this machine has",
+        items=[
+            ('AUTO', "Automatic", "Enable what this machine supports"),
+            ('MANUAL', "Manual", "Choose each one yourself"),
+        ],
+        default='AUTO',
+        update=_mode_update,
+    )
+
     bpy.types.Scene.falcon_vse_render_engine = EnumProperty(
         name="Engine",
         description="Engine to use for rendering",
@@ -2620,6 +2815,8 @@ def unregister():
     FILEBROWSER_HT_header.remove(_on_browser_header_draw)
     from bl_ui.space_sequencer import SEQUENCER_MT_add, SEQUENCER_HT_header
     SEQUENCER_HT_header.remove(_draw_sequencer_header)
+    from bl_ui.space_sequencer import SEQUENCER_HT_playback_controls
+    SEQUENCER_HT_playback_controls.remove(_draw_playback_footer)
     SEQUENCER_MT_add.remove(_draw_sequencer_add)
     from bl_ui.space_image import IMAGE_HT_header
     IMAGE_HT_header.remove(_draw_image_header)
@@ -2662,6 +2859,8 @@ def unregister():
         _panel.COMPAT_ENGINES.discard(FALCON_VSE_ENGINE)
 
     _remove_render_context_draw()
+    _remove_scene_panel_polls()
+    del bpy.types.Scene.falcon_accel_mode
     del bpy.types.Scene.falcon_vse_render_engine
     _engine_menu_items_cache.clear()
 

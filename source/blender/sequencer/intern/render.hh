@@ -10,6 +10,7 @@
 
 #include "DNA_listBase.h"
 
+#include "BLI_math_matrix_types.hh"
 #include "BLI_math_vector_types.hh"
 #include "BLI_set.hh"
 
@@ -72,6 +73,39 @@ SeqResult seq_render_strip(const RenderData *context,
                            SeqRenderState *state,
                            Strip *strip,
                            float timeline_frame);
+
+/**
+ * ストリップの**素材だけ**を返す(復号と色空間まで。変形・重ねはしない)。
+ * GPU プレビュー経路(`SEQ_gpu_preview.hh`)が、変形を GPU でやるために使う。
+ * 返った画像は呼び手が `IMB_freeImBuf()` する。素材キャッシュへは通常の経路と同じ条件で入る。
+ */
+/**
+ * キャッシュが上限に当たっていれば追い出す(`render_give_ibuf()` がやるのと同じ事)。
+ * GPU プレビュー経路は `render_give_ibuf()` を通らないので、こちらから呼ぶ。
+ */
+void seq_render_evict_caches_if_full(const RenderData *context);
+
+SeqResult seq_render_strip_source_only(const RenderData *context,
+                                       SeqRenderState *state,
+                                       Strip *strip,
+                                       float timeline_frame,
+                                       bool *r_is_proxy_image);
+
+/**
+ * 入力画像(`in_size`)を出力画布(`out_size`)へ置く行列。ストリップの拡縮・回転・移動込み。
+ * CPU 経路(`IMB_transform`)と GPU 経路で**同じ行列**を使うために公開している。
+ */
+float3x3 calc_strip_transform_matrix(const Scene *scene,
+                                     const Strip *strip,
+                                     int2 in_size,
+                                     int2 out_size,
+                                     float image_scale_factor,
+                                     float preview_scale_factor);
+
+/** 変形が要る配置か / 切り抜きが要る配置か(GPU 経路の可否判定で使う)。 */
+bool sequencer_use_transform(const Strip *strip);
+bool sequencer_use_crop(const Strip *strip);
+bool seq_need_scale_to_render_size(const Strip *strip, bool is_proxy_image);
 
 /* Renders Mask into an image suitable for sequencer:
  * RGB channels contain mask intensity; alpha channel is opaque. */

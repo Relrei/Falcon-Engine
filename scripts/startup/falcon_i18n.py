@@ -560,6 +560,15 @@ JA = (
     ("Encoder:", "符号化:"),
     ("stream copy", "そのままコピー"),
     ("not a movie export", "動画の書き出しではない"),
+    # --- VSE: Proxy Settings のボタン (falcon_vse_proxy) --------------------------------------
+    # 「代役」でなく「プロキシ」= 囲んでいる Blender 本家の板が「プロキシ設定」なので合わせる。
+    ("Set Up Proxies for Playback", "再生用のプロキシを用意する"),
+    ("Build half-size proxies for every movie strip and play those back instead of the originals",
+     "動画ストリップの半分の大きさのプロキシを作り、再生ではそちらを使う"),
+    ("Build Now", "すぐ作る"),
+    ("Start building the proxy files right away", "プロキシのファイルの作成をすぐ始める"),
+    ("No movie or image strips to set up", "用意できる動画・画像のストリップがありません"),
+    ("Proxies set up for %d strip(s)", "%d 本のストリップにプロキシを用意しました"),
     # --- VSE: Render Properties > Source Media (falcon_vse_bridge/media_info.py) --------------
     ("Source Media", "素材の情報"),
     ("Select a strip in the Sequencer", "Sequencer でストリップを選んでください"),

@@ -7,6 +7,7 @@
  */
 
 #include <algorithm>
+#include <cstdlib>
 
 #include "DNA_screen_types.h"
 #include "DNA_space_types.h"
@@ -20,6 +21,9 @@
 #include "BKE_screen.hh"
 
 #include "ED_screen.hh"
+
+#include "RNA_access.hh"
+#include "RNA_define.hh"
 
 #include "UI_view2d.hh"
 
@@ -75,8 +79,22 @@ static bool sequencer_channel_count_poll(bContext *C)
          !ID_IS_LINKED(&scene->id);
 }
 
-/** Move the timelines that show the top channel, so the added channel comes into view and a
- * removed one leaves it (the view otherwise keeps its top, see `timeline_clamp_custom_range`). */
+/** Move the timelines that show the top channel when a channel is **removed**, so the view does
+ * not hold on to a row that no longer exists.
+ *
+ * ★2026-09-21 作者「チャンネルを増やすとそっちに画面が映るから移動しないようにしたい」。
+ * 足した時は**動かさない** — 編集中に段を足すと見ている場所が飛ぶのが理由。足した段は
+ * スクロールすれば出てくる。減らした時だけは、消えた段に貼り付いたままになるのでついていく。
+ * 戻す口: `FALCON_VSE_CHANNEL_FOLLOW=1` で足した時も本家と同じについていく形に戻る。 */
+static bool channel_add_follows_view()
+{
+  static const bool follow = []() {
+    const char *env = std::getenv("FALCON_VSE_CHANNEL_FOLLOW");
+    return env != nullptr && env[0] != '\0' && env[0] != '0';
+  }();
+  return follow;
+}
+
 static void sequencer_channel_count_follow_views(bContext *C,
                                                  const Scene *scene,
                                                  const int old_shown,
@@ -108,7 +126,8 @@ static void sequencer_channel_count_follow_views(bContext *C,
        * 画面の**下**に来るので、見る辺も ymax から ymin へ入れ替わる。 */
       const bool at_top_channel = flip ? (v2d->cur.ymin <= seq::channel_to_y(old_shown)) :
                                          (v2d->cur.ymax >= seq::channel_to_y(old_shown) + 1.0f);
-      if (delta != 0.0f && at_top_channel) {
+      const bool follow = (delta < 0.0f) || (delta > 0.0f && channel_add_follows_view());
+      if (follow && at_top_channel) {
         v2d->cur.ymin += view_delta;
         v2d->cur.ymax += view_delta;
         if (flip) {
@@ -171,6 +190,42 @@ void SEQUENCER_OT_channel_add(wmOperatorType *ot)
   ot->poll = sequencer_channel_count_poll;
 
   ot->flag = OPTYPE_REGISTER | OPTYPE_UNDO;
+}
+
+/* ★2026-09-21 作者「空いてる余白に…上下反転のボタンが欲しい」。
+ * 値は場面に保存されるので、切り替えてから保存すれば次に開いた時も同じ向き。 */
+static wmOperatorStatus sequencer_channel_flip_exec(bContext *C, wmOperator *op)
+{
+  Scene *scene = CTX_data_sequencer_scene(C);
+  if (scene == nullptr) {
+    return OPERATOR_CANCELLED;
+  }
+  PropertyRNA *prop = RNA_struct_find_property(op->ptr, "enable");
+  const bool enable = RNA_property_is_set(op->ptr, prop) ?
+                          RNA_property_boolean_get(op->ptr, prop) :
+                          !seq::channel_flip_enabled();
+  seq::channel_flip_store(scene, enable);
+  WM_event_add_notifier(C, NC_SCENE | ND_SEQUENCER, scene);
+  return OPERATOR_FINISHED;
+}
+
+void SEQUENCER_OT_channel_flip(wmOperatorType *ot)
+{
+  ot->name = "Flip Channel Order";
+  ot->idname = "SEQUENCER_OT_channel_flip";
+  ot->description =
+      "Put channel 1 at the top and count downward, or back to channel 1 at the bottom";
+
+  ot->exec = sequencer_channel_flip_exec;
+  ot->poll = sequencer_channel_count_poll;
+
+  ot->flag = OPTYPE_REGISTER | OPTYPE_UNDO;
+
+  RNA_def_boolean(ot->srna,
+                  "enable",
+                  true,
+                  "Channel 1 on Top",
+                  "Leave unset to toggle whichever way the timeline is showing now");
 }
 
 void SEQUENCER_OT_channel_remove(wmOperatorType *ot)

@@ -345,6 +345,39 @@ int falcon_timeline_channels_shown(const Scene *scene, const ListBaseT<Strip> *s
   return std::min(shown, MAX_CHANNELS);
 }
 
+/* Falcon (2026-09-21): the up/down flip used to be read once from the environment. The author
+ * asked for a button, so the value now lives on the scene next to the channel count and the
+ * environment variable is only the default for a scene that has never been told. */
+#define FALCON_CHANNEL_FLIP_PROP "falcon_vse_channel_flip"
+
+void channel_flip_sync_from_scene(const Scene *scene)
+{
+  if (scene == nullptr || scene->id.system_properties == nullptr) {
+    return;
+  }
+  const IDProperty *prop = IDP_GetPropertyTypeFromGroup(
+      scene->id.system_properties, FALCON_CHANNEL_FLIP_PROP, IDP_INT);
+  if (prop != nullptr) {
+    channel_flip_set(IDP_int_get(prop) != 0);
+  }
+}
+
+void channel_flip_store(Scene *scene, const bool enable)
+{
+  channel_flip_set(enable);
+  if (scene == nullptr) {
+    return;
+  }
+  IDProperty *group = IDP_ID_system_properties_ensure(&scene->id);
+  const int value = enable ? 1 : 0;
+  IDProperty *prop = IDP_GetPropertyTypeFromGroup(group, FALCON_CHANNEL_FLIP_PROP, IDP_INT);
+  if (prop != nullptr) {
+    IDP_int_set(prop, value);
+    return;
+  }
+  IDP_AddToGroup(group, bke::idprop::create(FALCON_CHANNEL_FLIP_PROP, value).release());
+}
+
 void falcon_timeline_channels_set(Scene *scene, const int count)
 {
   IDProperty *group = IDP_ID_system_properties_ensure(&scene->id);

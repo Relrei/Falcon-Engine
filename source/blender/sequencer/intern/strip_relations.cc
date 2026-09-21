@@ -41,6 +41,8 @@
 #include "SEQ_thumbnail_cache.hh"
 #include "SEQ_utils.hh"
 
+#include "prefetch.hh"
+
 #include "cache/final_image_cache.hh"
 #include "cache/intra_frame_cache.hh"
 #include "cache/source_image_cache.hh"
@@ -238,6 +240,29 @@ bool cache_should_stop_growing(const Scene * /*scene*/)
   return seq_system_memory_is_below(seq_cache_soft_floor_bytes());
 }
 
+
+/**
+ * 追い出しの時、素材の絵(source)から先に捨てて仕上がりの絵(final)を残すか。
+ * `FALCON_VSE_CACHE_KEEP_FINAL=0` で上流どおり(final を 1 枚捨ててから比率ぶんの source)。
+ *
+ * ★なぜ要るか(2026-09-20 実測・メモリの少ない機械向け): 1 コマにつきキャッシュに載るのは
+ * 「素材の絵 × 重なっている本数」+「仕上がりの絵 1 枚」で、FHD 4 本なら約 40MB/コマ。
+ * このうち**再生でそのまま出せるのは仕上がりの 8MB だけ**。上流は 1 巡ごとに final を必ず
+ * 1 枚捨てるので、予算が小さいほど「いちばん効く物」から先に消える。source から先に捨てれば、
+ * 同じ予算で持てる「すぐ出せるコマ」が重ねた本数ぶん(最大 5 倍)増える。
+ *
+ * ⚠ 素材を捨てると、色補正などを変えた後の描き直しは復号からやり直しになる。そこで
+ * **先読みジョブが走っている間(= 再生中)だけ**この順番にし、編集中は上流のままにする。
+ */
+static bool seq_cache_keep_final_enabled()
+{
+  static const bool keep = []() {
+    const char *env = getenv("FALCON_VSE_CACHE_KEEP_FINAL");
+    return (env == nullptr) ? true : atoi(env) != 0;
+  }();
+  return keep;
+}
+
 bool evict_caches_if_full(Scene *scene)
 {
   if (!is_cache_full(scene)) {
@@ -252,12 +277,32 @@ bool evict_caches_if_full(Scene *scene)
    * we'd eventually have the cache still filled only with source images. */
   bool evicted_final = false;
   bool evicted_source = false;
+  /* 再生中(先読みジョブが走っている間)は、仕上がりの絵を残して素材の絵から捨てる。 */
+  const bool keep_final = seq_cache_keep_final_enabled() && seq_prefetch_job_is_running(scene);
   do {
     const size_t count_final = final_image_cache_get_image_count(scene);
     const size_t count_source = source_image_cache_get_image_count(scene);
     evicted_final = false;
     evicted_source = false;
     const bool final_active = scene->ed->cache_flag & SEQ_CACHE_STORE_FINAL_OUT;
+
+    if (keep_final) {
+      /* 素材の絵が 1 枚でも捨てられる限り、仕上がりの絵には手を付けない。
+       * 素材が尽きた時だけ、上流と同じく仕上がりを 1 枚捨てる。 */
+      if (count_source != 0) {
+        evicted_source = source_image_cache_evict(scene);
+        for (size_t i = 1; evicted_source && i < count_source && is_cache_full(scene); i++) {
+          if (!source_image_cache_evict(scene)) {
+            break;
+          }
+        }
+      }
+      if (!evicted_source && count_final != 0) {
+        evicted_final = final_image_cache_evict(scene);
+      }
+      continue;
+    }
+
     /* Evict one final item, and as much from source as needed to maintain ratio. */
     if (count_final != 0) {
       evicted_final = final_image_cache_evict(scene);

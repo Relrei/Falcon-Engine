@@ -26,6 +26,7 @@
 #include "GPU_matrix.hh"
 #include "GPU_state.hh"
 
+#include "RNA_access.hh"
 #include "RNA_prototypes.hh"
 
 #include "SEQ_channels.hh"
@@ -384,19 +385,47 @@ static void draw_channel_count_buttons(const SeqChannelDrawContext *context)
   block_align_end(block);
   x += button + int(U.widget_unit * 0.3f);
 
-  char label[32];
-  SNPRINTF(label, "%d", shown);
-  uiDefBut(block,
-           ui::ButtonType::Label,
-           label,
-           x,
-           y,
-           max_ii(button, int(winx) - x),
-           button,
-           nullptr,
-           0,
-           0,
-           TIP_("Channels in the timeline"));
+  /* ★2026-09-21 作者「番号が見ずらいから見やすくしてほしい」。
+   * 以前は素の札(#ui::ButtonType::Label)で、時間帯の暗い背景の上に薄い字が乗るだけだった。
+   * 数の窓にすると、widget の背景と明るい字で描かれ、そのうえ**打ち込んで段数を決められる**。
+   * 読む値は「実際に見えている段数」(strip が居る段は数より下げられない)。 */
+  PointerRNA scene_ptr = RNA_id_pointer_create(&context->scene->id);
+  const int num_width = max_ii(int(UI_UNIT_X * 2.6f), int(U.widget_unit * 2.6f));
+  /* ★空の文字列 = 名前を描かず**数字だけ**。`std::nullopt` にすると RNA の名前
+   * ("Channels")が描かれ、この幅では「C」だけ出て数字が押し出される
+   * (2026-09-21 作者「表記が C のまま」)。 */
+  uiDefButR(block,
+            ui::ButtonType::Num,
+            "",
+            x,
+            y,
+            num_width,
+            button,
+            &scene_ptr,
+            "falcon_vse_channels",
+            0,
+            0,
+            0,
+            TIP_("Channels in the timeline"));
+  x += num_width + int(U.widget_unit * 0.3f);
+
+  /* ★2026-09-21 作者「上下入れ替えをここに置いて」= 段数のすぐ隣。
+   * ツールバーに出していた物はここへ移し、ツールバーの札は取り下げた。
+   * 絵は今の向きを表す(1 が上なら昇り・1 が下なら降り)。 */
+  const bool flip_now = seq::channel_flip_enabled();
+  uiDefIconButR(block,
+                ui::ButtonType::Toggle,
+                flip_now ? ICON_SORT_ASC : ICON_SORT_DESC,
+                x,
+                y,
+                button,
+                button,
+                &scene_ptr,
+                "falcon_vse_channel_flip",
+                0,
+                0,
+                0,
+                TIP_("Put channel 1 at the top and count downward"));
 
   block_end(context->C, block);
   block_draw(context->C, block);

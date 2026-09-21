@@ -6,6 +6,7 @@
  * \ingroup spseq
  */
 
+#include <algorithm>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
@@ -437,7 +438,10 @@ static void sequencer_file_drop_channel_frame_set(bContext *C,
 
   float frame_start, channel;
   ui::view2d_region_to_view(&region->v2d, event->mval[0], event->mval[1], &frame_start, &channel);
-  RNA_int_set(op->ptr, "channel", seq::y_to_channel(channel));
+  /* ★段の外に出た位置でも、必ず [1, MAX_CHANNELS] に収める(2026-09-21)。
+   * 反転では画面の外れが 128 段目を指すので、丸めないと行方不明の素材ができる。 */
+  RNA_int_set(
+      op->ptr, "channel", std::clamp(seq::y_to_channel(channel), 1, seq::MAX_CHANNELS));
   RNA_int_set(op->ptr, "frame_start", int(frame_start));
 }
 
@@ -667,7 +671,7 @@ static bool load_data_init_from_operator(seq::LoadData *load_data, bContext *C, 
         &region->v2d, mouse_region.x, mouse_region.y, &mouse_view.x, &mouse_view.y);
 
     load_data->start_frame = std::trunc(mouse_view.x);
-    load_data->channel = seq::y_to_channel(mouse_view.y);
+    load_data->channel = std::clamp(seq::y_to_channel(mouse_view.y), 1, seq::MAX_CHANNELS);
   }
   return true;
 }

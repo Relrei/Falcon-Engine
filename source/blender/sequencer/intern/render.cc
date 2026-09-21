@@ -17,6 +17,7 @@
 #include "DNA_world_types.h"
 
 #include "BLI_listbase.h"
+#include "BLI_time.h"
 #include "BLI_math_geom.h"
 #include "BLI_math_matrix.hh"
 #include "BLI_path_utils.hh"
@@ -61,10 +62,12 @@
 
 #include "SEQ_channels.hh"
 #include "SEQ_effects.hh"
+#include "SEQ_gpu_preview.hh"
 #include "SEQ_iterator.hh"
 #include "SEQ_offscreen.hh"
 #include "SEQ_proxy.hh"
 #include "SEQ_relations.hh"
+#include "SEQ_falcon_timing.hh"
 #include "SEQ_render.hh"
 #include "SEQ_sequencer.hh"
 #include "SEQ_time.hh"
@@ -332,7 +335,7 @@ struct OpaqueQuadTracker {
  * - Pre-multiply.
  * \{ */
 
-static bool sequencer_use_transform(const Strip *strip)
+bool sequencer_use_transform(const Strip *strip)
 {
   const StripTransform *transform = strip->data->transform;
 
@@ -345,7 +348,7 @@ static bool sequencer_use_transform(const Strip *strip)
   return false;
 }
 
-static bool sequencer_use_crop(const Strip *strip)
+bool sequencer_use_crop(const Strip *strip)
 {
   const StripCrop *crop = strip->data->crop;
   if (crop->left > 0 || crop->right > 0 || crop->top > 0 || crop->bottom > 0) {
@@ -392,7 +395,7 @@ static bool seq_input_have_to_preprocess(const Strip *strip)
  * Other strip types are rendered with original media resolution, unless proxies are
  * enabled for them. With proxies `is_proxy_image` will be set correctly to true.
  */
-static bool seq_need_scale_to_render_size(const Strip *strip, bool is_proxy_image)
+bool seq_need_scale_to_render_size(const Strip *strip, bool is_proxy_image)
 {
   if (is_proxy_image) {
     return false;
@@ -421,7 +424,7 @@ static bool seq_need_scale_to_render_size(const Strip *strip, bool is_proxy_imag
  * After scaling down strips, we need to adjust the strip's translation, which refers to full
  * render resolution pixels; we do this with `preview_scale_factor`.
  */
-static float3x3 calc_strip_transform_matrix(const Scene *scene,
+float3x3 calc_strip_transform_matrix(const Scene *scene,
                                             const Strip *strip,
                                             const int2 in_size,
                                             const int2 out_size,
@@ -559,7 +562,10 @@ static void sequencer_preprocess_transform_crop(ImBuf *in,
       break;
   }
 
-  IMB_transform(in, out, IMB_TRANSFORM_MODE_CROP_SRC, filter, matrix, &source_crop);
+  {
+    timing::Scope timer(timing::Stage::Transform, context->is_prefetch_render);
+    IMB_transform(in, out, IMB_TRANSFORM_MODE_CROP_SRC, filter, matrix, &source_crop);
+  }
 
   if (is_strip_covering_screen(context, strip)) {
     out->color_mode = in->color_mode;
@@ -640,6 +646,7 @@ static SeqResult input_preprocess(const RenderData *context,
                                   const bool is_proxy_image)
 {
   PRF_scope_with_name("SeqPreprocess", ProfileCategory::Draw);
+  timing::Scope timer(timing::Stage::Preprocess, context->is_prefetch_render);
 
   BLI_assert(input.is_valid());
 
@@ -1434,6 +1441,7 @@ static ImBuf *seq_render_image_strip(const RenderData *context,
                                      int timeline_frame,
                                      bool *r_is_proxy_image)
 {
+  timing::Scope timer(timing::Stage::Decode, context->is_prefetch_render);
   PRF_scope_with_name("SeqRenderImage", ProfileCategory::Draw);
 
   /* Speculative background read-ahead for the next BL_VSE_PREFETCH_N
@@ -1581,6 +1589,7 @@ static ImBuf *seq_render_movie_strip(const RenderData *context,
                                      float timeline_frame,
                                      bool *r_is_proxy_image)
 {
+  timing::Scope timer(timing::Stage::Decode, context->is_prefetch_render);
   PRF_scope_with_name("SeqRenderMovie", ProfileCategory::Draw);
 
   /* Load all the videos. */
@@ -2212,6 +2221,61 @@ static SeqResult do_render_strip_uncached(const RenderData *context,
   return out;
 }
 
+/* 素材だけを返す(変形・重ねはしない)。GPU プレビュー経路が使う。
+ * 通常の経路の `seq_render_strip()` の前半とまったく同じ順で当たりを見る:
+ * ①プロキシを使わない時だけ素材キャッシュ ②無ければ復号。
+ * 素材キャッシュへの格納も通常の経路(`seq_render_preprocess_ibuf`)と同じ条件で行う。 */
+/* ★GPU プレビュー経路のための追い出しの入口。
+ *
+ * 通常の経路では `render_give_ibuf()` が 1 コマごとに `evict_caches_if_full()` を通るが、
+ * GPU 経路は画面を描く側で素材を作るので**そこを通らない**。先読みの側は通っているので
+ * 上限そのものは守られるが、先読みが止まっている間(場面の端・一時停止・条件を外した配置)は
+ * 画面側の格納だけが進む。通常の経路と同じ形にそろえておく。
+ *
+ * ★2026-09-20 の注記: これを入れた発端は「再生で RSS 20GB」だったが、**それは漏れではなかった**。
+ * 作者の設定が `memcachelimit = 16384MB` で、16GB + 実行の分でその値になっていただけ
+ * (工場出荷の既定はこの建てでは RAM/8 = 3989MB)。取り違えないこと。 */
+void seq_render_evict_caches_if_full(const RenderData *context)
+{
+  Scene *orig_scene = prefetch_get_original_scene(context);
+  if (orig_scene == nullptr || orig_scene->ed == nullptr) {
+    return;
+  }
+  std::scoped_lock lock(seq_render_mutex);
+  timing::Scope timer(timing::Stage::Evict, context->is_prefetch_render);
+  evict_caches_if_full(orig_scene);
+}
+
+SeqResult seq_render_strip_source_only(const RenderData *context,
+                                       SeqRenderState *state,
+                                       Strip *strip,
+                                       float timeline_frame,
+                                       bool *r_is_proxy_image)
+{
+  bool is_proxy_image = false;
+  SeqResult res;
+
+  if (!can_use_proxy(context, strip, rendersize_to_proxysize(context->preview_render_size))) {
+    res = source_image_cache_get(context, strip, timeline_frame);
+  }
+
+  if (!res.is_valid()) {
+    res = do_render_strip_uncached(context, state, strip, timeline_frame, &is_proxy_image);
+
+    const bool is_effect_with_inputs = strip->is_effect_with_inputs() ||
+                                       strip->type == STRIP_TYPE_ADJUSTMENT;
+    if (res.is_valid() && !is_proxy_image && !is_effect_with_inputs) {
+      Scene *orig_scene = prefetch_get_original_scene(context);
+      if (orig_scene->ed->cache_flag & SEQ_CACHE_STORE_RAW) {
+        source_image_cache_put(context, strip, timeline_frame, res);
+      }
+    }
+  }
+
+  *r_is_proxy_image = is_proxy_image;
+  return res;
+}
+
 SeqResult seq_render_strip(const RenderData *context,
                            SeqRenderState *state,
                            Strip *strip,
@@ -2283,6 +2347,10 @@ static SeqResult seq_render_strip_stack_apply_effect(const RenderData *context,
                                                      const SeqResult &src1,
                                                      const SeqResult &src2)
 {
+  /* ★ここが「重ね」の唯一の入口。Alpha Over も Cross も Add も通る
+   * (`effects/effect_blend.cc` は screen / lighten などの一群だけなので、
+   *  そちらに計器を置くと既定の Alpha Over が数えられない)。 */
+  timing::Scope timer(timing::Stage::Blend, context->is_prefetch_render);
   EffectHandle sh = strip_blend_mode_handle_get(strip);
   BLI_assert(sh.execute != nullptr);
   float fac = strip->blend_opacity / 100.0f;
@@ -2450,6 +2518,8 @@ static SeqResult seq_render_strip_stack(const RenderData *context,
 
 ImBuf *render_give_ibuf(const RenderData *context, float timeline_frame, int chanshown)
 {
+  /* 1 コマの壁時計。工程ごとの合計(並列込み)は `timing::Scope` が別に積む。 */
+  const double timing_start = timing::enabled() ? BLI_time_now_seconds() : 0.0;
   Scene *scene = context->scene;
   Editing *ed = editing_get(scene);
   ListBaseT<Strip> *seqbasep;
@@ -2499,11 +2569,43 @@ ImBuf *render_give_ibuf(const RenderData *context, float timeline_frame, int cha
   SeqRenderState state;
   state.is_current_frame = timeline_frame == BKE_scene_frame_get(scene);
 
+  /* ★GPU プレビュー経路(`FALCON_VSE_GPU_PREVIEW`)が通っている間、先読みは**素材の復号だけ**をする。
+   * 変形と重ねは画面を描く時に GPU でやるので、ここで CPU でも作ると同じ仕事を 2 回することになる。
+   * 直近のプレビューで実際に GPU 経路が通った時だけ(`gpu_preview_is_active()`)切り替える —
+   * 通らない配置で先読みを止めると、描く側が毎コマ合成することになって逆に遅くなる。 */
+  if (context->is_prefetch_render && gpu_preview_enabled() && gpu_preview_is_active() &&
+      !strips.is_empty() && !out)
+  {
+    std::scoped_lock lock(seq_render_mutex);
+    {
+      timing::Scope timer(timing::Stage::Evict, true);
+      evict_caches_if_full(orig_scene);
+    }
+    /* ★段 2b: できればここで合成まで済ませて、仕上がりを輪へ預ける。
+     * 画面を描く側は「描くだけ」になる = 主スレッドに仕事を積まない。
+     * 作れなかった時(副 GPU 文脈が無い・輪が先まで埋まっている)は素材の復号だけをする。 */
+    if (!gpu_preview_produce(context, timeline_frame, chanshown)) {
+      for (Strip *strip : strips) {
+        bool is_proxy_image = false;
+        SeqResult res = seq_render_strip_source_only(
+            context, &state, strip, timeline_frame, &is_proxy_image);
+        IMB_freeImBuf(res.image);
+      }
+    }
+    if (timing_start != 0.0) {
+      timing::frame_done(int(timeline_frame), BLI_time_now_seconds() - timing_start, true);
+    }
+    return nullptr;
+  }
+
   if (!strips.is_empty() && !out) {
     std::scoped_lock lock(seq_render_mutex);
     /* Try to make space before we add any new frames to the cache if it is full.
      * If we do this after we have added the new cache, we risk removing what we just added. */
-    evict_caches_if_full(orig_scene);
+    {
+      timing::Scope timer(timing::Stage::Evict, context->is_prefetch_render);
+      evict_caches_if_full(orig_scene);
+    }
 
     out = seq_render_strip_stack(context, &state, channels, seqbasep, timeline_frame, chanshown)
               .image;
@@ -2520,6 +2622,12 @@ ImBuf *render_give_ibuf(const RenderData *context, float timeline_frame, int cha
   }
 
   seq_prefetch_start(context, timeline_frame);
+
+  if (timing_start != 0.0) {
+    timing::frame_done(int(timeline_frame),
+                       BLI_time_now_seconds() - timing_start,
+                       context->is_prefetch_render);
+  }
 
   return out;
 }

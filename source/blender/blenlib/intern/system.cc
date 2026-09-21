@@ -18,6 +18,7 @@
 #include "BLI_mutex.hh"
 #include "BLI_string.h"
 #include "BLI_system.h"
+#include "BLI_utildefines.h"
 
 /* for backtrace and gethostname/GetComputerName */
 #if defined(WIN32)
@@ -222,6 +223,123 @@ int BLI_system_memory_max_in_megabytes_int()
   return int(min_zz(limit_megabytes, size_t(INT_MAX)));
 }
 
+
+#if defined(__linux__)
+/**
+ * cgroup v2 で掛かっているメモリの上限と、その枠で今使っている量。取れなければ 0 を返す。
+ *
+ * ★なぜ要るか: `/proc/meminfo` は**機械全体**の数字で、容器(Flatpak / Docker / podman)や
+ * `systemd-run -p MemoryMax=...` の中では嘘になる。枠が 2GB でも機械に 20GB 空いていれば
+ * 「まだ 20GB ある」と読んでしまい、キャッシュを太らせたまま枠の外に出て殺される。
+ * メモリの少ない機械ほど容器で動かす人が多いので、ここは両方を見て小さい方を採る。
+ * `FALCON_MEM_CGROUP=0` で従来どおり(機械全体だけを見る)。
+ */
+static bool blender_cgroup_memory_enabled()
+{
+  static const bool enabled = []() {
+    const char *env = getenv("FALCON_MEM_CGROUP");
+    return (env == nullptr) ? true : atoi(env) != 0;
+  }();
+  return enabled;
+}
+
+static bool blender_cgroup_read_value(const char *relative_path, const char *name, size_t *r_value)
+{
+  char path[1024];
+  SNPRINTF(path, "/sys/fs/cgroup%s/%s", relative_path, name);
+  FILE *f = fopen(path, "r");
+  if (f == nullptr) {
+    return false;
+  }
+  char buf[64] = {0};
+  const bool read_ok = fgets(buf, sizeof(buf), f) != nullptr;
+  fclose(f);
+  if (!read_ok || STRPREFIX(buf, "max")) {
+    /* "max" = 上限なし。「0」ではないので区別する。 */
+    return false;
+  }
+  unsigned long long value = 0;
+  if (sscanf(buf, "%llu", &value) != 1) {
+    return false;
+  }
+  *r_value = size_t(value);
+  return true;
+}
+
+/** この処理が属する cgroup v2 の相対パス(`/proc/self/cgroup` の `0::` の行)。
+ * 処理の一生の間変わらないので 1 回だけ読む(再生中は 100ms に 1 回ここを通り、
+ * 先読みの糸からも呼ばれるので、初期化が 1 回で済む形にしてある)。 */
+struct BlenderCGroupPath {
+  bool ok = false;
+  char path[1024] = {0};
+};
+
+static const BlenderCGroupPath &blender_cgroup_path()
+{
+  static const BlenderCGroupPath cached = []() {
+    BlenderCGroupPath result;
+    FILE *f = fopen("/proc/self/cgroup", "r");
+    if (f == nullptr) {
+      return result;
+    }
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+      if (STRPREFIX(line, "0::")) {
+        char *start = line + 3;
+        char *end = strchr(start, '\n');
+        if (end != nullptr) {
+          *end = '\0';
+        }
+        BLI_strncpy(result.path, STREQ(start, "/") ? "" : start, sizeof(result.path));
+        result.ok = true;
+        break;
+      }
+    }
+    fclose(f);
+    return result;
+  }();
+  return cached;
+}
+
+/** 枠の残り(上限 - 使用中)。枠が無い・読めない時は 0。 */
+static size_t blender_cgroup_memory_available()
+{
+  if (!blender_cgroup_memory_enabled()) {
+    return 0;
+  }
+  const BlenderCGroupPath &cg = blender_cgroup_path();
+  if (!cg.ok) {
+    return 0;
+  }
+  size_t limit = 0;
+  if (!blender_cgroup_read_value(cg.path, "memory.max", &limit) || limit == 0) {
+    return 0;
+  }
+  size_t current = 0;
+  if (!blender_cgroup_read_value(cg.path, "memory.current", &current)) {
+    return limit;
+  }
+  return (current >= limit) ? 0 : limit - current;
+}
+
+/** 枠の大きさそのもの(上限)。枠が無い・読めない時は 0。 */
+static size_t blender_cgroup_memory_limit()
+{
+  if (!blender_cgroup_memory_enabled()) {
+    return 0;
+  }
+  const BlenderCGroupPath &cg = blender_cgroup_path();
+  if (!cg.ok) {
+    return 0;
+  }
+  size_t limit = 0;
+  if (!blender_cgroup_read_value(cg.path, "memory.max", &limit)) {
+    return 0;
+  }
+  return limit;
+}
+#endif /* __linux__ */
+
 size_t BLI_system_memory_available_in_bytes()
 {
 #if defined(WIN32)
@@ -249,9 +367,50 @@ size_t BLI_system_memory_available_in_bytes()
     }
   }
   fclose(f);
+  /* 容器や systemd の枠の中では、機械全体の空きより枠の残りの方が小さい。小さい方を採る。 */
+  const size_t cgroup_bytes = blender_cgroup_memory_available();
+  if (cgroup_bytes != 0 && (bytes == 0 || cgroup_bytes < bytes)) {
+    bytes = cgroup_bytes;
+  }
   return bytes;
 #else
   /* Unknown: callers must not read this as "no memory available". */
+  return 0;
+#endif
+}
+
+size_t BLI_system_memory_total_in_bytes()
+{
+#if defined(WIN32)
+  MEMORYSTATUSEX status;
+  status.dwLength = sizeof(status);
+  if (!GlobalMemoryStatusEx(&status)) {
+    return 0;
+  }
+  return size_t(status.ullTotalPhys);
+#elif defined(__linux__)
+  FILE *f = fopen("/proc/meminfo", "r");
+  if (f == nullptr) {
+    return 0;
+  }
+  char line[256];
+  size_t bytes = 0;
+  while (fgets(line, sizeof(line), f)) {
+    unsigned long long kb = 0;
+    if (sscanf(line, "MemTotal: %llu kB", &kb) == 1) {
+      bytes = size_t(kb) * 1024;
+      break;
+    }
+  }
+  fclose(f);
+  /* 枠の中では、機械の RAM でなく枠の大きさがその機械の「全部」。 */
+  const size_t cgroup_bytes = blender_cgroup_memory_limit();
+  if (cgroup_bytes != 0 && (bytes == 0 || cgroup_bytes < bytes)) {
+    bytes = cgroup_bytes;
+  }
+  return bytes;
+#else
+  /* Unknown: callers must not read this as "no memory". */
   return 0;
 #endif
 }

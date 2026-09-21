@@ -11,6 +11,7 @@
 
 #include "GPU_texture.hh"
 
+#include "SEQ_gpu_preview.hh"
 #include "SEQ_preview_cache.hh"
 #include "SEQ_sequencer.hh"
 
@@ -213,6 +214,8 @@ void preview_cache_invalidate(Scene *scene)
   if (cache != nullptr) {
     cache->clear();
   }
+  /* GPU 経路で先読みが作っておいた 1 枚も一緒に捨てる(同じ理由で古くなっているため)。 */
+  gpu_preview_ring_clear();
 }
 
 void preview_cache_destroy(Scene *scene)
@@ -221,6 +224,7 @@ void preview_cache_destroy(Scene *scene)
   if (cache != nullptr) {
     MEM_SAFE_DELETE(scene->ed->runtime->preview_cache);
   }
+  gpu_preview_ring_clear();
 }
 
 }  // namespace blender::seq

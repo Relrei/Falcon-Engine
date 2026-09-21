@@ -791,6 +791,9 @@ static const EnumPropertyItem eevee_resolution_scale_items[] = {
 #  include "DEG_depsgraph_query.hh"
 
 #  include "SEQ_iterator.hh"
+#  include "SEQ_gpu_preview.hh"
+#  include "SEQ_time.hh"
+#  include "SEQ_transform.hh"
 #  include "SEQ_relations.hh"
 #  include "SEQ_sequencer.hh"
 #  include "SEQ_sound.hh"
@@ -2630,6 +2633,74 @@ static void rna_SceneCamera_update(Main * /*bmain*/, Scene * /*scene*/, PointerR
 static void rna_SceneSequencer_update(Main * /*bmain*/, Scene * /*scene*/, PointerRNA *ptr)
 {
   seq::cache_cleanup(id_cast<Scene *>(ptr->owner_id), seq::CacheCleanup::FinalAndIntra);
+}
+
+/* Falcon (2026-09-21): the up/down flip of the channel rows. The value itself lives on the scene
+ * as a system property (see `channel_flip_store`), so this is a computed property with no DNA
+ * field. Read/written through the sequencer so the timeline's runtime copy stays in step. */
+static bool rna_Scene_falcon_vse_channel_flip_get(PointerRNA * /*ptr*/)
+{
+  return seq::channel_flip_enabled();
+}
+
+static void rna_Scene_falcon_vse_channel_flip_set(PointerRNA *ptr, const bool value)
+{
+  seq::channel_flip_store(id_cast<Scene *>(ptr->owner_id), value);
+}
+
+/* Falcon (2026-09-21): the channel count shown in the timeline's band. Read back as what is
+ * actually shown (strips above the count keep their rows), written as the count itself — the
+ * same pair the "+"/"-" buttons use. The band draws this as a number field instead of a label,
+ * because a label on the scrub band was hard to read (作者 9-21「番号が見ずらい」). */
+static int rna_Scene_falcon_vse_channels_get(PointerRNA *ptr)
+{
+  const Scene *scene = id_cast<Scene *>(ptr->owner_id);
+  const Editing *ed = seq::editing_get(scene);
+  const ListBaseT<Strip> *seqbase = ed ? seq::active_seqbase_get(ed) : nullptr;
+  return seq::falcon_timeline_channels_shown(scene, seqbase);
+}
+
+static void rna_Scene_falcon_vse_channels_set(PointerRNA *ptr, const int value)
+{
+  seq::falcon_timeline_channels_set(id_cast<Scene *>(ptr->owner_id), value);
+}
+
+/* Falcon (2026-09-21): 再生を GPU に回すか。値は場面に持つ(system property)。 */
+static bool rna_Scene_falcon_vse_gpu_preview_get(PointerRNA * /*ptr*/)
+{
+  return seq::gpu_preview_enabled();
+}
+
+static void rna_Scene_falcon_vse_gpu_preview_set(PointerRNA *ptr, const bool value)
+{
+  seq::gpu_preview_store(id_cast<Scene *>(ptr->owner_id), value);
+}
+
+static int rna_Scene_falcon_vse_cpu_kernel_get(PointerRNA * /*ptr*/)
+{
+  return seq::falcon_cpu_kernel_get();
+}
+
+static void rna_Scene_falcon_vse_cpu_kernel_set(PointerRNA *ptr, const int value)
+{
+  seq::falcon_cpu_kernel_store(id_cast<Scene *>(ptr->owner_id), value);
+}
+
+static bool rna_Scene_falcon_cpu_has_avx2_get(PointerRNA * /*ptr*/)
+{
+  return seq::falcon_cpu_has_avx2();
+}
+
+/* この実行ファイルが VSE の色補正をどの段で建てたか(建てる時に決まる・実行時には変わらない)。
+ * 作者 2026-09-21「拡張命令は入ってる?」に、画面の上で答えられるようにするための読み取り専用。 */
+static void rna_Scene_falcon_cpu_simd_tier_get(PointerRNA * /*ptr*/, char *value)
+{
+  strcpy(value, seq::falcon_simd_tier());
+}
+
+static int rna_Scene_falcon_cpu_simd_tier_length(PointerRNA * /*ptr*/)
+{
+  return int(strlen(seq::falcon_simd_tier()));
 }
 
 static std::optional<std::string> rna_ToolSettings_path(const PointerRNA * /*ptr*/)
@@ -9202,6 +9273,74 @@ void RNA_def_scene(BlenderRNA *brna)
       600);
 
   /* Sequencer */
+  /* ★2026-09-21 作者「空いてる余白に…上下反転のボタンが欲しい」= ツールバーの札から
+   * その場で切り替えられるように。場面に保存されるので、次に開いた時も同じ向き。 */
+  prop = RNA_def_property(srna, "falcon_vse_channel_flip", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_funcs(prop,
+                                 "rna_Scene_falcon_vse_channel_flip_get",
+                                 "rna_Scene_falcon_vse_channel_flip_set");
+  RNA_def_property_ui_text(prop,
+                           "Channel 1 on Top",
+                           "Stack the video sequencer's channels downward, with channel 1 at the "
+                           "top, instead of upward from the bottom");
+  RNA_def_property_update(prop, NC_SCENE | ND_SEQUENCER, nullptr);
+
+  prop = RNA_def_property(srna, "falcon_vse_channels", PROP_INT, PROP_UNSIGNED);
+  RNA_def_property_int_funcs(
+      prop, "rna_Scene_falcon_vse_channels_get", "rna_Scene_falcon_vse_channels_set", nullptr);
+  /* 128 = `blender::seq::MAX_CHANNELS`. Written out because the sequencer headers are only
+   * included inside `RNA_RUNTIME`, and this part is compiled without them. */
+  RNA_def_property_range(prop, 1, 128);
+  RNA_def_property_ui_range(prop, 1, 128, 1, 0);
+  RNA_def_property_ui_text(prop,
+                           "Channels",
+                           "Channels the video sequencer's timeline shows. Channels holding "
+                           "strips are always shown, whatever this is set to");
+  RNA_def_property_update(prop, NC_SCENE | ND_SEQUENCER, nullptr);
+
+  prop = RNA_def_property(srna, "falcon_vse_gpu_preview", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_funcs(prop,
+                                 "rna_Scene_falcon_vse_gpu_preview_get",
+                                 "rna_Scene_falcon_vse_gpu_preview_set");
+  RNA_def_property_ui_text(prop,
+                           "GPU Playback",
+                           "Composite the video sequencer's playback on the GPU and keep it "
+                           "there, instead of building each frame on the CPU");
+  RNA_def_property_update(prop, NC_SCENE | ND_SEQUENCER, nullptr);
+
+  static const EnumPropertyItem falcon_cpu_kernel_items[] = {
+      {0, "AUTO", 0, "Automatic", "Let the build decide (portable today)"},
+      {1, "PORTABLE", 0, "Portable", "The kernel that runs on any supported CPU"},
+      {2, "AVX2", 0, "AVX2", "Use the AVX2 kernel when this CPU has AVX2"},
+      {3, "REFERENCE", 0, "Reference", "The plain, slow kernel. For checking results"},
+      {0, nullptr, 0, nullptr, nullptr},
+  };
+  prop = RNA_def_property(srna, "falcon_vse_cpu_kernel", PROP_ENUM, PROP_NONE);
+  RNA_def_property_enum_items(prop, falcon_cpu_kernel_items);
+  RNA_def_property_enum_funcs(
+      prop, "rna_Scene_falcon_vse_cpu_kernel_get", "rna_Scene_falcon_vse_cpu_kernel_set", nullptr);
+  RNA_def_property_ui_text(prop,
+                           "CPU Kernel",
+                           "Which CPU kernel the video sequencer's color tools use. Picking AVX2 "
+                           "on a CPU without it falls back instead of failing");
+  RNA_def_property_update(prop, NC_SCENE | ND_SEQUENCER, nullptr);
+
+  prop = RNA_def_property(srna, "falcon_cpu_has_avx2", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_boolean_funcs(prop, "rna_Scene_falcon_cpu_has_avx2_get", nullptr);
+  RNA_def_property_clear_flag(prop, PROP_EDITABLE);
+  RNA_def_property_ui_text(prop, "CPU Has AVX2", "Whether this machine's CPU supports AVX2");
+
+  prop = RNA_def_property(srna, "falcon_cpu_simd_tier", PROP_STRING, PROP_NONE);
+  RNA_def_property_string_funcs(prop,
+                                "rna_Scene_falcon_cpu_simd_tier_get",
+                                "rna_Scene_falcon_cpu_simd_tier_length",
+                                nullptr);
+  RNA_def_property_clear_flag(prop, PROP_EDITABLE);
+  RNA_def_property_ui_text(prop,
+                           "CPU Instructions",
+                           "Which instruction set this build's video sequencer color tools were "
+                           "compiled for. Fixed when the program is built");
+
   prop = RNA_def_property(srna, "sequence_editor", PROP_POINTER, PROP_NONE);
   RNA_def_property_pointer_sdna(prop, nullptr, "ed");
   RNA_def_property_struct_type(prop, "SequenceEditor");

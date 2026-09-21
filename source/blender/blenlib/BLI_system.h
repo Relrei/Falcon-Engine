@@ -55,6 +55,14 @@ int BLI_system_memory_max_in_megabytes_int();
 size_t BLI_system_memory_available_in_bytes();
 
 /**
+ * Physical memory this machine has in total, in bytes; 0 when unknown.
+ *
+ * Inside a container or a systemd unit with a memory limit, this reports that limit instead of
+ * the host's RAM: for deciding how big a cache may be, the limit *is* the machine's size.
+ */
+size_t BLI_system_memory_total_in_bytes();
+
+/**
  * Ensure the process can open many files simultaneously.
  * This should be called once on application startup, as it is not thread safe.
  */

@@ -72,9 +72,6 @@ waveletNoiseTile.bin
 /release/datafiles/assets/
 /tests/data/
 /lib/macos_x64/
-# ★この機械だけの symlink(→ Blender-5.2.C2-dlss/lib/linux_x64)。
-#   絶対パスなので index に入れると別の機械で必ず壊れる。
-/lib/linux_x64
 
 # Build files for VS and VS Code.
 /build/

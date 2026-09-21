@@ -9,6 +9,7 @@
  * and functions for writing *partial* files (only selected data-blocks).
  */
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <optional>
@@ -1577,6 +1578,31 @@ UserDef *BKE_blendfile_userdef_from_defaults()
 
   userdef->memcachelimit = min_ii(BLI_system_memory_max_in_megabytes_int() / 2,
                                   userdef->memcachelimit);
+
+  /* ★出荷時の既定(4096 MB)は機械の大きさを見ていない。8 GB の機械ではその半分を
+   * 1 系統が名乗ることになり、しかも同じ数字が ImBuf のキャッシュと汎用メモリキャッシュにも
+   * そのまま渡る(`wm_files.cc` の `MEM_CacheLimiter_set_maximum()` と
+   * `memory_cache::set_approximate_size_limit()`)。メモリの少ない機械では、これだけで
+   * 編集中にスワップへ落ちる。ここでは**機械の RAM の 1/8**(下限 512 MB・上限は従来の既定)
+   * に丸める。32 GB の機械では 4096 MB のままなので、今までの機械では何も変わらない。
+   * 既に保存された設定はこの道を通らない(出荷時の既定を作る時だけ)。
+   * `FALCON_VSE_CACHE_DEFAULT_MB` で明示指定できる。 */
+  {
+    const char *env = getenv("FALCON_VSE_CACHE_DEFAULT_MB");
+    if (env != nullptr) {
+      const int mb = atoi(env);
+      if (mb > 0) {
+        userdef->memcachelimit = mb;
+      }
+    }
+    else {
+      const size_t total_bytes = BLI_system_memory_total_in_bytes();
+      if (total_bytes != 0) {
+        const int scaled_mb = int(total_bytes / (1024 * 1024) / 8);
+        userdef->memcachelimit = std::max(512, std::min(userdef->memcachelimit, scaled_mb));
+      }
+    }
+  }
 
   /* Init weight paint range. */
   BKE_colorband_init(&userdef->coba_weight, true);

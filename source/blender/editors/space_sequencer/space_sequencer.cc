@@ -474,56 +474,61 @@ static bool flip_view_fix_enabled()
 
 /**
  * FALCON: チャンネルを上下反転させると、チャンネル 1 は一番大きい Y (128〜129) に座る。
- * ところがファイルに保存されている `v2d.cur` は反転前の座標 (Y≈1〜9) なので、
- * `File > New > Video Editing` を開いた直後にチャンネル 1 が画面の外に出る。
- * 領域を**初めて描く時に限り**、`cur` を既定の範囲 (`timeline_init_boundbox`) の
- * 上端へ平行移動する。
+ * ところがファイルや新規作成が持っている `v2d.cur` は反転前の座標 (Y≒1〜9) なので、
+ * **画面に段が 1 本も映らない**。そのまま動画を落とすと、その Y が指す段 (121〜129) に
+ * 置かれるので「どこへ行ったか分からない」ことになる。
  *
- * ★寄せるのは `cur` が**反転前の座標**に見える時だけ。反転後に作者がスクロールして
- * 保存した位置(= 反転後の座標)は、開き直しても動かさない。以前は無条件に寄せていたので、
- * 「チャンネル 10〜20 を見て保存 → 開くとチャンネル 1 に戻る」= 保存したスクロール位置を
- * 毎回捨てていた。
+ * ★2026-09-21 実測: 開いた直後の view は
+ * Y 0.05〜8.16 で、段 1 は region_y=11458 = 画面の外。Home (view_all) を押すと直る
+ * = 「描画と段の計算は正しく、**最初のビューの位置だけ**が反転前のまま」。
+ *
+ * ★以前は「一度だけ・`cur.ymax` が下半分なら寄せる」という形だったが、
+ * **一度きりの旗が、v2d がまだ整う前の描画で消費される**ことがあり、その時は永久に直らなかった。
+ * いまは条件で判定する: **時間軸が使っている Y の範囲と 1 ミリも重なっていない時だけ**寄せる
+ * (= 画面に段が 1 本も映っていない時だけ)。利用者がスクロールして見ている位置は必ず重なるので
+ * 触らない。毎回の描画で確かめるので、どの順で初期化されても最後には直る。
+ *
+ * 戻す口: `FALCON_VSE_FLIP_VIEW_FIX=0` で従来どおり `v2d.cur` をそのまま使う。
  */
 static void sequencer_main_region_flip_view_init(const bContext *C, ARegion *region)
 {
-  if (!seq::channel_flip_enabled() || !flip_view_fix_enabled()) {
+  if (!flip_view_fix_enabled()) {
     return;
   }
   SpaceSeq *sseq = CTX_wm_space_seq(C);
-  if (sseq == nullptr || sseq->runtime == nullptr || sseq->runtime->timeline_view_y_init_done) {
+  Scene *scene = CTX_data_sequencer_scene(C);
+  if (sseq == nullptr || sseq->runtime == nullptr || scene == nullptr) {
     return;
+  }
+  View2D *v2d = &region->v2d;
+
+  /* 時間軸が実際に使っている Y の範囲(段の本数 + strip で広がったぶん)。 */
+  rctf box;
+  seq::timeline_init_boundbox(scene, &box);
+  if (Editing *ed = seq::editing_get(scene)) {
+    seq::timeline_expand_boundbox(scene, ed->current_strips(), &box);
+  }
+
+  /* ★少しでも重なっていれば、作者が見ている場所なので触らない。
+   * 1 ミリも重なっていない時だけ = 画面に段が 1 本も映っていない時だけ寄せる。 */
+  if (v2d->cur.ymin < box.ymax && v2d->cur.ymax > box.ymin) {
+    sseq->runtime->timeline_view_y_init_done = true;
+    return;
+  }
+
+  const float range = BLI_rctf_size_y(&v2d->cur);
+  if (seq::channel_flip_enabled()) {
+    /* 反転ではチャンネル 1 がいちばん大きい Y。上端を合わせる。 */
+    v2d->cur.ymax = box.ymax;
+    v2d->cur.ymin = box.ymax - range;
+  }
+  else {
+    v2d->cur.ymin = box.ymin;
+    v2d->cur.ymax = box.ymin + range;
   }
   sseq->runtime->timeline_view_y_init_done = true;
-
-  View2D *v2d = &region->v2d;
-  /* 反転後は、ふだん使うチャンネル (1〜64) が Y の**上半分** (65〜129) に座る
-   * (`channel_to_y(c) == MAX_CHANNELS + 1 - c`)。したがって `cur.ymax` が下半分に居る =
-   * その Y はチャンネル 65 以上を指している = 反転前の座標 (チャンネル == Y) がそのまま
-   * 保存されている、と読める。上半分に居るなら反転後の座標なので、作者が選んだ位置として
-   * そのままにする。
-   * ⚠ 引き換えに外れる 2 つ (どちらもチャンネル 65 以上を見ている場合で、Home で戻せる):
-   * 反転前の座標でチャンネル 65 以上を見て保存したファイルは寄せない / 反転後にチャンネル
-   * 65 以上を見て保存した位置は寄せてしまう。 */
-  if (v2d->cur.ymax >= seq::channel_to_y(seq::MAX_CHANNELS / 2)) {
-    return;
-  }
-
-  Scene *scene = CTX_data_sequencer_scene(C);
-  if (scene == nullptr) {
-    return;
-  }
-  rctf boundbox;
-  seq::timeline_init_boundbox(scene, &boundbox);
-
-  const float dy = boundbox.ymax - v2d->cur.ymax;
-  if (dy == 0.0f) {
-    return;
-  }
-  v2d->cur.ymin += dy;
-  v2d->cur.ymax += dy;
-  /* チャンネル名の列 (RGN_TYPE_CHANNELS) は自分の v2d で描くので、Y を写して
-   * 描き直しを付ける。これが無いと帯だけが反転前の位置に残る。 */
-  ui::view2d_sync(nullptr, CTX_wm_area(C), v2d, V2D_LOCK_COPY);
+  sseq->runtime->timeline_clamp_custom_range = v2d->cur.ymax;
+  ED_region_tag_redraw(region);
 }
 
 /* Strip editing timeline. */
@@ -602,14 +607,36 @@ static void sequencer_main_clamp_view(const bContext *C, ARegion *region)
   v2d->cur = view_clamped;
 }
 
+/**
+ * 「strip を消しても視点を動かさない」ための覚え書き。いま見えている上端をそのまま覚え、
+ * #sequencer_main_clamp_view が `max_ff(これ, 段の高さ)` を天井に使う。
+ *
+ * ★2026-09-21 作者「何もないのに上にいける問題を直したい・上下入れ替えでも同様に」。
+ * そのまま覚えると**戻れなくなる**: 一度でも段より上に視点が出ると(開いた直後の位置が
+ * ずれていた時期・上下反転を切り替えた直後・128 段目に落ちた素材を消した後)、その高さが
+ * 天井として残り、以後ずっと何も無い所までスクロールできてしまう。上下反転を切り替えると
+ * 段の居場所が Y 1〜10 と Y 119〜129 の間で入れ替わるので、**必ず**この形になる。
+ *
+ * ⇒ 段が実際に使っている高さを超えては覚えない。反転していてもいなくても同じ式で効く。
+ */
 static void sequencer_main_region_clamp_custom_set(const bContext *C, ARegion *region)
 {
   SpaceSeq *sseq = CTX_wm_space_seq(C);
   View2D *v2d = &region->v2d;
 
-  if ((v2d->flag & V2D_IS_NAVIGATING) == 0) {
-    sseq->runtime->timeline_clamp_custom_range = v2d->cur.ymax;
+  if ((v2d->flag & V2D_IS_NAVIGATING) != 0) {
+    return;
   }
+  float ymax = v2d->cur.ymax;
+  if (Scene *scene = CTX_data_sequencer_scene(C)) {
+    rctf box;
+    seq::timeline_init_boundbox(scene, &box);
+    if (Editing *ed = seq::editing_get(scene)) {
+      seq::timeline_expand_boundbox(scene, ed->current_strips(), &box);
+    }
+    ymax = min_ff(ymax, box.ymax);
+  }
+  sseq->runtime->timeline_clamp_custom_range = ymax;
 }
 
 static void sequencer_main_region_layout(const bContext *C, ARegion *region)

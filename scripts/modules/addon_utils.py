@@ -49,6 +49,8 @@ _addons_hidden_core = {
     "falcon_vse_bridge",
     # Falcon Engine: 上の帯の EN / JA と Ctrl+Shift+L で言語を切り替える(既定で有効)。
     "falcon_language",
+    # Falcon Engine: VSE の代役(プロキシ)をボタン 1 つで用意する(既定で有効)。
+    "falcon_vse_proxy",
     "io_anim_bvh",
     "io_curve_svg",
     "io_mesh_uv_layout",

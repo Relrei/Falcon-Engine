@@ -59,6 +59,8 @@
 #include "ED_util.hh"
 #include "ED_view3d.hh"
 
+#include "SEQ_falcon_timing.hh"
+#include "SEQ_gpu_preview.hh"
 #include "SEQ_channels.hh"
 #include "SEQ_effects.hh"
 #include "SEQ_iterator.hh"
@@ -178,6 +180,54 @@ ImBuf *sequencer_ibuf_get(const bContext *C, const int timeline_frame, const cha
   G.is_break = is_break;
 
   return ibuf;
+}
+
+/* GPU プレビュー経路(`FALCON_VSE_GPU_PREVIEW`)。
+ * 通せる配置なら、仕上がりの 1 枚を GPU の上で作ってそのまま返す(CPU の ImBuf は作らない)。
+ * 通せない配置では nullptr を返し、呼び手は今までどおり `sequencer_ibuf_get()` へ落ちる。 */
+static gpu::Texture *sequencer_gpu_preview_get(const bContext *C,
+                                               const int timeline_frame,
+                                               const char *viewname,
+                                               const char **r_colorspace_name,
+                                               bool *r_owned)
+{
+  *r_colorspace_name = nullptr;
+  *r_owned = false;
+  if (!seq::gpu_preview_enabled() || special_preview_get() != nullptr) {
+    return nullptr;
+  }
+
+  Main *bmain = CTX_data_main(C);
+  Depsgraph *depsgraph = CTX_data_expect_evaluated_depsgraph(C);
+  Scene *scene = CTX_data_sequencer_scene(C);
+  SpaceSeq *sseq = CTX_wm_space_seq(C);
+  bScreen *screen = CTX_wm_screen(C);
+
+  const eSpaceSeq_Proxy_RenderSize render_size_mode = eSpaceSeq_Proxy_RenderSize(
+      sseq->render_size);
+  if (render_size_mode == SEQ_RENDER_SIZE_NONE) {
+    return nullptr;
+  }
+
+  const float render_scale = seq::get_render_scale_factor(render_size_mode, scene->r.size);
+  const int rectx = roundf(render_scale * scene->r.xsch);
+  const int recty = roundf(render_scale * scene->r.ysch);
+
+  seq::RenderData context = {nullptr};
+  seq::render_new_render_data(
+      bmain, depsgraph, scene, rectx, recty, render_size_mode, nullptr, &context);
+  context.view_id = BKE_scene_multiview_view_id_get(&scene->r, viewname);
+  context.use_proxies = (sseq->flag & SEQ_USE_PROXIES) != 0;
+  context.is_playing = screen->animtimer != nullptr;
+  context.is_scrubbing = screen->scrubbing;
+
+  const short is_break = G.is_break;
+  G.is_break = false;
+  gpu::Texture *texture = seq::gpu_preview_render(
+      &context, timeline_frame, sseq->chanshown, r_colorspace_name, r_owned);
+  G.is_break = is_break;
+
+  return texture;
 }
 
 static void sequencer_display_size(const RenderData &render_data, float r_viewrect[2])
@@ -1558,6 +1608,8 @@ static int get_reference_frame_offset(const Editing &editing, const RenderData &
 static gpu::Texture *create_texture(const ImBuf &ibuf)
 {
   PRF_scope_with_name("SeqPreviewCreateTexture", ProfileCategory::Draw);
+  /* 仕上がりの 1 枚を GPU へ送る時間(FHD の float なら 1 枚 32MB)。 */
+  blender::seq::timing::Scope timer(blender::seq::timing::Stage::Upload, false);
   const eGPUTextureUsage texture_usage = GPU_TEXTURE_USAGE_SHADER_READ |
                                          GPU_TEXTURE_USAGE_ATTACHMENT;
 
@@ -1634,17 +1686,23 @@ static void sequencer_preview_draw_color_render(const SpaceSeq &space_sequencer,
                                                 ARegion &region,
                                                 const ImBuf *current_ibuf,
                                                 gpu::Texture *current_texture,
+                                                const char *current_gpu_colorspace,
                                                 const ImBuf *reference_ibuf,
                                                 gpu::Texture *reference_texture)
 {
   preview_draw_color_render_begin(region);
 
   if (current_texture) {
-    BLI_assert(current_ibuf);
+    /* `current_gpu_colorspace` が入っている = GPU 経路で作った 1 枚(CPU の ImBuf は無い)。
+     * 中身はアルファを掛けた形なので predivide を立てる。 */
+    BLI_assert(current_ibuf || current_gpu_colorspace);
     const rctf position = preview_get_full_position(region);
     const rctf texture_coord = preview_get_full_texture_coord();
-    const char *texture_colorspace = get_texture_colorspace_name(*current_ibuf);
-    const bool predivide = (current_ibuf->float_data() != nullptr);
+    const char *texture_colorspace = current_gpu_colorspace ?
+                                         current_gpu_colorspace :
+                                         get_texture_colorspace_name(*current_ibuf);
+    const bool predivide = current_gpu_colorspace ? true :
+                                                    (current_ibuf->float_data() != nullptr);
     preview_draw_texture_to_linear(
         *current_texture, texture_colorspace, predivide, position, texture_coord);
   }
@@ -1899,7 +1957,18 @@ void sequencer_preview_region_draw(const bContext *C, ARegion *region)
       reference_texture = create_texture(*reference_ibuf);
     }
   }
-  if (need_current_frame) {
+  const char *current_gpu_colorspace = nullptr;
+  bool current_gpu_owned = false;
+  if (need_current_frame && use_gpu_texture) {
+    /* ★GPU 経路: 変形と重ねを GPU でやって、CPU に戻さずそのまま描く。
+     * 通せない配置ならここは nullptr を返し、下の今までの経路に落ちる。 */
+    current_texture = sequencer_gpu_preview_get(C,
+                                               timeline_frame,
+                                               view_names[space_sequencer.multiview_eye],
+                                               &current_gpu_colorspace,
+                                               &current_gpu_owned);
+  }
+  if (need_current_frame && current_texture == nullptr) {
     current_ibuf = sequencer_ibuf_get(
         C, timeline_frame, view_names[space_sequencer.multiview_eye]);
     if (use_gpu_texture && current_ibuf) {
@@ -1930,6 +1999,7 @@ void sequencer_preview_region_draw(const bContext *C, ARegion *region)
                                       *region,
                                       current_ibuf,
                                       show_imbuf ? current_texture : nullptr,
+                                      current_gpu_colorspace,
                                       reference_ibuf,
                                       show_imbuf ? reference_texture : nullptr);
   sequencer_preview_draw_overlays(C,
@@ -1954,6 +2024,10 @@ void sequencer_preview_region_draw(const bContext *C, ARegion *region)
    * for other preview areas or frames if nothing changes between them. */
   if (reference_texture) {
     GPU_texture_free(reference_texture);
+  }
+  if (current_gpu_owned && current_texture != nullptr) {
+    /* この場で作った 1 枚だけ手放す。★輪から借りた物は輪の持ち物なので触らない。 */
+    GPU_texture_free(current_texture);
   }
 
   /* Free CPU side resources. */

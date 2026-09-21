@@ -59,6 +59,7 @@
 #include "SEQ_sequencer.hh"
 #include "SEQ_thumbnail_cache.hh"
 #include "SEQ_time.hh"
+#include "SEQ_gpu_preview.hh"
 #include "SEQ_transform.hh"
 #include "SEQ_utils.hh"
 
@@ -1956,6 +1957,11 @@ void draw_timeline_seq(const bContext *C, const ARegion *region)
 
   SeqQuadsBatch quads_batch;
   TimelineDrawContext ctx = timeline_draw_context_get(C, &quads_batch);
+  /* ★上下反転は場面に保存される(2026-09-21)。描く直前に写すので、ファイルを開いた時も
+   * 場面を切り替えた時も、保存された向きにそのまま追従する。 */
+  seq::channel_flip_sync_from_scene(ctx.scene);
+  seq::gpu_preview_sync_from_scene(ctx.scene);
+  seq::falcon_cpu_kernel_sync_from_scene(ctx.scene);
   StripsDrawBatch strips_batch(ctx.v2d);
 
   draw_timeline_pre_view_callbacks(ctx);
