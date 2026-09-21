@@ -34,6 +34,8 @@ def _falcon_reset_photon_state(*_args):
     import os
     for k in _FALCON_PHOTON_ADD_ENV:
         os.environ.pop(k, None)
+    # 開き直した後は、前のファイルの「写しの場面」を指す物が残っていても意味が無い
+    _falcon_lt_scrap.clear()
 
 
 def _falcon_flatten_name(name):
@@ -1355,6 +1357,29 @@ def _falcon_lt_write_exr(path, layer, w, h):
     bpy.data.images.remove(img)
 
 
+def _falcon_media_to_image(img_set):
+    """出力が動画のシーンで、静止画の書式を選べるようにする。戻り値は元の値。
+
+    ★Blender 5.2 の `file_format` の選択肢は `media_type` で絞られる。出力が
+      動画(`media_type='VIDEO'`)のシーンでは `('FFMPEG')` しか無いので、
+      `file_format = 'OPEN_EXR'` は **enum not found で例外**になる。
+      2026-09-21 作者「出力全部真っ暗になってる」の正体がこれだった:
+      動画出力の場面で F12 の自動集光(LT)が毎コマ失敗し、書き出した動画が
+      全コマ真っ暗になっていた(同じ場面を PNG で焼くと普通に写る)。
+    """
+    before = getattr(img_set, "media_type", None)
+    if before is not None and before != 'IMAGE':
+        img_set.media_type = 'IMAGE'
+    return before
+
+
+def _falcon_media_restore(img_set, before):
+    """`_falcon_media_to_image` の戻し。★file_format を戻すより先に呼ぶこと
+    (動画の書式は media_type が VIDEO でないと選べないため)。"""
+    if before is not None and getattr(img_set, "media_type", None) != before:
+        img_set.media_type = before
+
+
 def _falcon_lt_publish(context, scene, stem, comp, w, h, report, display=True):
     """Composite array -> "Falcon LT Composite" EXR datablock + color-managed 8-bit
     display PNG pushed into every open image editor. Shared tail of the LT
@@ -1385,12 +1410,14 @@ def _falcon_lt_publish(context, scene, stem, comp, w, h, report, display=True):
     img_set = scene.render.image_settings
     try:
         _fmt = (img_set.file_format, img_set.color_mode, img_set.color_depth)
+        _media = _falcon_media_to_image(img_set)
         img_set.file_format = 'PNG'
         img_set.color_mode = 'RGBA'
         img_set.color_depth = '8'
         try:
             out.save_render(disp_path, scene=scene)
         finally:
+            _falcon_media_restore(img_set, _media)
             (img_set.file_format, img_set.color_mode, img_set.color_depth) = _fmt
     except Exception as e:
         report({'WARNING'}, rpt_("Could not write the display image (the EXR was saved): %s") % e)
@@ -1434,7 +1461,7 @@ _falcon_lt_pending_restore = []
 _falcon_lt_running = 0
 
 # F12 の道で一時的に切った物(PT 側の集光)。レンダーが終わったら戻す。
-_falcon_lt_f12 = {"saved_caustics": None}
+_falcon_lt_f12 = {"saved_caustics": None, "warned": False}
 
 
 def _falcon_lt_arm_render_result(w, h, rgb):
@@ -1872,6 +1899,7 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
         cscene.max_bounces = max(cscene.max_bounces, 32)
         cscene.transmission_bounces = max(cscene.transmission_bounces, 32)
         cscene.glossy_bounces = max(cscene.glossy_bounces, 16)
+        st["saved_media"] = _falcon_media_to_image(img_set)
         img_set.file_format = 'OPEN_EXR'
         img_set.color_depth = '32'
         img_set.color_mode = 'RGB'
@@ -1917,10 +1945,15 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
             with bpy.context.temp_override(scene=tmp):
                 bpy.ops.render.render(write_still=write_still)
         finally:
-            try:
-                bpy.data.scenes.remove(tmp)
-            except Exception as e:
-                print("Falcon LT: could not remove the temporary scene: %r" % (e,), flush=True)
+            # ★写しはここで消さない(2026-09-21 作者「真っ暗の画面で落ちた」)。
+            #   F12 の道はそもそも外側のレンダーの render_pre の中なので、ここで
+            #   bpy.data.scenes.remove() を呼ぶと**レンダーの最中に場面を消す**ことになる:
+            #     ① 評価側ビューレイヤの base が作り直され、depsgraph が古い base を読む
+            #        (coredump 153104: deg_check_base_in_depsgraph で base_orig=NULL)
+            #     ② context の Python 辞書に消えた場面を指す物が残る
+            #        (coredump 229505: CTX_wm_window_set -> BPY_context_dict_clear_members_array)
+            #   消すのは外側のレンダーが終わってから、主糸のタイマーで(下の掃除係)。
+            _falcon_lt_scrap.append(tmp)
 
     def _lt_load_rgba(self, path):
         import numpy as np
@@ -2161,6 +2194,7 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
             _falcon_lt_disarm_render_result()
         self._lt_restore_scene()
         cscene, r, img_set = st["cscene"], st["r"], st["img_set"]
+        _falcon_media_restore(img_set, st.get("saved_media"))
         (cscene.use_adaptive_sampling, cscene.max_bounces,
          cscene.transmission_bounces, cscene.glossy_bounces,
          r.filepath, img_set.file_format, img_set.color_depth,
@@ -2299,6 +2333,25 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
 #   光子の段はこれで回る。timers は使わない。
 
 
+# 焼き終わった「場面の写し」の置き場。レンダーの中では消さず、ここに積んで
+# タイマー(主糸・レンダーの外)で消す。→ CYCLES_OT_falcon_lighttrace_render._lt_render
+_falcon_lt_scrap = []
+
+
+def _falcon_lt_scrap_sweep():
+    """溜まった写しの場面を、レンダーの外で消す(1 秒ごと)。"""
+    if _falcon_lt_running or not _falcon_lt_scrap:
+        return 1.0
+    for sc in list(_falcon_lt_scrap):
+        _falcon_lt_scrap.remove(sc)
+        try:
+            bpy.data.scenes.remove(sc)
+        except Exception as e:
+            # ファイルを開き直した後など、既に無い物を指していることがある
+            print("Falcon LT: could not remove the temporary scene: %r" % (e,), flush=True)
+    return 1.0
+
+
 @persistent
 def _falcon_lt_f12_pre(scene, depsgraph=None):
     """F12 の直前に光子の段だけを回して、層を仕掛ける。
@@ -2315,6 +2368,23 @@ def _falcon_lt_f12_pre(scene, depsgraph=None):
         return
     cscene = getattr(scene, "cycles", None)
     if not getattr(cscene, "falcon_caustics_photon", False):
+        return
+    # ★窓がある時は、ここから光子の段を回さない(2026-09-21・落ちる件 3 本)。
+    #   render_pre は**レンダーの糸**で鳴る(実測: thread=Dummy-1 / main=False)。
+    #   そこから bpy.ops / temp_override / scenes.remove を呼ぶと、主糸の
+    #   event loop と同じ物を取り合って落ちる:
+    #     153104 深さ deg_check_base_in_depsgraph (base_orig=NULL)
+    #     229505 / 331575 BPY_context_member_get (context の Python 辞書)
+    #     381421 DepsgraphNodeBuilder::begin_build (入れ子のレンダーが
+    #            同じ場面の depsgraph を建て直す)
+    #   窓なし(`-f` / `-b`)は event loop が無いので今までどおり回す。
+    #   窓がある時の集光は「ライトトレース合成レンダー」ボタン ―― あちらは
+    #   主糸の operator なので同じ絵が安全に出る(門 G7 で画素一致)。
+    if not bpy.app.background:
+        if not _falcon_lt_f12["warned"]:
+            _falcon_lt_f12["warned"] = True
+            print("Falcon LT: automatic caustics on F12 are off while a window is open; "
+                  "use the Light-Traced Composite Render button instead", flush=True)
         return
     # ★焼いている最中は絶対に鳴らない (2026-09-20・落ちる不具合の直し)
     #
@@ -2363,6 +2433,11 @@ def _falcon_lt_f12_post(scene, depsgraph=None):
     if _falcon_lt_running:
         return          # 光子の段のレンダーが終わっただけ。まだ外側は走っていない
     _falcon_lt_f12_restore(scene)
+    # ★-b(窓なし)ではタイマーが回らないので、掃除係をここで直に呼ぶ。外側の
+    #   レンダーはもう終わっているので、消しても誰も見ていない。窓がある時は
+    #   タイマー(主糸)に任せる ―― レンダーの糸で場面を消すのが落ちる元だった。
+    if bpy.app.background:
+        _falcon_lt_scrap_sweep()
 
 
 @persistent
@@ -3002,12 +3077,18 @@ def register():
                    (bpy.app.handlers.render_cancel, _falcon_lt_f12_cancel)):
         if fn not in hs:
             hs.append(fn)
+    # ★掃除係は**主糸で**登録しておく(レンダーの糸から登録しない)。
+    if not bpy.app.timers.is_registered(_falcon_lt_scrap_sweep):
+        bpy.app.timers.register(_falcon_lt_scrap_sweep, first_interval=1.0, persistent=True)
 
 
 def unregister():
     from bpy.utils import unregister_class
     if _falcon_reset_photon_state in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_falcon_reset_photon_state)
+    if bpy.app.timers.is_registered(_falcon_lt_scrap_sweep):
+        bpy.app.timers.unregister(_falcon_lt_scrap_sweep)
+    _falcon_lt_scrap.clear()
     for hs, fn in ((bpy.app.handlers.render_pre, _falcon_lt_f12_pre),
                    (bpy.app.handlers.render_post, _falcon_lt_f12_post),
                    (bpy.app.handlers.render_cancel, _falcon_lt_f12_cancel)):

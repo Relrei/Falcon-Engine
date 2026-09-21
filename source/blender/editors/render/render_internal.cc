@@ -47,6 +47,7 @@
 #include "BKE_screen.hh"
 
 #include "DEG_depsgraph.hh"
+#include "DEG_depsgraph_build.hh"
 
 #include "WM_api.hh"
 #include "WM_types.hh"
@@ -783,6 +784,13 @@ static void render_endjob(void *rjv)
       if (BLI_findindex(&rj->scene->view_layers, rj->view_layer) != -1) {
         Depsgraph *depsgraph = BKE_scene_get_depsgraph(rj->scene, rj->view_layer);
         if (depsgraph) {
+          /* Falcon 2026-09-21: 集光(LT)は 1 パスごとに `scene.copy()` を作って
+           * `bpy.data.scenes.remove()` で消します。アニメを焼き終えてここへ来る時点で
+           * 依存グラフが既に無い Base を抱えていることがあり、そのまま評価すると
+           * `deg_check_base_in_depsgraph` で落ちます(GUI のアニメだけで起き、
+           * 同じ場面を `blender -b -a` で焼いても出ません)。評価の前に関係を
+           * 作り直させます。費用は 1 回ぶんで、落ちるよりは安く済みます。 */
+          DEG_graph_tag_relations_update(depsgraph);
           ED_update_for_newframe(G_MAIN, depsgraph);
         }
       }

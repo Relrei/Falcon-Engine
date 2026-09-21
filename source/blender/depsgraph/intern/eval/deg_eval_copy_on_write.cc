@@ -409,7 +409,12 @@ void view_layer_remove_disabled_bases(const Depsgraph *depsgraph,
      * points to is not yet copied. This is dangerous access from evaluated
      * domain to original one, but this is how the entire copy-on-evaluation works:
      * it does need to access original for an initial copy. */
-    const bool is_object_enabled = deg_check_base_in_depsgraph(depsgraph, &base);
+    /* ★ base_orig is only filled in when the original view layer is known (see
+     * get_original_view_layer(): an indirectly linked scene has none). A base without it can
+     * not be tested, and deleting it would drop objects out of the evaluated scene, so keep
+     * it. Without this guard the read of base_orig->object crashes. */
+    const bool is_object_enabled = base.base_orig == nullptr ||
+                                   deg_check_base_in_depsgraph(depsgraph, &base);
     if (is_object_enabled) {
       BLI_addtail(&enabled_bases, &base);
     }
@@ -433,6 +438,12 @@ void view_layer_update_orig_base_pointers(const ViewLayer *view_layer_orig,
   Base *base_orig = reinterpret_cast<Base *>(view_layer_orig->object_bases.first);
   for (Base &base_eval : view_layer_eval->object_bases) {
     base_eval.base_orig = base_orig;
+    if (base_orig == nullptr) {
+      /* ★ The evaluated list can be longer than the original one when the original view layer
+       * has been re-synced in between. Leave the remaining pointers null instead of walking
+       * off the end of the list. */
+      continue;
+    }
     base_orig = base_orig->next;
   }
 }
@@ -456,7 +467,11 @@ void scene_setup_view_layers_after_remap(const Depsgraph *depsgraph,
   const ViewLayer *view_layer_orig = get_original_view_layer(depsgraph, id_node);
   ViewLayer *view_layer_eval = reinterpret_cast<ViewLayer *>(scene_cow->view_layers.first);
   view_layer_update_orig_base_pointers(view_layer_orig, view_layer_eval);
-  view_layer_remove_disabled_bases(depsgraph, scene_cow, view_layer_eval);
+  if (view_layer_orig != nullptr) {
+    /* ★ Without the original view layer the bases have no base_orig, so there is nothing to
+     * test them against. */
+    view_layer_remove_disabled_bases(depsgraph, scene_cow, view_layer_eval);
+  }
   /* TODO(sergey): Remove objects from collections as well.
    * Not a HUGE deal for now, nobody is looking into those CURRENTLY.
    * Still not an excuse to have those. */

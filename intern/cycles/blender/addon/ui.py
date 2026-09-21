@@ -778,6 +778,9 @@ class CYCLES_RENDER_PT_light_paths_caustics(CyclesButtonsPanel, Panel):
 
         col = layout.column()
         col.prop(cscene, "blur_glossy")
+        # ★作者 2026-09-21「Light パスにあるコースティクスの所でオンオフしたい」。
+        #   Falcon の親パネルにしか無かった入口をここへ移した(同じ 1 つの値)。
+        col.prop(cscene, "falcon_caustics_photon")
         col = layout.column(heading="Caustics", align=True)
         col.prop(cscene, "caustics_reflective", text="Reflective")
         col.prop(cscene, "caustics_refractive", text="Refractive")
@@ -2731,8 +2734,10 @@ def _falcon_draw_classic(layout, context):
     #   コースティクスの入口はこのチェック1つ(既定 ON)。切ると、この下の
     #   自動化の導線も、子パネルの「コースティクス (Photon)」「ライトトレース」も
     #   まるごと出なくなる(灰色にするのではなく出さない)。
-    layout.prop(cscene, "falcon_caustics_photon")
     if not cscene.falcon_caustics_photon:
+        # ★チェックは「ライトパス > コースティクス」へ移した(作者 2026-09-21)。
+        #   切っている時に行き先が分からなくならないよう、1 行だけ残す。
+        layout.label(text="Caustics are off (Light Paths ▸ Caustics)", icon='INFO')
         return
     layout = layout.column(align=True)
 
@@ -2758,6 +2763,10 @@ def _falcon_draw_classic(layout, context):
         # 清書コースティクス(LT): フォトンと別経路の仕上げ。検出時は常に選べる。
         if _fops._falcon_scene_has_caustics(context.scene):
             sub = box.column(align=True)
+            # ★2026-09-21: 窓がある時の F12 は集光を焼かない(レンダーの糸から
+            #   焼くと落ちるため)。黙って絵が変わらないよう、ここに 1 行出す。
+            sub.label(text="F12 renders without caustics — use this button",
+                      icon='INFO')
             sub.operator("cycles.falcon_lt_clean_caustics",
                          text="Clean Caustics (LT, Minutes)", icon='RENDER_STILL')
             risk = _fops._falcon_lt_flood_risk(context.scene)
@@ -2775,9 +2784,9 @@ def _falcon_draw_simple(layout, context):
     from . import operators as _fops
     cscene = context.scene.cycles
 
-    # 入口は classic と同じ1つ(上のチェック)。切れば下は何も出ない。
-    layout.prop(cscene, "falcon_caustics_photon")
+    # 入口は「ライトパス > コースティクス」のチェック1つ(作者 2026-09-21 に移した)。
     if not cscene.falcon_caustics_photon:
+        layout.label(text="Caustics are off (Light Paths ▸ Caustics)", icon='INFO')
         return
     has = _fops._falcon_scene_has_caustics(context.scene)
 
