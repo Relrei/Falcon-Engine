@@ -1,11 +1,12 @@
 # Falcon Engine
 
-Blender 5.2.2 をもとにしたカスタムビルドです。このリポジトリから、Blender 本家と同じ手順でビルドできます。
-本家の README は [README.blender.md](README.blender.md) にあります。
+Blender 5.2.2 をベースに、個人で手を入れているカスタムビルドです。
+自分が動画編集やレンダリングで「ここが遅い」「ここが不便」と感じた所を、少しずつ直しています。
+ビルドは Blender 本家と同じ手順でできます(本家の README は [README.blender.md](README.blender.md) に置いてあります)。
 
-- 問題と進捗は [Issues](../../issues) で管理しています。
+- 不具合や進み具合は [Issues](../../issues) に書いています。気になる所があれば気軽にどうぞ。
 
-## 入っているもの
+## 入れたもの
 
 - VSE(動画編集)の書き出しの高速化: 切っただけの区間は復号も符号化もせずに通す(fast path)・GPU での符号化(NVENC)・GPU で開けない時は CPU の符号化へ落とす
 - VSE 本体の直し(プロキシ・キャッシュ・書き出しの末尾のコマなど)・書き出しで何が効いたかを 1 行で出す・書き出しの後にメモリを返す
@@ -16,8 +17,8 @@ Blender 5.2.2 をもとにしたカスタムビルドです。このリポジト
 
 ## ビルド(Linux x64)
 
-★**事前ビルド済みライブラリ(`lib/`)はこのリポジトリに含めていません。**容量が大きく、
-本家が配っている物をそのまま使うためです。下の 2 で取ってきてください(git-lfs が要ります)。
+★**事前ビルド済みライブラリ(`lib/`)はこのリポジトリに入れていません。**容量が大きいのと、
+本家が配っている物をそのまま使えるからです。下の 2 で取ってきてください(git-lfs が要ります)。
 
 ```sh
 # 1) この木を取る
@@ -33,7 +34,7 @@ mkdir -p lib
 git clone --depth 1 -b blender-v5.2-release \
     https://projects.blender.org/blender/lib-linux_x64.git lib/linux_x64
 
-# 3) 建てる(どちらか片方で結構です)
+# 3) ビルドする(どちらか片方で大丈夫です)
 make release               # 本家と同じ入口。出来上がりは ../build_linux_release/bin/blender
 
 # もしくは cmake を直に叩く
@@ -44,9 +45,9 @@ cmake -G Ninja -S . -B ../build-falcon \
 ninja -C ../build-falcon install     # 出来上がりは ../build-falcon/bin/blender
 ```
 
-★**Intel の GPU(oneAPI)のカーネルで止まる時**: 既定の設定はこれも焼きます。焼く時に使う
+★**Intel の GPU(oneAPI)のカーネルで止まる時**: 既定の設定だとこれもビルドします。その時に使う
 dpcpp が**システムの C++ ヘッダ**を探すので、最小限のビルド環境(コンテナなど)では
-`fatal error: 'iostream' file not found` で止まります。Intel の GPU を使わないなら切ってください。
+`fatal error: 'iostream' file not found` で止まります。Intel の GPU を使わないなら切ってしまって大丈夫です。
 
 ```sh
 cmake -B ../build-falcon -DWITH_CYCLES_DEVICE_ONEAPI=OFF -DWITH_CYCLES_ONEAPI_BINARIES=OFF
@@ -56,13 +57,13 @@ cmake -B ../build-falcon -DWITH_CYCLES_DEVICE_ONEAPI=OFF -DWITH_CYCLES_ONEAPI_BI
 |---|---|
 | `lib/linux_x64` | 本家の事前ビルド済みライブラリ(上の 2 で取る)|
 | `../build_linux_release/bin/blender` | `make release` で建てた時の実行ファイル |
-| `../build-falcon` | cmake を直に叩いた時の作業場所(木の外に置くのが本家の作法)|
+| `../build-falcon` | cmake を直に叩いた時の作業場所(ソースの外に置くのが本家のやり方です)|
 | `../build-falcon/bin/blender` | そちらで建てた時の実行ファイル |
 
-動作を確認しているのは Linux x64 だけです。
-- **Windows**: 対応する予定です。ビルド自体は本家と同じ手順で通る可能性がありますが、まだ試していません。
-  追加した機能には NVIDIA の GPU(CUDA / NVENC / DLSS)と x86-64 の CPU を前提にした物が多いため、機能面の制限が多くなります。
-- **macOS**: サポートしません(非サポートです)。追加した機能の多くが NVIDIA の GPU と x86-64 の CPU を前提にしており(上と同じ理由)、作者も環境を持っていないためです。
+いまのところ、動作を確かめているのは Linux x64 だけです。
+- **Windows**: 対応するつもりです。ビルド自体は本家と同じ手順で通るかもしれませんが、まだ試せていません。
+  足した機能は NVIDIA の GPU(CUDA / NVENC / DLSS)と x86-64 の CPU が前提の物が多いので、使えない機能がそれなりに出ると思います。
+- **macOS**: 対応しません。足した機能の多くが NVIDIA の GPU と x86-64 の CPU 前提なのと、私が Mac を持っていなくて確かめようがないためです。ごめんなさい。
 
 必要な物と細かい手順は Blender 本家と同じです:
 https://developer.blender.org/docs/handbook/building_blender/linux/
@@ -73,8 +74,8 @@ https://developer.blender.org/docs/handbook/building_blender/linux/
 ### DLSS(任意)
 
 - 既定では DLSS 無し(`WITH_DLSS=OFF`)でビルドされます。
-- DLSS を使う場合は、NVIDIA の DLSS SDK(https://github.com/NVIDIA/DLSS)のヘッダを用意して `-DWITH_DLSS=ON -DDLSS_SDK_ROOT=<SDK の場所>` でビルドします。
-- DLSS の本体(NVIDIA のランタイム `libnvidia-ngx-dlssd.so.<版>`)は、このリポジトリにも配布物にも含みません。SDK の `lib/Linux_x86_64/rel/` から取り、札 `falcon_plugin.toml` と一緒にプラグインフォルダへ置きます。
+- DLSS を使いたい時は、NVIDIA の DLSS SDK(https://github.com/NVIDIA/DLSS)のヘッダを用意して `-DWITH_DLSS=ON -DDLSS_SDK_ROOT=<SDK の場所>` でビルドしてください。
+- DLSS の本体(NVIDIA のランタイム `libnvidia-ngx-dlssd.so.<版>`)は、ライセンスの都合でこのリポジトリにも配布物にも入れていません。SDK の `lib/Linux_x86_64/rel/` から取って、札 `falcon_plugin.toml` と一緒にプラグインフォルダへ置いてください。
 
 ```
 ~/.config/blender/5.2/falcon_plugins/dlss/      (または blender の実行ファイルの隣の falcon_plugins/dlss/)
@@ -93,12 +94,12 @@ files = ["libnvidia-ngx-dlssd.so.310.7.0"]
 ```
 
 - 置くと Preferences > Add-ons に「NVIDIA DLSS denoiser」が出ます(既定は無効)。有効にすると、デノイザの一覧に DLSS が出ます。
-- 札に書いていないファイルがフォルダにあると、そのプラグインは繋がずにエラーを出します。`FALCON_PLUGINS=0` で起動すると、プラグインフォルダを読みません。
+- 札に書いていないファイルがフォルダにあると、安全のためそのプラグインは繋がずにエラーを出します。`FALCON_PLUGINS=0` で起動すると、プラグインフォルダを読まずに立ち上がります。
 
-## 含まないもの
+## 入れていないもの
 
 - 分離ビルド(Dragon・Kajigata・Yotsuba4・Rapid)
-- 試験中で、実用の数字がまだ無い機能
+- まだ試している途中で、実用と言える数字が出ていない機能
 - NVIDIA DLSS の SDK とランタイム
 - 試験用のデータ(`tests/files`)と開発用の道具
 
@@ -109,4 +110,4 @@ NVIDIA と DLSS は NVIDIA Corporation の商標です。
 
 ---
 
-*English:* Falcon Engine is a custom build based on Blender 5.2.2. It builds with the same steps as upstream Blender (`make update && make release`); only Linux x64 is verified. Windows is planned (the build may work, but many features are limited because they assume an NVIDIA GPU and an x86-64 CPU); macOS is not supported. It adds faster VSE export (a pass-through fast path and NVENC encoding, which needs an FFmpeg built with NVENC; the upstream precompiled FFmpeg has it disabled, so a plain build encodes on the CPU), VSE fixes, a VSE bridge add-on, and F-Cycles (Cycles with photon mapping, SHARC and dispersion for caustics). DLSS support is optional (`-DWITH_DLSS=ON -DDLSS_SDK_ROOT=...`); the NVIDIA DLSS SDK and runtime are not included. Place the runtime from the SDK, together with the `falcon_plugin.toml` manifest shown above, in `~/.config/blender/5.2/falcon_plugins/dlss/` (or `falcon_plugins/dlss/` next to the executable); the "NVIDIA DLSS denoiser" add-on then appears in Preferences > Add-ons, and enabling it offers DLSS as a denoiser. The separately built renderers (Dragon, Kajigata, Yotsuba4, Rapid) and features still in testing are not part of this repository. Issues track bugs and progress.
+*English:* Falcon Engine is my personal custom build of Blender 5.2.2 — I fix the things that feel slow or awkward in my own video editing and rendering. It builds with the same steps as upstream Blender (`make update && make release`); only Linux x64 is verified. Windows is planned (the build may work, but many features are limited because they assume an NVIDIA GPU and an x86-64 CPU); macOS is not supported (I don't have a Mac to test on, sorry). It adds faster VSE export (a pass-through fast path and NVENC encoding, which needs an FFmpeg built with NVENC; the upstream precompiled FFmpeg has it disabled, so a plain build encodes on the CPU), VSE fixes, a VSE bridge add-on, and F-Cycles (Cycles with photon mapping, SHARC and dispersion for caustics). DLSS support is optional (`-DWITH_DLSS=ON -DDLSS_SDK_ROOT=...`); the NVIDIA DLSS SDK and runtime are not included. Place the runtime from the SDK, together with the `falcon_plugin.toml` manifest shown above, in `~/.config/blender/5.2/falcon_plugins/dlss/` (or `falcon_plugins/dlss/` next to the executable); the "NVIDIA DLSS denoiser" add-on then appears in Preferences > Add-ons, and enabling it offers DLSS as a denoiser. The separately built renderers (Dragon, Kajigata, Yotsuba4, Rapid) and features still in testing are not part of this repository. Bugs and progress are tracked in Issues — feel free to drop by.
