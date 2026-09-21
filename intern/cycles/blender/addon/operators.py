@@ -1619,6 +1619,14 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
           ので、`-f` を測らないと出ない。帯は UI が無ければ意味も無い。"""
         if bpy.app.background:
             return
+        # ★レンダーのジョブ糸(Ctrl+F12 のアニメ)には窓も画面も無い。
+        #   そこから status_text_set() を呼ぶと、C 側の
+        #   WM_window_status_area_find() が screen->state と win->global_areas を
+        #   null のまま触って **落ちる**(2026-09-21 実測・GUI でも落ちた)。
+        #   bpy.app.background だけでは足りないので、窓の有無でも降りる。
+        ctx = bpy.context
+        if getattr(ctx, "window", None) is None or getattr(ctx, "screen", None) is None:
+            return
         try:
             for ws in bpy.data.workspaces:
                 ws.status_text_set(text)

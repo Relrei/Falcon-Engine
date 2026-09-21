@@ -6760,6 +6760,12 @@ const char *WM_window_cursor_keymap_status_get(const wmWindow *win,
 
 ScrArea *WM_window_status_area_find(wmWindow *win, bScreen *screen)
 {
+  /* ★窓も画面も無い所から呼ばれることがある(レンダーのジョブ糸で走る Python の
+   *   ハンドラ → 演算子 → ED_workspace_status_text)。そこで null のまま
+   *   screen->state を読んで落ちていた(2026-09-21 実測・demo 5.2.2)。 */
+  if (win == nullptr || screen == nullptr) {
+    return nullptr;
+  }
   if (screen->state == SCREENFULL) {
     return nullptr;
   }
