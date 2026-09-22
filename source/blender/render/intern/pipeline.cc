@@ -30,6 +30,7 @@
 
 #include "MEM_guardedalloc.h"
 
+#include "BLI_memory_utils.hh"
 #include "BLI_fileops.h"
 #include "BLI_listbase.h"
 #include "BLI_map.hh"
@@ -45,6 +46,7 @@
 
 #include "BLT_translation.hh"
 
+#include "BKE_idprop.hh"
 #include "BKE_anim_data.hh"
 #include "BKE_animsys.h" /* <------ should this be here?, needed for sequencer update */
 #include "BKE_callbacks.hh"
@@ -2866,6 +2868,55 @@ static void render_animation_finish(Render *re, Scene *scene, int frame, float s
   G.is_rendering = false;
 }
 
+/* DLSS でアニメを出す時は、利用者が切っていても永続データを入れる。
+ *
+ * ★永続データが切れていると Cycles は**毎コマ Session を作り直す**ので、DLSS も毎コマ
+ * NGX を Init/Shutdown し直し、そのたびにメモリが残る。2026-09-22 01:19 に 5.2.2 のデモで
+ * classroom の DLAA 連番 802 枚目で RAM と swap が尽き、デスクトップごと落ちた。
+ * 5.2.2 での実測(8spp・40 コマ): 切 = 共有メモリ +10.5MB/コマ・NGX 46 回・147 秒 /
+ * 入 = 増加 0・NGX 1 回・履歴も続く・72 秒(5.2.2 と同じ直し)。
+ *
+ * 触るのはこのレンダーの `re->r` だけで、場面の設定は変えない。終わったらエンジンを捨てる。
+ * `FALCON_DLSS_ANIM_PERSIST=0` で今までどおり。 */
+static int falcon_anim_scene_cycles_int(const Scene *scene, const char *name, const int fallback)
+{
+  /* アドオンの PointerProperty はシステム側の IDProperty(グループ "cycles")に入る。
+   * 真偽は IDP_BOOLEAN の版と IDP_INT の版があるので両方見る。 */
+  IDProperty *props = IDP_ID_system_properties_get(const_cast<ID *>(&scene->id));
+  if (props == nullptr) {
+    return fallback;
+  }
+  IDProperty *cycles = IDP_GetPropertyTypeFromGroup(props, "cycles", IDP_GROUP);
+  if (cycles == nullptr) {
+    return fallback;
+  }
+  IDProperty *prop = IDP_GetPropertyFromGroup(cycles, name);
+  if (prop == nullptr) {
+    return fallback;
+  }
+  if (prop->type == IDP_INT || prop->type == IDP_BOOLEAN) {
+    return prop->data.val;
+  }
+  return fallback;
+}
+
+static bool falcon_dlss_anim_wants_persistent(const Scene *scene,
+                                              const RenderData &rd,
+                                              const int sfra,
+                                              const int efra)
+{
+  const char *env = getenv("FALCON_DLSS_ANIM_PERSIST");
+  if (env != nullptr && STREQ(env, "0")) {
+    return false;
+  }
+  if (sfra == efra || (rd.mode & R_PERSISTENT_DATA) || !STREQ(rd.engine, "CYCLES")) {
+    return false;
+  }
+  const int denoiser_dlss = 8; /* properties.py の ('DLSS', ..., 8) / DENOISER_DLSS */
+  return falcon_anim_scene_cycles_int(scene, "use_denoising", 1) != 0 &&
+         falcon_anim_scene_cycles_int(scene, "denoiser", 0) == denoiser_dlss;
+}
+
 void RE_RenderAnim(Render *re,
                    Main *bmain,
                    Scene *scene,
@@ -2898,10 +2949,34 @@ void RE_RenderAnim(Render *re,
   const float subframe_old = rd.subframe;
   int nfra, totrendered = 0, totskipped = 0;
 
+  /* Falcon: DLSS のアニメは永続データで回す(`falcon_dlss_anim_wants_persistent`)。
+   * ★`render_init_from_main` は `rd` でなく `scene->r` を `re->r` へ写し直す(解像度だけ
+   *   `rd` を見る)ので、写した直後に `re->r` 側へ立て直す。抜ける時は必ず戻す。 */
+  const bool falcon_forced_persistent = falcon_dlss_anim_wants_persistent(scene, rd, sfra, efra);
+  auto falcon_apply_persistent = [&]() {
+    if (falcon_forced_persistent) {
+      re->r.mode |= R_PERSISTENT_DATA;
+    }
+  };
+  if (falcon_forced_persistent) {
+    CLOG_INFO(&LOG, "DLSS animation: persistent data on for this render");
+    fprintf(stderr, "[dlss] animation: persistent data forced on (FALCON_DLSS_ANIM_PERSIST=0 to skip)\n");
+  }
+  BLI_SCOPED_DEFER([&]() {
+    if (falcon_forced_persistent) {
+      re->r.mode &= ~R_PERSISTENT_DATA;
+      if (re->engine) {
+        RE_engine_free(re->engine);
+        re->engine = nullptr;
+      }
+    }
+  });
+
   /* do not fully call for each frame, it initializes & pops output window */
   if (!render_init_from_main(re, &rd, bmain, scene, single_layer, camera_override, false, true)) {
     return;
   }
+  falcon_apply_persistent();
 
   RenderEngineType *re_type = RE_engines_find(re->r.engine);
 
@@ -3085,6 +3160,7 @@ void RE_RenderAnim(Render *re,
 
     /* Only border now, TODO(ton): camera lens. */
     render_init_from_main(re, &rd, bmain, scene, single_layer, camera_override, true, false);
+    falcon_apply_persistent();
 
     if (nfra != scene->r.cfra) {
       /* Skip this frame, but could update for physics and particles system. */

@@ -16,6 +16,7 @@
 #include "DNA_space_types.h"
 #include "DNA_world_types.h"
 
+#include "BLI_memory_utils.hh"
 #include "BLI_listbase.h"
 #include "BLI_time.h"
 #include "BLI_math_geom.h"
@@ -1541,6 +1542,24 @@ static ImBuf *seq_render_movie_strip_custom_file_proxy(const RenderData *context
 /**
  * Render individual view for multi-view or single (default view) for mono-view.
  */
+
+/* プレビューで 8bit を超える動画を 8bit で読むか。
+ *
+ * ★2026-09-22 実測(cage headless・同じ絵の 10bit / 8bit mp4・交互 4 回): 10bit = 16〜26fps・
+ * 10〜15 秒で RSS +8GB / 8bit = 53〜60fps(上限)・+1GB。Blender は 8bit を超える動画を
+ * 浮動小数の絵(FHD で 1 コマ 32MB)にして、さらに全画素を線形へ直すので、変換も転送も重い。
+ * 作者「再生時のメモリが追いつけなくて止まる」の主因。
+ * 書き出しには効かない(書き出しの前に 8bit の絵が入ったキャッシュを捨てる:`render_give_ibuf`)。
+ * `FALCON_VSE_PREVIEW_8BIT=0` で今まで通り。 */
+static bool falcon_preview_8bit()
+{
+  static const bool on = []() {
+    const char *env = getenv("FALCON_VSE_PREVIEW_8BIT");
+    return !(env != nullptr && STREQ(env, "0"));
+  }();
+  return on;
+}
+
 static ImBuf *seq_render_movie_strip_view(const RenderData *context,
                                           Strip *strip,
                                           float timeline_frame,
@@ -1550,6 +1569,11 @@ static ImBuf *seq_render_movie_strip_view(const RenderData *context,
   ImBuf *ibuf = nullptr;
   IMB_Proxy_Size psize = rendersize_to_proxysize(context->preview_render_size);
   const int frame_index = round_fl_to_int(give_frame_index(context->scene, strip, timeline_frame));
+
+  /* Falcon: プレビューでは 8bit を超える動画も 8bit の絵で読む(`falcon_preview_8bit`)。
+   * 書き出し(`context->render` がある時)は今まで通り浮動小数。 */
+  MOV_prefer_byte_for_thread(context->render == nullptr && falcon_preview_8bit());
+  BLI_SCOPED_DEFER([]() { MOV_prefer_byte_for_thread(false); });
 
   if (can_use_proxy(context, strip, psize)) {
     /* Try to get a proxy image.
@@ -1582,6 +1606,31 @@ static ImBuf *seq_render_movie_strip_view(const RenderData *context,
   }
 
   return ibuf;
+}
+
+bool seq_render_movie_strip_yuv(const RenderData *context,
+                                Strip *strip,
+                                const float timeline_frame,
+                                MovieYUVFrame &r_frame)
+{
+  if (context->render != nullptr || (strip->flag & SEQ_USE_VIEWS)) {
+    return false;
+  }
+  timing::Scope timer(timing::Stage::Decode, context->is_prefetch_render);
+  strip_open_anim_file(context->scene, strip, false);
+  MovieReader *reader = strip->runtime->movie_reader_get();
+  if (reader == nullptr) {
+    return false;
+  }
+  /* プロキシが**実際にある**時はそちら(RGBA の道)に任せる。`can_use_proxy()` は設定だけ見て
+   * ファイルの有無を見ないので、作っていないプロキシでも真になる(9-22 に踏んだ)。
+   * 通常の道も、開けなければ元の動画に戻る(`seq_render_movie_strip_view`)。 */
+  const IMB_Proxy_Size psize = rendersize_to_proxysize(context->preview_render_size);
+  if (can_use_proxy(context, strip, psize) && (MOV_get_existing_proxies(reader) & psize)) {
+    return false;
+  }
+  const int frame_index = round_fl_to_int(give_frame_index(context->scene, strip, timeline_frame));
+  return MOV_decode_frame_yuv(reader, frame_index + strip->anim_startofs, r_frame);
 }
 
 static ImBuf *seq_render_movie_strip(const RenderData *context,
@@ -2246,6 +2295,98 @@ void seq_render_evict_caches_if_full(const RenderData *context)
   evict_caches_if_full(orig_scene);
 }
 
+/**
+ * 画像の連番(PNG など)を複数の糸で先回りして復号し、素材キャッシュへ入れておく。
+ * 何本の糸で回すか: `FALCON_VSE_PREFETCH_DECODE_THREADS`(既定 = 論理コア数の半分・最大 8)。
+ * 0 / 1 で今まで通り。
+ *
+ * ★なぜ要るか(2026-09-22 実測): 先読みも画面側も 1 本の糸で 1 コマずつ作るので、PNG の連番は
+ * 復号 122〜140ms/枚 = 約 6fps が天井だった(60fps の場面で再生が追いつかない)。画像は 1 枚ずつ
+ * 別のファイルなので、コマごとに別の糸で読んでも順番の制約が無い。復号した物は通常の経路と同じ
+ * 条件で素材キャッシュへ入るので、後の `render_give_ibuf()` はキャッシュから拾うだけになる。
+ * 素材キャッシュが切ってある時は何もしない(入れる先が無い)。
+ */
+int falcon_image_decode_threads()
+{
+  static const int n = []() {
+    const char *env = getenv("FALCON_VSE_PREFETCH_DECODE_THREADS");
+    if (env != nullptr) {
+      return std::max(0, atoi(env));
+    }
+    return std::clamp(BLI_system_thread_count() / 2, 1, 8);
+  }();
+  return n;
+}
+
+void falcon_decode_images_ahead(
+    const RenderData *context, const Scene *scene_eval, const int from, const int to, const bool *stop)
+{
+  Scene *orig_scene = prefetch_get_original_scene(const_cast<RenderData *>(context));
+  if (orig_scene == nullptr || orig_scene->ed == nullptr ||
+      !(orig_scene->ed->cache_flag & SEQ_CACHE_STORE_RAW))
+  {
+    return;
+  }
+  Editing *ed = editing_get(scene_eval);
+  if (ed == nullptr) {
+    return;
+  }
+  ListBaseT<Strip> *seqbase = active_seqbase_get(ed);
+  ListBaseT<SeqTimelineChannel> *channels = channels_displayed_get(ed);
+
+  struct Job {
+    Strip *strip;
+    int frame;
+  };
+  Vector<Job> jobs;
+  for (int frame = from; frame <= to; frame++) {
+    for (Strip *strip : query_rendered_strips(scene_eval, channels, seqbase, frame, 0)) {
+      if (strip->type == STRIP_TYPE_IMAGE) {
+        jobs.append({strip, frame});
+      }
+    }
+  }
+  if (jobs.size() < 2) {
+    return;
+  }
+  threading::parallel_for(jobs.index_range(), 1, [&](const IndexRange range) {
+    for (const int64_t i : range) {
+      if (stop != nullptr && *stop) {
+        return;
+      }
+      SeqRenderState state;
+      bool is_proxy_image = false;
+      /* 素材キャッシュに当たりがあればそれを返すだけ、無ければ復号して入れる。 */
+      SeqResult res = seq_render_strip_source_only(
+          context, &state, jobs[i].strip, float(jobs[i].frame), &is_proxy_image);
+      if (res.is_valid()) {
+        IMB_freeImBuf(res.image);
+      }
+    }
+  });
+}
+
+/** 画面側(再生中)が素材キャッシュを外した時、その先を並列に復号する。 */
+static void falcon_preview_decode_ahead(const RenderData *context, const int timeline_frame)
+{
+  const int threads = falcon_image_decode_threads();
+  if (threads <= 1 || context->is_prefetch_render || context->render != nullptr ||
+      !context->is_playing)
+  {
+    return;
+  }
+  /* 同じ範囲を何度も回さない(画面側は 1 本なので、直前の範囲を覚えておけば足りる)。 */
+  static const Scene *last_scene = nullptr;
+  static int from = 0, until = 0;
+  if (context->scene == last_scene && timeline_frame >= from && timeline_frame < until) {
+    return;
+  }
+  last_scene = context->scene;
+  from = timeline_frame;
+  until = std::min(timeline_frame + threads * 2, context->scene->r.efra + 1);
+  falcon_decode_images_ahead(context, context->scene, from, until - 1, nullptr);
+}
+
 SeqResult seq_render_strip_source_only(const RenderData *context,
                                        SeqRenderState *state,
                                        Strip *strip,
@@ -2527,6 +2668,15 @@ ImBuf *render_give_ibuf(const RenderData *context, float timeline_frame, int cha
 
   if (ed == nullptr) {
     return nullptr;
+  }
+
+  /* Falcon: 再生中は画像の連番を先回りして並列に復号する(`falcon_decode_images_ahead`)。 */
+  falcon_preview_decode_ahead(context, int(timeline_frame));
+
+  /* Falcon: プレビューで 8bit へ落とした動画の絵がキャッシュに残っていたら、書き出しの前に捨てる
+   * (`falcon_preview_8bit`)。書き出しは浮動小数で読み直す。 */
+  if (context->render != nullptr && MOV_take_byte_downgrade_happened()) {
+    cache_cleanup(scene, CacheCleanup::All);
   }
 
   if ((chanshown < 0) && !ed->metastack.is_empty()) {

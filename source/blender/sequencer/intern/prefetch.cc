@@ -19,6 +19,9 @@
 #include "DNA_space_types.h"
 
 #include "BLI_threads.h"
+#include "BLI_vector.hh"
+#include "BLI_system.h"
+#include "BLI_task.hh"
 
 #include "IMB_imbuf.hh"
 
@@ -87,6 +90,9 @@ struct PrefetchJob {
   int timeline_length = 0;
   int num_frames_prefetched = 0;
   int cache_flags = 0; /* Only used to detect cache flag changes. */
+  /* Falcon: 画像の連番を先回りして並列に復号した範囲 [from, until)。`falcon_prefetch_decode_ahead`。 */
+  int falcon_decoded_from = 0;
+  int falcon_decoded_until = 0;
 
   /* Control: */
   /* Set by prefetch. */
@@ -620,6 +626,23 @@ static void seq_prefetch_do_suspend(PrefetchJob *pfjob)
   BLI_mutex_unlock(&pfjob->prefetch_suspend_mutex);
 }
 
+/* 画像の連番を先回りして並列に復号する(`falcon_decode_images_ahead` の注記)。 */
+static void falcon_prefetch_decode_ahead(PrefetchJob *pfjob)
+{
+  const int threads = falcon_image_decode_threads();
+  if (threads <= 1) {
+    return;
+  }
+  const int cfra = seq_prefetch_cfra(pfjob);
+  if (cfra >= pfjob->falcon_decoded_from && cfra < pfjob->falcon_decoded_until) {
+    return; /* この範囲はもう済んでいる。 */
+  }
+  const int last = std::min(cfra + threads * 2 - 1, pfjob->timeline_end);
+  pfjob->falcon_decoded_from = cfra;
+  pfjob->falcon_decoded_until = last + 1;
+  falcon_decode_images_ahead(&pfjob->context_cpy, pfjob->scene_eval, cfra, last, &pfjob->stop);
+}
+
 static void *seq_prefetch_frames(void *job)
 {
   PrefetchJob *pfjob = static_cast<PrefetchJob *>(job);
@@ -656,6 +679,7 @@ static void *seq_prefetch_frames(void *job)
       continue;
     }
 
+    falcon_prefetch_decode_ahead(pfjob);
     ImBuf *ibuf = render_give_ibuf(&pfjob->context_cpy, seq_prefetch_cfra(pfjob), 0);
     pfjob->num_frames_prefetched++;
     IMB_freeImBuf(ibuf);

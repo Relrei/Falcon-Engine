@@ -1481,6 +1481,8 @@ def clear_preview_range_on_load():
 def _on_load_post(*args):
     # ★メッセージバスの購読はファイルを読み込むと消える。張り直す。
     _subscribe_workspace()
+    # 「自動」の場面に GPU 再生などを当てる(`apply_auto_all` の注記)。
+    _apply_auto_all_deferred()
     # 開いたファイルの覚え(Video Editing に入っていたか)と今の画面を突き合わせる。
     _auto_engine_poke("load")
     _browser_seen.clear()
@@ -1959,6 +1961,27 @@ def apply_auto(scene):
 def _mode_update(self, context):
     if self.falcon_accel_mode == 'AUTO':
         apply_auto(self)
+
+
+def apply_auto_all():
+    """「自動」の場面すべてに、この機械の見立てを当てる。
+
+    ★2026-09-22 作者「GPU ゼロコピーの設計をしたはずなのに GPU はフル無視・VRAM も使っていない」。
+      `apply_auto()` は**モードを切り替えた瞬間**(`_mode_update`)にしか呼ばれておらず、
+      場面は最初から「自動」なので一度も走っていなかった = GPU 再生は環境変数の既定(切)のまま。
+      しかも「自動」の間はチェックが灰色で、手でも入れられなかった。
+      ⇒ ファイルを開いた時と起動した時にも当てる。"""
+    for scene in bpy.data.scenes:
+        if getattr(scene, "falcon_accel_mode", 'MANUAL') == 'AUTO':
+            apply_auto(scene)
+
+
+def _apply_auto_all_deferred():
+    try:
+        apply_auto_all()
+    except Exception as ex:  # noqa: BLE001  起動を止めない
+        print("falcon_vse_bridge:", ex)
+    return None
 
 
 # ★2026-09-21 作者「シーンプロパティ いらないものが多いから外せるものは外して」。
@@ -2707,6 +2730,8 @@ def register():
     output_panels.prepare()
     for cls in classes:
         bpy.utils.register_class(cls)
+    # 起動直後の場面にも「自動」を当てる(読み込みの手続きより先に登録が走る版があるため)。
+    bpy.app.timers.register(_apply_auto_all_deferred, first_interval=0.5)
 
     bpy.types.Scene.falcon_output_name = StringProperty(
         name="Output Name",

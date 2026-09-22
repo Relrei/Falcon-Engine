@@ -12,6 +12,10 @@
 #include <climits>
 #include <cmath>
 #include <cstdio>
+#include <atomic>
+#include <dlfcn.h>
+#include <unistd.h>
+#include <mutex>
 #include <sys/types.h>
 
 #include "BLI_path_utils.hh"
@@ -43,6 +47,7 @@
 extern "C" {
 #  include <libavcodec/avcodec.h>
 #  include <libavformat/avformat.h>
+#  include <libavutil/hwcontext.h>
 #  include <libavutil/imgutils.h>
 #  include <libavutil/rational.h>
 #  include <libswscale/swscale.h>
@@ -372,6 +377,226 @@ static AVFormatContext *init_format_context_vpx_workarounds(const char *filepath
   return format_ctx;
 }
 
+/* -------------------------------------------------------------------- */
+/** \name Falcon: GPU 復号(NVDEC)
+ *
+ * ★2026-09-22 作者「今まで NVDEC なしで動いてた感じ?」= その通りだった。同梱の FFmpeg には
+ * `h264_nvdec` / `hevc_nvdec` の部品が入っているのに、Blender は一度も `hw_device_ctx` を
+ * 渡していなかったので、動画は全部 CPU で復号していた。
+ *
+ * ここでは「GPU で復号 → すぐメインメモリへ移す」までをやる。移した後の絵は NV12 / P010 の
+ * 普通の絵なので、以降の色変換・キャッシュは今までと同じ道を通る(色変換の入口だけ形式を合わせる)。
+ * CUDA の装置は 1 つを全部の読み手で共有する(読み手ごとに作ると 1 本 300MB 級の VRAM を食う)。
+ * 対応しない形式・装置が無い時は FFmpeg が自動で CPU 復号に落ちる。
+ * `FALCON_VSE_NVDEC=0` で今までどおり CPU だけ。
+ * \{ */
+
+static bool falcon_nvdec_wanted()
+{
+  static const bool wanted = []() {
+    const char *env = getenv("FALCON_VSE_NVDEC");
+    return !(env != nullptr && STREQ(env, "0"));
+  }();
+  return wanted;
+}
+
+static AVBufferRef *falcon_nvdec_device()
+{
+  /* 最初の 1 回だけ作る。失敗したら以後は試さない(毎回 CUDA の初期化を待たない)。 */
+  static std::mutex mutex;
+  static AVBufferRef *device = nullptr;
+  static bool tried = false;
+  std::scoped_lock lock(mutex);
+  if (!tried) {
+    tried = true;
+    if (av_hwdevice_ctx_create(&device, AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0) < 0) {
+      device = nullptr;
+      CLOG_INFO(&LOG, "NVDEC: no CUDA device, decoding on the CPU");
+    }
+  }
+  return device;
+}
+
+static AVPixelFormat falcon_nvdec_get_format(AVCodecContext *ctx, const AVPixelFormat *fmts)
+{
+  for (const AVPixelFormat *p = fmts; *p != AV_PIX_FMT_NONE; p++) {
+    if (*p == AV_PIX_FMT_CUDA) {
+      return *p;
+    }
+  }
+  /* この形式は GPU で復号できない: CPU の復号に任せる。 */
+  return avcodec_default_get_format(ctx, fmts);
+}
+
+static bool falcon_nvdec_codec_ok(const AVCodecID id)
+{
+  return ELEM(id, AV_CODEC_ID_H264, AV_CODEC_ID_HEVC, AV_CODEC_ID_AV1, AV_CODEC_ID_VP9);
+}
+
+/**
+ * GPU 上の絵(AV_PIX_FMT_CUDA)なら、メインメモリへ写した物を返す(元の絵はそのまま)。
+ * CPU の道(RGBA への変換)に渡す直前だけ呼ぶ。GPU 再生の道(`MOV_decode_frame_yuv` の
+ * 装置の面)では降ろさずに使う = 段 G2。
+ */
+static AVFrame *falcon_frame_to_sw(MovieReader *anim, AVFrame *frame)
+{
+  if (frame == nullptr || frame->format != AV_PIX_FMT_CUDA) {
+    return frame;
+  }
+  if (anim->pFrame_hw_download == nullptr) {
+    anim->pFrame_hw_download = av_frame_alloc();
+  }
+  AVFrame *sw = anim->pFrame_hw_download;
+  av_frame_unref(sw);
+  if (av_hwframe_transfer_data(sw, frame, 0) < 0) {
+    CLOG_ERROR(&LOG, "NVDEC: could not copy the frame to memory (%s)", anim->filepath);
+    return nullptr;
+  }
+  av_frame_copy_props(sw, frame);
+  return sw;
+}
+
+/** `avcodec_receive_frame` の代わり。GPU で復号した絵は GPU に置いたまま持つ(降ろすのは使う側)。 */
+static bool falcon_receive_frame(MovieReader *anim)
+{
+  return avcodec_receive_frame(anim->pCodecCtx, anim->pFrame) == 0;
+}
+
+/* -------------------------------------------------------------------- */
+/** \name Falcon: CUDA → OpenGL のバッファ(段 G2)
+ *
+ * NVDEC の面(CUDA の装置メモリ)を、OpenGL のピクセルバッファへ **GPU の中だけで** 写す。
+ * Cycles の表示(`graphics_interop.cpp`)と同じ形: バッファを CUDA に登録 → 写像 → cuMemcpy2D →
+ * 写像を外す。libcuda は dlopen で必要な関数だけ引く(Blender 本体に CUDA の依存を足さない)。
+ * \{ */
+
+using falcon_CUresult = int;
+using falcon_CUcontext = void *;
+using falcon_CUgraphicsResource = void *;
+using falcon_CUdeviceptr = unsigned long long;
+struct falcon_CUDA_MEMCPY2D {
+  size_t srcXInBytes, srcY;
+  int srcMemoryType;
+  const void *srcHost;
+  falcon_CUdeviceptr srcDevice;
+  void *srcArray;
+  size_t srcPitch;
+  size_t dstXInBytes, dstY;
+  int dstMemoryType;
+  void *dstHost;
+  falcon_CUdeviceptr dstDevice;
+  void *dstArray;
+  size_t dstPitch;
+  size_t WidthInBytes, Height;
+};
+
+/* FFmpeg の AVCUDADeviceContext と同じ並び(`libavutil/hwcontext_cuda.h`)。その見出しは cuda.h を
+ * 要求するので読まず、使う先頭の項目だけ写す。 */
+struct falcon_AVCUDADeviceContext {
+  falcon_CUcontext cuda_ctx;
+  void *stream;
+  void *internal;
+};
+
+/* Vulkan のバッファを CUDA へ取り込む時の記述子(ドライバ API と同じ並び)。 */
+struct falcon_CUDA_EXTERNAL_MEMORY_HANDLE_DESC {
+  int type; /* 1 = CU_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD */
+  union {
+    int fd;
+    struct {
+      void *handle;
+      const void *name;
+    } win32;
+  } handle;
+  unsigned long long size;
+  unsigned int flags;
+  unsigned int reserved[16];
+};
+struct falcon_CUDA_EXTERNAL_MEMORY_BUFFER_DESC {
+  unsigned long long offset;
+  unsigned long long size;
+  unsigned int flags;
+  unsigned int reserved[16];
+};
+
+struct FalconCudaGL {
+  bool ok = false;
+  bool vk_ok = false;
+  falcon_CUresult (*import_external)(void **, const falcon_CUDA_EXTERNAL_MEMORY_HANDLE_DESC *) =
+      nullptr;
+  falcon_CUresult (*external_mapped_buffer)(falcon_CUdeviceptr *,
+                                            void *,
+                                            const falcon_CUDA_EXTERNAL_MEMORY_BUFFER_DESC *) =
+      nullptr;
+  falcon_CUresult (*destroy_external)(void *) = nullptr;
+  falcon_CUresult (*mem_free)(falcon_CUdeviceptr) = nullptr;
+  falcon_CUresult (*ctx_push)(falcon_CUcontext) = nullptr;
+  falcon_CUresult (*ctx_pop)(falcon_CUcontext *) = nullptr;
+  falcon_CUresult (*gl_register_buffer)(falcon_CUgraphicsResource *, unsigned int, unsigned int) =
+      nullptr;
+  falcon_CUresult (*map)(unsigned int, falcon_CUgraphicsResource *, void *) = nullptr;
+  falcon_CUresult (*unmap)(unsigned int, falcon_CUgraphicsResource *, void *) = nullptr;
+  falcon_CUresult (*mapped_pointer)(falcon_CUdeviceptr *, size_t *, falcon_CUgraphicsResource) =
+      nullptr;
+  falcon_CUresult (*unregister)(falcon_CUgraphicsResource) = nullptr;
+  falcon_CUresult (*memcpy2d)(const falcon_CUDA_MEMCPY2D *) = nullptr;
+};
+
+static FalconCudaGL &falcon_cuda_gl()
+{
+  static FalconCudaGL api = []() {
+    FalconCudaGL a;
+    void *lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+    if (lib == nullptr) {
+      return a;
+    }
+    a.ctx_push = reinterpret_cast<decltype(a.ctx_push)>(dlsym(lib, "cuCtxPushCurrent_v2"));
+    a.ctx_pop = reinterpret_cast<decltype(a.ctx_pop)>(dlsym(lib, "cuCtxPopCurrent_v2"));
+    a.gl_register_buffer = reinterpret_cast<decltype(a.gl_register_buffer)>(
+        dlsym(lib, "cuGraphicsGLRegisterBuffer"));
+    a.map = reinterpret_cast<decltype(a.map)>(dlsym(lib, "cuGraphicsMapResources"));
+    a.unmap = reinterpret_cast<decltype(a.unmap)>(dlsym(lib, "cuGraphicsUnmapResources"));
+    a.mapped_pointer = reinterpret_cast<decltype(a.mapped_pointer)>(
+        dlsym(lib, "cuGraphicsResourceGetMappedPointer_v2"));
+    a.unregister = reinterpret_cast<decltype(a.unregister)>(
+        dlsym(lib, "cuGraphicsUnregisterResource"));
+    a.memcpy2d = reinterpret_cast<decltype(a.memcpy2d)>(dlsym(lib, "cuMemcpy2D_v2"));
+    a.import_external = reinterpret_cast<decltype(a.import_external)>(
+        dlsym(lib, "cuImportExternalMemory"));
+    a.external_mapped_buffer = reinterpret_cast<decltype(a.external_mapped_buffer)>(
+        dlsym(lib, "cuExternalMemoryGetMappedBuffer"));
+    a.destroy_external = reinterpret_cast<decltype(a.destroy_external)>(
+        dlsym(lib, "cuDestroyExternalMemory"));
+    a.mem_free = reinterpret_cast<decltype(a.mem_free)>(dlsym(lib, "cuMemFree_v2"));
+    a.ok = a.ctx_push && a.ctx_pop && a.gl_register_buffer && a.map && a.unmap &&
+           a.mapped_pointer && a.unregister && a.memcpy2d;
+    a.vk_ok = a.ok && a.import_external && a.external_mapped_buffer && a.destroy_external &&
+              a.mem_free;
+    return a;
+  }();
+  return api;
+}
+
+/** 段 G2 を使うか(`FALCON_VSE_GPU_ZEROCOPY=0` で使わない・CUDA が無い時も使わない)。 */
+static bool falcon_zerocopy_wanted()
+{
+  static const bool on = []() {
+    const char *env = getenv("FALCON_VSE_GPU_ZEROCOPY");
+    return !(env != nullptr && STREQ(env, "0"));
+  }();
+  return on && falcon_cuda_gl().ok;
+}
+
+/** \} */
+
+/* 8bit へ落とす指定(MOV_prefer_byte_for_thread)。糸ごと。 */
+static thread_local bool falcon_prefer_byte = false;
+/* GPU 上の面を降ろさずに返す指定(MOV_prefer_device_for_thread)。糸ごと。 */
+static thread_local bool falcon_prefer_device = false;
+static std::atomic<bool> falcon_byte_downgrade_happened{false};
+
+/** \} */
+
 static int startffmpeg(MovieReader *anim)
 {
   if (anim == nullptr) {
@@ -404,6 +629,25 @@ static int startffmpeg(MovieReader *anim)
   }
   else if (pCodec->capabilities & AV_CODEC_CAP_SLICE_THREADS) {
     pCodecCtx->thread_type = FF_THREAD_SLICE;
+  }
+
+  /* Falcon: GPU 復号(上の「GPU 復号(NVDEC)」)。インターレース解除は CPU 側の形式を前提に
+   * しているので、その時は使わない。GPU で復号する時は糸を 1 本にする(復号は GPU がやり、
+   * 糸ごとに GPU 上の面を抱えると VRAM だけ増える)。 */
+  anim->hw_decode = false;
+  if (falcon_nvdec_wanted() && falcon_nvdec_codec_ok(pCodecCtx->codec_id) &&
+      !flag_is_set(anim->ib_flags, ImBufFlags::Deinterlace))
+  {
+    if (AVBufferRef *device = falcon_nvdec_device()) {
+      pCodecCtx->hw_device_ctx = av_buffer_ref(device);
+      pCodecCtx->get_format = falcon_nvdec_get_format;
+      /* 復号した面を GPU に置いたまま前後 2 枚(pFrame / pFrame_backup)+ 描画中の分を抱えるので、
+       * 面の数に余裕を持たせる(足りないと復号が面の空きを待って止まる)。 */
+      pCodecCtx->extra_hw_frames = 6;
+      pCodecCtx->thread_count = 1;
+      pCodecCtx->thread_type = 0;
+      anim->hw_decode = true;
+    }
   }
 
   if (avcodec_open2(pCodecCtx, pCodec, nullptr) < 0) {
@@ -524,6 +768,8 @@ static int startffmpeg(MovieReader *anim)
                                                  -1,
                                                  SWS_POINT | SWS_FULL_CHR_H_INT |
                                                      SWS_ACCURATE_RND);
+
+  anim->img_convert_src_fmt = anim->pCodecCtx->pix_fmt;
 
   if (!anim->img_convert_ctx) {
     CLOG_ERROR(&LOG,
@@ -693,7 +939,7 @@ static void float_planar_to_interleaved(const AVFrame *frame, const int rotation
  *
  * \param ibuf: The frame just read by `ffmpeg_fetchibuf`, processed in-place.
  */
-static void ffmpeg_postprocess(MovieReader *anim, AVFrame *input, ImBuf *ibuf)
+static void ffmpeg_postprocess(MovieReader *anim, AVFrame *input, ImBuf *ibuf, const bool as_float)
 {
   int filter_y = 0;
 
@@ -730,15 +976,49 @@ static void ffmpeg_postprocess(MovieReader *anim, AVFrame *input, ImBuf *ibuf)
     }
   }
 
+  /* Falcon: 変換先は 2 通り。浮動小数(8bit を超える動画の既定)か 8bit(8bit の動画・プレビュー用の格下げ)。 */
+  AVFrame *frame_rgb = as_float ? anim->pFrameRGB :
+                                  (anim->is_float ? anim->pFrameRGB_byte : anim->pFrameRGB);
+  SwsContext *&convert_ctx = (as_float || !anim->is_float) ? anim->img_convert_ctx :
+                                                             anim->img_convert_ctx_byte;
+  int &convert_src_fmt = (as_float || !anim->is_float) ? anim->img_convert_src_fmt :
+                                                         anim->img_convert_byte_src_fmt;
+  /* GPU 復号の絵は NV12 / P010 で来る。色変換の入口をその形式に合わせる(最初の 1 回だけ)。 */
+  if (input->format != convert_src_fmt || convert_ctx == nullptr) {
+    SwsContext *ctx = ffmpeg_sws_get_context(anim->x,
+                                             anim->y,
+                                             AVPixelFormat(input->format),
+                                             anim->pCodecCtx->color_range == AVCOL_RANGE_JPEG,
+                                             anim->pCodecCtx->colorspace,
+                                             anim->x,
+                                             anim->y,
+                                             frame_rgb->format,
+                                             false,
+                                             -1,
+                                             SWS_POINT | SWS_FULL_CHR_H_INT | SWS_ACCURATE_RND);
+    if (ctx == nullptr) {
+      CLOG_ERROR(&LOG,
+                 "ffmpeg: swscale can't transform from pixel format %s (%s)",
+                 av_get_pix_fmt_name(AVPixelFormat(input->format)),
+                 anim->filepath);
+      return;
+    }
+    if (convert_ctx) {
+      ffmpeg_sws_release_context(convert_ctx);
+    }
+    convert_ctx = ctx;
+    convert_src_fmt = input->format;
+  }
+
   bool already_rotated = false;
-  if (anim->is_float) {
+  if (as_float) {
     /* Float images are converted into planar GBRA layout by swscale (since
      * it does not support direct YUV->RGBA float interleaved conversion).
      * Do vertical flip and interleave into RGBA manually. */
     /* Decode, then do vertical flip into destination. */
-    ffmpeg_sws_scale_frame(anim->img_convert_ctx, anim->pFrameRGB, input);
+    ffmpeg_sws_scale_frame(convert_ctx, frame_rgb, input);
 
-    float_planar_to_interleaved(anim->pFrameRGB, anim->video_rotation, ibuf);
+    float_planar_to_interleaved(frame_rgb, anim->video_rotation, ibuf);
     already_rotated = true;
   }
   else {
@@ -747,7 +1027,7 @@ static void ffmpeg_postprocess(MovieReader *anim, AVFrame *input, ImBuf *ibuf)
      * decode into that, doing the vertical flip in the same step. Otherwise have
      * to do a separate flip. */
     const int ibuf_linesize = ibuf->x * 4;
-    const int rgb_linesize = anim->pFrameRGB->linesize[0];
+    const int rgb_linesize = frame_rgb->linesize[0];
     bool scale_to_ibuf = (rgb_linesize == ibuf_linesize);
     /* swscale on arm64 before ffmpeg 6.0 (libswscale major version 7)
      * could not handle negative line sizes. That has been fixed in all major
@@ -755,36 +1035,36 @@ static void ffmpeg_postprocess(MovieReader *anim, AVFrame *input, ImBuf *ibuf)
 #  if (defined(__aarch64__) || defined(_M_ARM64)) && (LIBSWSCALE_VERSION_MAJOR < 7)
     scale_to_ibuf = false;
 #  endif
-    uint8_t *rgb_data = anim->pFrameRGB->data[0];
+    uint8_t *rgb_data = frame_rgb->data[0];
 
     if (scale_to_ibuf) {
       /* Decode RGB and do vertical flip directly into destination image, by using negative
        * line size. */
-      anim->pFrameRGB->linesize[0] = -ibuf_linesize;
-      anim->pFrameRGB->data[0] = ibuf->byte_data_for_write() + (ibuf->y - 1) * ibuf_linesize;
+      frame_rgb->linesize[0] = -ibuf_linesize;
+      frame_rgb->data[0] = ibuf->byte_data_for_write() + (ibuf->y - 1) * ibuf_linesize;
 
-      ffmpeg_sws_scale_frame(anim->img_convert_ctx, anim->pFrameRGB, input);
+      ffmpeg_sws_scale_frame(convert_ctx, frame_rgb, input);
 
-      anim->pFrameRGB->linesize[0] = rgb_linesize;
-      anim->pFrameRGB->data[0] = rgb_data;
+      frame_rgb->linesize[0] = rgb_linesize;
+      frame_rgb->data[0] = rgb_data;
     }
     else {
       /* Decode, then do vertical flip into destination. */
-      ffmpeg_sws_scale_frame(anim->img_convert_ctx, anim->pFrameRGB, input);
+      ffmpeg_sws_scale_frame(convert_ctx, frame_rgb, input);
 
       /* Use negative line size to do vertical image flip. */
       const int src_linesize[4] = {-rgb_linesize, 0, 0, 0};
       const uint8_t *const src[4] = {
           rgb_data + (anim->y - 1) * rgb_linesize, nullptr, nullptr, nullptr};
-      int dst_size = av_image_get_buffer_size(AVPixelFormat(anim->pFrameRGB->format),
-                                              anim->pFrameRGB->width,
-                                              anim->pFrameRGB->height,
+      int dst_size = av_image_get_buffer_size(AVPixelFormat(frame_rgb->format),
+                                              frame_rgb->width,
+                                              frame_rgb->height,
                                               1);
       av_image_copy_to_buffer(ibuf->byte_data_for_write(),
                               dst_size,
                               src,
                               src_linesize,
-                              AVPixelFormat(anim->pFrameRGB->format),
+                              AVPixelFormat(frame_rgb->format),
                               anim->x,
                               anim->y,
                               1);
@@ -893,7 +1173,7 @@ static int ffmpeg_decode_video_frame(MovieReader *anim)
 
   /* Sometimes, decoder returns more than one frame per sent packet. Check if frames are available.
    * This frames must be read, otherwise decoding will fail. See #91405. */
-  anim->pFrame_complete = avcodec_receive_frame(anim->pCodecCtx, anim->pFrame) == 0;
+  anim->pFrame_complete = falcon_receive_frame(anim);
   if (anim->pFrame_complete) {
     av_log(anim->pFormatCtx, AV_LOG_DEBUG, "  DECODE FROM CODEC BUFFER\n");
     ffmpeg_decode_store_frame_pts(anim);
@@ -920,7 +1200,7 @@ static int ffmpeg_decode_video_frame(MovieReader *anim)
            (anim->cur_packet->flags & AV_PKT_FLAG_KEY) ? " KEY" : "");
 
     avcodec_send_packet(anim->pCodecCtx, anim->cur_packet);
-    anim->pFrame_complete = avcodec_receive_frame(anim->pCodecCtx, anim->pFrame) == 0;
+    anim->pFrame_complete = falcon_receive_frame(anim);
 
     if (anim->pFrame_complete) {
       ffmpeg_decode_store_frame_pts(anim);
@@ -933,7 +1213,7 @@ static int ffmpeg_decode_video_frame(MovieReader *anim)
   if (rval == AVERROR_EOF) {
     /* Flush any remaining frames out of the decoder. */
     avcodec_send_packet(anim->pCodecCtx, nullptr);
-    anim->pFrame_complete = avcodec_receive_frame(anim->pCodecCtx, anim->pFrame) == 0;
+    anim->pFrame_complete = falcon_receive_frame(anim);
 
     if (anim->pFrame_complete) {
       ffmpeg_decode_store_frame_pts(anim);
@@ -1200,14 +1480,9 @@ static bool ffmpeg_must_seek(MovieReader *anim, int position)
   return must_seek;
 }
 
-static ImBuf *ffmpeg_fetchibuf(MovieReader *anim, int position)
+/** 求めるコマまで(必要なら探して)復号する。戻り値は探す PTS。`ffmpeg_fetchibuf` から切り出した。 */
+static int64_t ffmpeg_seek_and_decode(MovieReader *anim, int position)
 {
-  if (anim == nullptr) {
-    return nullptr;
-  }
-
-  av_log(anim->pFormatCtx, AV_LOG_DEBUG, "FETCH: seek_pos=%d\n", position);
-
   int64_t pts_to_search = ffmpeg_get_pts_to_search(anim, position);
   AVStream *v_st = anim->pFormatCtx->streams[anim->videoStream];
   double frame_rate = av_q2d(v_st->r_frame_rate);
@@ -1243,6 +1518,18 @@ static ImBuf *ffmpeg_fetchibuf(MovieReader *anim, int position)
   /* Update resolution as it can change per-frame with WebM. See #100741 & #100081. */
   anim->x = anim->pCodecCtx->width;
   anim->y = anim->pCodecCtx->height;
+  return pts_to_search;
+}
+
+static ImBuf *ffmpeg_fetchibuf(MovieReader *anim, int position)
+{
+  if (anim == nullptr) {
+    return nullptr;
+  }
+
+  av_log(anim->pFormatCtx, AV_LOG_DEBUG, "FETCH: seek_pos=%d\n", position);
+
+  const int64_t pts_to_search = ffmpeg_seek_and_decode(anim, position);
 
   const AVPixFmtDescriptor *pix_fmt_descriptor = av_pix_fmt_desc_get(anim->pCodecCtx->pix_fmt);
 
@@ -1251,15 +1538,31 @@ static ImBuf *ffmpeg_fetchibuf(MovieReader *anim, int position)
     color_mode = ImColorMode::RGB;
   }
 
+  /* Falcon: プレビューでは 8bit を超える動画も 8bit で出す(MOV_prefer_byte_for_thread)。 */
+  const bool as_float = anim->is_float && !falcon_prefer_byte;
+  if (anim->is_float && !as_float) {
+    falcon_byte_downgrade_happened.store(true, std::memory_order_relaxed);
+    if (anim->pFrameRGB_byte == nullptr) {
+      anim->pFrameRGB_byte = av_frame_alloc();
+      anim->pFrameRGB_byte->format = AV_PIX_FMT_RGBA;
+      anim->pFrameRGB_byte->width = anim->x;
+      anim->pFrameRGB_byte->height = anim->y;
+      if (av_frame_get_buffer(anim->pFrameRGB_byte, ffmpeg_get_buffer_alignment()) < 0) {
+        av_frame_free(&anim->pFrameRGB_byte);
+        return nullptr;
+      }
+    }
+  }
+
   ImBuf *cur_frame_final = IMB_allocImBuf(anim->x, anim->y, ImBufFlags::Zero);
   cur_frame_final->color_mode = color_mode;
 
   /* Allocate the storage explicitly to ensure the memory is aligned. */
   const size_t align = ffmpeg_get_buffer_alignment();
-  const size_t pixel_size = anim->is_float ? 16 : 4;
+  const size_t pixel_size = as_float ? 16 : 4;
   uint8_t *buffer_data = static_cast<uint8_t *>(
       MEM_new_uninitialized_aligned(pixel_size * anim->x * anim->y, align, "ffmpeg ibuf"));
-  if (anim->is_float) {
+  if (as_float) {
     cur_frame_final->assign_float_data((float *)buffer_data);
   }
   else {
@@ -1276,10 +1579,14 @@ static ImBuf *ffmpeg_fetchibuf(MovieReader *anim, int position)
   /* Even with the fallback from above it is possible that the current decode frame is nullptr. In
    * this case skip post-processing and return current image buffer. */
   if (final_frame != nullptr) {
-    ffmpeg_postprocess(anim, final_frame, cur_frame_final);
+    /* GPU 上の絵は、ここで初めてメインメモリへ降ろす(`falcon_frame_to_sw`)。 */
+    AVFrame *sw_frame = falcon_frame_to_sw(anim, final_frame);
+    if (sw_frame != nullptr) {
+      ffmpeg_postprocess(anim, sw_frame, cur_frame_final, as_float);
+    }
   }
 
-  if (anim->is_float) {
+  if (as_float) {
     if (anim->keep_original_colorspace) {
       /* Movie has been explicitly requested to keep original colorspace, regardless of the nature
        * of the buffer. */
@@ -1327,6 +1634,11 @@ static void free_anim_ffmpeg(MovieReader *anim)
       MEM_delete(anim->pFrameDeinterlaced->data[0]);
     }
     av_frame_free(&anim->pFrameDeinterlaced);
+    av_frame_free(&anim->pFrame_hw_download);
+    av_frame_free(&anim->pFrameRGB_byte);
+    if (anim->img_convert_ctx_byte) {
+      ffmpeg_sws_release_context(anim->img_convert_ctx_byte);
+    }
     ffmpeg_sws_release_context(anim->img_convert_ctx);
   }
   anim->duration_in_frames = 0;
@@ -1394,6 +1706,296 @@ ImBuf *MOV_decode_preview_frame(MovieReader *anim)
 #endif
   }
   return ibuf;
+}
+
+bool MOV_decode_frame_yuv(MovieReader *anim, const int position, MovieYUVFrame &r_frame)
+{
+  r_frame = MovieYUVFrame();
+#ifdef WITH_FFMPEG
+  if (anim == nullptr) {
+    return false;
+  }
+  if (anim->state == MovieReader::State::Uninitialized && !anim_getnew(anim)) {
+    return false;
+  }
+  if (anim->state != MovieReader::State::Valid || anim->pCodecCtx == nullptr || position < 0 ||
+      position >= anim->duration_in_frames || anim->video_rotation != 0 ||
+      anim->never_seek_decode_one_frame || flag_is_set(anim->ib_flags, ImBufFlags::Deinterlace))
+  {
+    return false;
+  }
+  const int64_t pts_to_search = ffmpeg_seek_and_decode(anim, position);
+  AVFrame *frame = ffmpeg_frame_by_pts_get(anim, pts_to_search);
+  if (frame == nullptr) {
+    frame = ffmpeg_double_buffer_frame_fallback_get(anim);
+  }
+  if (frame == nullptr || frame->data[0] == nullptr) {
+    return false;
+  }
+  /* GPU 上の面(NVDEC)。段 G2 が使えるなら降ろさずに渡す。使えなければここで降ろす。 */
+  AVFrame *owned_sw = nullptr;
+  {
+    /* `FALCON_VSE_GPU_DEBUG=1` の時だけ、GPU 直送に乗れるかの材料を 1 回出す。 */
+    static std::atomic<bool> said{false};
+    const char *dbg = getenv("FALCON_VSE_GPU_DEBUG");
+    if (dbg && dbg[0] && strcmp(dbg, "0") != 0 && !said.exchange(true)) {
+      printf("{\"k\":\"yuv_src\",\"fmt\":\"%s\",\"hw_ctx\":%d,\"prefer_device\":%d,\"cuda_gl\":%d,\"hw_decode\":%d}\n",
+             av_get_pix_fmt_name(AVPixelFormat(frame->format)),
+             int(frame->hw_frames_ctx != nullptr),
+             int(falcon_prefer_device),
+             int(falcon_cuda_gl().ok),
+             int(anim->hw_decode));
+      fflush(stdout);
+    }
+  }
+  if (frame->format == AV_PIX_FMT_CUDA && frame->hw_frames_ctx != nullptr) {
+    const AVHWFramesContext *fc = reinterpret_cast<const AVHWFramesContext *>(
+        frame->hw_frames_ctx->data);
+    const bool device_ok = falcon_prefer_device && falcon_zerocopy_wanted() &&
+                           ELEM(fc->sw_format, AV_PIX_FMT_NV12, AV_PIX_FMT_P010LE);
+    if (device_ok) {
+      AVFrame *ref = av_frame_clone(frame);
+      if (ref == nullptr) {
+        return false;
+      }
+      anim->cur_position = position;
+      r_frame.frame = ref;
+      r_frame.width = frame->width;
+      r_frame.height = frame->height;
+      r_frame.layout = (fc->sw_format == AV_PIX_FMT_NV12) ? 4 : 5;
+    }
+    else {
+      owned_sw = av_frame_alloc();
+      if (owned_sw == nullptr || av_hwframe_transfer_data(owned_sw, frame, 0) < 0) {
+        av_frame_free(&owned_sw);
+        return false;
+      }
+      av_frame_copy_props(owned_sw, frame);
+      frame = owned_sw;
+    }
+  }
+  int layout = r_frame.layout;
+  switch (layout ? -1 : frame->format) {
+    case -1:
+      break; /* 上で決まった(GPU 上の面)。 */
+    case AV_PIX_FMT_NV12:
+      layout = 1;
+      break;
+    case AV_PIX_FMT_P010LE:
+      layout = 2;
+      break;
+    case AV_PIX_FMT_YUV420P:
+      layout = 3;
+      break;
+    default:
+      av_frame_free(&owned_sw);
+      return false; /* ほかの形式は今まで通り RGBA へ変換する道で。 */
+  }
+  if (r_frame.frame == nullptr) {
+    AVFrame *ref = owned_sw ? owned_sw : av_frame_clone(frame);
+    if (ref == nullptr) {
+      return false;
+    }
+    anim->cur_position = position;
+    r_frame.frame = ref;
+    r_frame.width = frame->width;
+    r_frame.height = frame->height;
+    r_frame.layout = layout;
+  }
+  r_frame.full_range = anim->pCodecCtx->color_range == AVCOL_RANGE_JPEG;
+  /* sws(`ffmpeg_sws_get_context` → `sws_getCoefficients`)と同じ選び方: 未指定は 601。 */
+  switch (anim->pCodecCtx->colorspace) {
+    case AVCOL_SPC_BT709:
+      r_frame.matrix = 709;
+      break;
+    case AVCOL_SPC_BT2020_NCL:
+    case AVCOL_SPC_BT2020_CL:
+      r_frame.matrix = 2020;
+      break;
+    default:
+      r_frame.matrix = 601;
+      break;
+  }
+  /* byte の絵に付く色空間と同じ名前(寿命の長い OCIO 側の文字列)。 */
+  r_frame.colorspace = IMB_colormanagement_colorspace_get_name(
+      colormanage_colorspace_get_named(anim->colorspace));
+  return true;
+#else
+  UNUSED_VARS(anim, position);
+  return false;
+#endif
+}
+
+const uint8_t *MOV_yuv_plane(const MovieYUVFrame &frame, const int plane, int *r_linesize)
+{
+#ifdef WITH_FFMPEG
+  const AVFrame *f = static_cast<const AVFrame *>(frame.frame);
+  if (f == nullptr || plane < 0 || plane >= 3) {
+    return nullptr;
+  }
+  *r_linesize = f->linesize[plane];
+  return f->data[plane];
+#else
+  UNUSED_VARS(frame, plane, r_linesize);
+  return nullptr;
+#endif
+}
+
+bool MOV_yuv_frame_download(MovieYUVFrame &frame)
+{
+#ifdef WITH_FFMPEG
+  AVFrame *f = static_cast<AVFrame *>(frame.frame);
+  if (f == nullptr || f->format != AV_PIX_FMT_CUDA) {
+    return f != nullptr;
+  }
+  AVFrame *sw = av_frame_alloc();
+  if (sw == nullptr || av_hwframe_transfer_data(sw, f, 0) < 0) {
+    av_frame_free(&sw);
+    return false;
+  }
+  av_frame_copy_props(sw, f);
+  av_frame_free(&f);
+  frame.frame = sw;
+  frame.layout = (frame.layout == 4) ? 1 : 2;
+  return true;
+#else
+  UNUSED_VARS(frame);
+  return false;
+#endif
+}
+
+void MOV_prefer_device_for_thread(const bool prefer_device)
+{
+#ifdef WITH_FFMPEG
+  falcon_prefer_device = prefer_device;
+#else
+  UNUSED_VARS(prefer_device);
+#endif
+}
+
+bool MOV_yuv_plane_copy_to_gpu_buffer(const MovieYUVFrame &frame,
+                                      const int plane,
+                                      const int64_t handle,
+                                      const size_t handle_size,
+                                      const bool is_vulkan_fd,
+                                      const int row_bytes,
+                                      const int rows)
+{
+#ifdef WITH_FFMPEG
+  const AVFrame *f = static_cast<const AVFrame *>(frame.frame);
+  if (f == nullptr || f->format != AV_PIX_FMT_CUDA || f->hw_frames_ctx == nullptr || plane < 0 ||
+      plane > 1 || row_bytes <= 0 || rows <= 0)
+  {
+    return false;
+  }
+  FalconCudaGL &api = falcon_cuda_gl();
+  if (!api.ok) {
+    return false;
+  }
+  const AVHWFramesContext *fc = reinterpret_cast<const AVHWFramesContext *>(
+      f->hw_frames_ctx->data);
+  const falcon_AVCUDADeviceContext *dc = static_cast<const falcon_AVCUDADeviceContext *>(
+      fc->device_ctx->hwctx);
+
+  /* CUDA の文脈は読み手全員で 1 つ。GL との受け渡しは 1 本ずつ通す。 */
+  static std::mutex mutex;
+  std::scoped_lock lock(mutex);
+  if (api.ctx_push(dc->cuda_ctx) != 0) {
+    return false;
+  }
+  bool ok = false;
+  auto copy_to = [&](const falcon_CUdeviceptr dst, const size_t size) {
+    if (size < size_t(row_bytes) * size_t(rows)) {
+      return false;
+    }
+    falcon_CUDA_MEMCPY2D c = {};
+    c.srcMemoryType = 2; /* CU_MEMORYTYPE_DEVICE */
+    c.srcDevice = falcon_CUdeviceptr(uintptr_t(f->data[plane]));
+    c.srcPitch = size_t(f->linesize[plane]);
+    c.dstMemoryType = 2;
+    c.dstDevice = dst;
+    c.dstPitch = size_t(row_bytes);
+    c.WidthInBytes = size_t(row_bytes);
+    c.Height = size_t(rows);
+    return api.memcpy2d(&c) == 0;
+  };
+  if (is_vulkan_fd) {
+    /* Vulkan: 書き出した fd を取り込む(取り込みに成功すると fd は CUDA のもの)。Cycles と同じ。 */
+    if (!api.vk_ok) {
+      close(int(handle));
+    }
+    else {
+      falcon_CUDA_EXTERNAL_MEMORY_HANDLE_DESC hd = {};
+      hd.type = 1;
+      hd.handle.fd = int(handle);
+      hd.size = handle_size;
+      void *ext = nullptr;
+      if (api.import_external(&ext, &hd) != 0) {
+        close(int(handle));
+      }
+      else {
+        falcon_CUDA_EXTERNAL_MEMORY_BUFFER_DESC bd = {};
+        bd.offset = 0;
+        bd.size = handle_size;
+        falcon_CUdeviceptr dst = 0;
+        if (api.external_mapped_buffer(&dst, ext, &bd) == 0) {
+          ok = copy_to(dst, handle_size);
+          api.mem_free(dst);
+        }
+        api.destroy_external(ext);
+      }
+    }
+    falcon_CUcontext popped_vk = nullptr;
+    api.ctx_pop(&popped_vk);
+    return ok;
+  }
+  falcon_CUgraphicsResource res = nullptr;
+  /* 2 = CU_GRAPHICS_REGISTER_FLAGS_WRITE_DISCARD(前の中身は要らない)。 */
+  if (api.gl_register_buffer(&res, unsigned(handle), 2) == 0) {
+    if (api.map(1, &res, nullptr) == 0) {
+      falcon_CUdeviceptr dst = 0;
+      size_t size = 0;
+      if (api.mapped_pointer(&dst, &size, res) == 0) {
+        ok = copy_to(dst, size);
+      }
+      api.unmap(1, &res, nullptr);
+    }
+    api.unregister(res);
+  }
+  falcon_CUcontext popped = nullptr;
+  api.ctx_pop(&popped);
+  return ok;
+#else
+  UNUSED_VARS(frame, plane, handle, handle_size, is_vulkan_fd, row_bytes, rows);
+  return false;
+#endif
+}
+
+void MOV_yuv_frame_free(MovieYUVFrame &frame)
+{
+#ifdef WITH_FFMPEG
+  AVFrame *f = static_cast<AVFrame *>(frame.frame);
+  av_frame_free(&f);
+#endif
+  frame.frame = nullptr;
+}
+
+void MOV_prefer_byte_for_thread(const bool prefer_byte)
+{
+#ifdef WITH_FFMPEG
+  falcon_prefer_byte = prefer_byte;
+#else
+  UNUSED_VARS(prefer_byte);
+#endif
+}
+
+bool MOV_take_byte_downgrade_happened()
+{
+#ifdef WITH_FFMPEG
+  return falcon_byte_downgrade_happened.exchange(false);
+#else
+  return false;
+#endif
 }
 
 ImBuf *MOV_decode_frame(MovieReader *anim, int position, IMB_Proxy_Size preview_size)

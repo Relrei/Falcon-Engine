@@ -15,6 +15,7 @@
 #include "BLI_set.hh"
 
 namespace blender {
+struct MovieYUVFrame;
 
 struct Depsgraph;
 struct ImBuf;
@@ -85,6 +86,16 @@ SeqResult seq_render_strip(const RenderData *context,
  */
 void seq_render_evict_caches_if_full(const RenderData *context);
 
+/** 動画ストリップを YUV の面のまま復号する(GPU 再生の経路用)。プロキシ・多視点・書き出しでは false。 */
+bool seq_render_movie_strip_yuv(const RenderData *context,
+                                Strip *strip,
+                                float timeline_frame,
+                                MovieYUVFrame &r_frame);
+/** 画像の連番の復号に使う糸の数(`FALCON_VSE_PREFETCH_DECODE_THREADS`)。1 以下なら並列にしない。 */
+int falcon_image_decode_threads();
+/** [from, to] のコマに出ている画像ストリップを複数の糸で復号し、素材キャッシュへ入れる。 */
+void falcon_decode_images_ahead(
+    const RenderData *context, const Scene *scene_eval, int from, int to, const bool *stop);
 SeqResult seq_render_strip_source_only(const RenderData *context,
                                        SeqRenderState *state,
                                        Strip *strip,

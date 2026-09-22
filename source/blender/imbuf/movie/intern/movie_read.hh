@@ -59,6 +59,16 @@ struct MovieReader {
   AVFrame *pFrameRGB = nullptr;
   AVFrame *pFrameDeinterlaced = nullptr;
   SwsContext *img_convert_ctx = nullptr;
+  /* Falcon: `img_convert_ctx` を作った時の入力の画素形式。GPU 復号(NVDEC)の絵は
+   * メインメモリへ移すと NV12 / P010 になるので、違ったら作り直す。 */
+  int img_convert_src_fmt = -1;
+  /* Falcon: GPU で復号しているか(`FALCON_VSE_NVDEC`)。 */
+  bool hw_decode = false;
+  AVFrame *pFrame_hw_download = nullptr;
+  /* Falcon: 8bit を超える動画をプレビュー用に 8bit で出す時の変換先と変換器。 */
+  AVFrame *pFrameRGB_byte = nullptr;
+  SwsContext *img_convert_ctx_byte = nullptr;
+  int img_convert_byte_src_fmt = -1;
   int videoStream = 0;
 
   AVFrame *pFrame = nullptr;
