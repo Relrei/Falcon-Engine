@@ -375,6 +375,7 @@ void SEQUENCER_OT_rename_channel(wmOperatorType *ot);
 void SEQUENCER_OT_channel_add(wmOperatorType *ot);
 void SEQUENCER_OT_channel_remove(wmOperatorType *ot);
 void SEQUENCER_OT_channel_flip(wmOperatorType *ot);
+void SEQUENCER_OT_channel_move(wmOperatorType *ot);
 
 /* `sequencer_preview.cc` */
 

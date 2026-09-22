@@ -29,6 +29,7 @@
 
 #include "WM_api.hh"
 
+#include "SEQ_relations.hh"
 #include "SEQ_sequencer.hh"
 #include "SEQ_time.hh"
 #include "SEQ_transform.hh"
@@ -238,6 +239,73 @@ void SEQUENCER_OT_channel_remove(wmOperatorType *ot)
   ot->poll = sequencer_channel_count_poll;
 
   ot->flag = OPTYPE_REGISTER | OPTYPE_UNDO;
+}
+
+/** \} */
+
+/* -------------------------------------------------------------------- */
+/** \name Falcon: swap two channels' content (2026-09-22)
+ *
+ * 本人「ここは前後の入れ替えを簡単にSwitchできるようにしたい」。チャンネル番号は
+ * そのまま前後関係(重なりの手前・奥)を決めているので、丸ごと入れ替えるには両方の
+ * チャンネルに乗っている Strip の `channel` を交換するだけでよい。時間方向へは
+ * 何も動かさない。
+ * \{ */
+
+static bool sequencer_channel_move_poll(bContext *C)
+{
+  Scene *scene = CTX_data_sequencer_scene(C);
+  return scene != nullptr && seq::editing_get(scene) != nullptr && !ID_IS_LINKED(&scene->id);
+}
+
+static wmOperatorStatus sequencer_channel_move_exec(bContext *C, wmOperator *op)
+{
+  Scene *scene = CTX_data_sequencer_scene(C);
+  Editing *ed = seq::editing_get(scene);
+  ListBaseT<Strip> *seqbase = seq::active_seqbase_get(ed);
+
+  const int channel = RNA_int_get(op->ptr, "channel");
+  const int other = channel + RNA_int_get(op->ptr, "direction");
+  if (other < 1 || other > seq::MAX_CHANNELS) {
+    return OPERATOR_CANCELLED;
+  }
+
+  bool changed = false;
+  for (Strip &strip : *seqbase) {
+    if (strip.channel == channel) {
+      strip.channel = other;
+      changed = true;
+    }
+    else if (strip.channel == other) {
+      strip.channel = channel;
+      changed = true;
+    }
+    else {
+      continue;
+    }
+    seq::relations_invalidate_cache(scene, &strip);
+  }
+  if (!changed) {
+    return OPERATOR_CANCELLED;
+  }
+
+  WM_event_add_notifier(C, NC_SCENE | ND_SEQUENCER, scene);
+  return OPERATOR_FINISHED;
+}
+
+void SEQUENCER_OT_channel_move(wmOperatorType *ot)
+{
+  ot->name = "Swap Channel";
+  ot->idname = "SEQUENCER_OT_channel_move";
+  ot->description = "Swap this channel's strips with the neighboring channel's";
+
+  ot->exec = sequencer_channel_move_exec;
+  ot->poll = sequencer_channel_move_poll;
+
+  ot->flag = OPTYPE_REGISTER | OPTYPE_UNDO;
+
+  RNA_def_int(ot->srna, "channel", 1, 1, seq::MAX_CHANNELS, "Channel", "", 1, seq::MAX_CHANNELS);
+  RNA_def_int(ot->srna, "direction", 1, -1, 1, "Direction", "-1 or 1", -1, 1);
 }
 
 /** \} */

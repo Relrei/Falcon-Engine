@@ -194,6 +194,49 @@ static float draw_channel_widget_lock(const SeqChannelDrawContext *context,
   return width;
 }
 
+/* Falcon: 「前後の入れ替えを簡単にSwitchできるようにしたい」。矢印は**画面の上下**を指す
+ * (反転(#seq::channel_flip_enabled)の間は上下でチャンネル番号の増減が逆になるので、
+ * ここで向きを畳んでおく)。 */
+static float draw_channel_widget_move(const SeqChannelDrawContext *context,
+                                      ui::Block *block,
+                                      const int channel_index,
+                                      const float offset,
+                                      const bool visually_up)
+{
+  float y = channel_index_y_min(context, channel_index) + widget_y_offset(context);
+  const float width = icon_width_get(context);
+
+  const bool flip = seq::channel_flip_enabled();
+  const int direction = (visually_up != flip) ? 1 : -1;
+  const int other = channel_index + direction;
+  const int icon = visually_up ? ICON_TRIA_UP : ICON_TRIA_DOWN;
+
+  block_emboss_set(block, ui::EmbossType::None);
+  ui::Button *but = uiDefIconButO(block,
+                                  ui::ButtonType::But,
+                                  "SEQUENCER_OT_channel_move",
+                                  wm::OpCallContext::ExecDefault,
+                                  icon,
+                                  context->v2d->cur.xmax / context->scale - offset,
+                                  y,
+                                  width,
+                                  width,
+                                  std::nullopt);
+  if (other < 1 || other > seq::MAX_CHANNELS) {
+    button_flag_enable(but, ui::BUT_DISABLED);
+  }
+  else {
+    PointerRNA *opptr = button_operator_ptr_ensure(but);
+    RNA_int_set(opptr, "channel", channel_index);
+    RNA_int_set(opptr, "direction", direction);
+  }
+
+  char *tooltip = BLI_sprintfN("Swap with channel %d", other);
+  button_func_tooltip_set(but, draw_channel_widget_tooltip, tooltip, MEM_delete_void);
+
+  return width;
+}
+
 static bool channel_is_being_renamed(const SpaceSeq *sseq, const int channel_index)
 {
   return sseq->runtime->rename_channel_index == channel_index;
@@ -299,12 +342,16 @@ static void draw_channel_headers(const SeqChannelDrawContext *context)
   const float icon_width = icon_width_get(context);
   const float offset_lock = icon_width * 1.5f;
   const float offset_mute = icon_width * 2.5f;
-  const float offset_width = icon_width * 3.5f;
+  const float offset_move_down = icon_width * 3.5f;
+  const float offset_move_up = icon_width * 4.5f;
+  const float offset_width = icon_width * 5.5f;
   /* Draw widgets separately from text labels so they are batched together,
    * instead of alternating between two fonts (regular and SVG/icons). */
   for (int channel = channel_range[0]; channel <= channel_range[1]; channel++) {
     draw_channel_widget_lock(context, block, channel, offset_lock);
     draw_channel_widget_mute(context, block, channel, offset_mute);
+    draw_channel_widget_move(context, block, channel, offset_move_up, true);
+    draw_channel_widget_move(context, block, channel, offset_move_down, false);
   }
   for (int channel = channel_range[0]; channel <= channel_range[1]; channel++) {
     draw_channel_labels(context, block, channel, offset_width);
