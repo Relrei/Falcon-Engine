@@ -31,6 +31,7 @@
 
 #include "WM_types.hh"
 
+#include "IMB_falcon_prefer_byte.hh"
 #include "IMB_imbuf.hh"
 #include "IMB_imbuf_types.hh"
 
@@ -532,6 +533,11 @@ static ImBuf *render_image_strip_frame(const ProxyBuildContext &context,
     flag |= ImBufFlags::AlphaPremul;
   }
 
+  /* Falcon: プロキシは速さのための下書き。16bit の画像でも `ImBufFlags::ByteData` だけでは
+   * float に化ける(basesize() で決まる・render.cc と同じ理由)ので、ここでは常に 8bit で
+   * 読む。放っておくと `save_float` が真になり、プロキシが EXR half になって「作ったのに
+   * 速くならない」(DaVinci の Optimized Media と違い、劣化コピーのはずが元と同じ重さの絵)。 */
+  IMB_prefer_byte_for_thread(true);
   if (prefix[0] == '\0') {
     ibuf = IMB_load_image_from_filepath(filepath, flag, strip.data->colorspace_settings.name);
   }
@@ -541,6 +547,7 @@ static ImBuf *render_image_strip_frame(const ProxyBuildContext &context,
     seq_multiview_name(context.scene, view_id, prefix, ext, filepath_view, FILE_MAX);
     ibuf = IMB_load_image_from_filepath(filepath_view, flag, strip.data->colorspace_settings.name);
   }
+  IMB_prefer_byte_for_thread(false);
   if (ibuf == nullptr) {
     return nullptr;
   }
