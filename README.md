@@ -96,14 +96,18 @@ https://developer.blender.org/docs/handbook/building_blender/linux/
 
 - 既定では DLSS 無し(`WITH_DLSS=OFF`)でビルドされます。
 - DLSS を使いたい時は、NVIDIA の DLSS SDK(https://github.com/NVIDIA/DLSS)のヘッダを用意して `-DWITH_DLSS=ON -DDLSS_SDK_ROOT=<SDK の場所>` でビルドしてください。
-- DLSS の本体(NVIDIA のランタイム `libnvidia-ngx-dlssd.so.<版>`)は、ライセンスの都合でこのリポジトリにも配布物にも入れていません。SDK の `lib/Linux_x86_64/rel/` から取って、下の①か②どちらかのフォルダへ置いてください(両方要りません)。
+- DLSS の本体(NVIDIA のランタイム `libnvidia-ngx-dlssd.so.<版>`)は、ライセンスの都合でこのリポジトリにも配布物にも入れていません。SDK の `lib/Linux_x86_64/rel/` から取ってきて、下の手順で置いてください。
 
-| 置き場所 | 具体的な例 | 効く範囲 |
-|---|---|---|
-| ① 実行ファイルと同じフォルダの中 | `make release` なら `../build_linux_release/bin/falcon_plugins/dlss/`(cmake 直なら `../build-falcon/bin/falcon_plugins/dlss/`) | その実行ファイルだけ |
-| ② Blender のユーザー設定フォルダの中 | `~/.config/blender/5.2/falcon_plugins/dlss/`(`5.2` の所は使っている Blender のバージョン番号) | そのユーザーの 5.2 系 Blender 全部 |
+**置き場所は自分でパスを探さず、ビルドした Falcon Engine 側のボタンで開くのが確実です**(フォルダが無ければそのボタンが自動で作ります):
 
-迷ったら①で大丈夫です。どちらも、フォルダの中身は同じです:
+1. 起動して 3D ビューポートでサイドバーを開く(`N` キー)→「**Falcon**」タブを選ぶ
+2. 「Plugins」パネルの **Open Plugin Folder** を押す → フォルダが無ければ作られ、ファイルマネージャがそこを開く
+3. 開いたフォルダへ `falcon_plugin.toml` と `libnvidia-ngx-dlssd.so.<版>` をコピーする
+4. 数秒で自動検出されます(反応しない時は同じパネルの **Rescan** を押す)。Preferences > Add-ons に「NVIDIA DLSS denoiser」が出るので有効にしてください。
+
+★上のボタンが開くのは Blender のユーザー設定フォルダの中(`<ユーザー設定>/falcon_plugins/dlss/`。Linux なら通常 `~/.config/blender/5.2/falcon_plugins/`)です。実行ファイルと同じフォルダの中の `falcon_plugins/dlss/` に手で作って置いても効きますが、そちらはその実行ファイルだけにしか効かず、フォルダも自分で作る必要があります。迷ったら上のボタンを使ってください。
+
+フォルダの中身はどちらも同じです:
 
 ```
 falcon_plugins/dlss/
@@ -137,4 +141,4 @@ NVIDIA と DLSS は NVIDIA Corporation の商標です。
 
 ---
 
-*English:* Falcon Engine is my personal custom build of Blender 5.2.2 — I fix the things that feel slow or awkward in my own video editing and rendering. It builds with the same steps as upstream Blender (`make update && make release`); only Linux x64 is verified. Windows is planned (the build may work, but many features are limited because they assume an NVIDIA GPU and an x86-64 CPU); macOS is not supported (I don't have a Mac to test on, sorry). It adds GPU-accelerated VSE playback (NVDEC decoding and on-GPU colour conversion without copying frames back to the CPU, 8-bit preview for 10-bit video, parallel decoding of image sequences), faster VSE export (a pass-through fast path and NVENC encoding, which needs an FFmpeg built with NVENC; the upstream precompiled FFmpeg has it disabled, so a plain build encodes on the CPU), VSE fixes, a VSE bridge add-on, and F-Cycles (Cycles with photon mapping, SHARC and dispersion for caustics). DLSS support is optional (`-DWITH_DLSS=ON -DDLSS_SDK_ROOT=...`); the NVIDIA DLSS SDK and runtime are not included. Place the runtime from the SDK, together with the `falcon_plugin.toml` manifest shown above, in `~/.config/blender/5.2/falcon_plugins/dlss/` (or `falcon_plugins/dlss/` next to the executable); the "NVIDIA DLSS denoiser" add-on then appears in Preferences > Add-ons, and enabling it offers DLSS as a denoiser. Features still in testing are not part of this repository. Bugs and progress are tracked in Issues — feel free to drop by.
+*English:* Falcon Engine is my personal custom build of Blender 5.2.2 — I fix the things that feel slow or awkward in my own video editing and rendering. It builds with the same steps as upstream Blender (`make update && make release`); only Linux x64 is verified. Windows is planned (the build may work, but many features are limited because they assume an NVIDIA GPU and an x86-64 CPU); macOS is not supported (I don't have a Mac to test on, sorry). It adds GPU-accelerated VSE playback (NVDEC decoding and on-GPU colour conversion without copying frames back to the CPU, 8-bit preview for 10-bit video, parallel decoding of image sequences), faster VSE export (a pass-through fast path and NVENC encoding, which needs an FFmpeg built with NVENC; the upstream precompiled FFmpeg has it disabled, so a plain build encodes on the CPU), VSE fixes, a VSE bridge add-on, and F-Cycles (Cycles with photon mapping, SHARC and dispersion for caustics). DLSS support is optional (`-DWITH_DLSS=ON -DDLSS_SDK_ROOT=...`); the NVIDIA DLSS SDK and runtime are not included. Place the runtime from the SDK, together with the `falcon_plugin.toml` manifest shown above, into the folder opened by the "Open Plugin Folder" button in the 3D viewport sidebar's Falcon tab (Plugins panel) — it creates the folder for you if missing; the "NVIDIA DLSS denoiser" add-on then appears in Preferences > Add-ons, and enabling it offers DLSS as a denoiser. Features still in testing are not part of this repository. Bugs and progress are tracked in Issues — feel free to drop by.
