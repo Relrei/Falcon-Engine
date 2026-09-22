@@ -25,23 +25,20 @@ Blender 5.2.2 をベースに、個人で手を入れているカスタムビル
 
 ### F-Cycles(レンダリング)
 
-- Cycles に光子(フォトン)・SHARC・分散を足し、コースティクスをチェック 1 つで出せるようにしたもの
-
-| コースティクス ON(焼いた点マップを合成) | コースティクス OFF(素の Cycles と画素一致) |
-|---|---|
-| ![コースティクスON](docs/images/2026-09-23-caustics-dlss/caustics-on.png) | ![コースティクスOFF](docs/images/2026-09-23-caustics-dlss/caustics-off.png) |
-
-チェックを切ると、焼いた物を一切足さず素の Cycles と同じ絵に戻ります(同じサンプル数で比較)。
+- Cycles に光子(フォトン)・SHARC・分散を足し、コースティクスをチェック 1 つで出せるようにしたもの。
+  チェックを切ると、焼いた物を一切足さず素の Cycles と同じ絵に戻ります(実測: 画素一致)。
+  ★分かりやすい比較画像は準備中です(単純な球体だけのテストシーンだと違いが伝わりにくいため)。
 
 ### DLSS
 
 - 受け口とプラグインフォルダ(下の「DLSS」)
 - アニメーションを書き出す時にメモリが尽きて落ちる不具合を修正(書き出しの間だけ永続データを自動で使う)
 
-![レンダープロパティのDenoiserにDLSSが出る](docs/images/2026-09-23-caustics-dlss/dlss-denoiser-panel.png)
+![レンダー(F12)側のDenoiserにDLSSが出る](docs/images/2026-09-23-caustics-dlss/dlss-denoiser-panel.png)
 
 プラグインフォルダに NVIDIA の DLSS ランタイムを置いてアドオンを有効にすると、
-Viewport / Render 双方の Denoiser に「DLSS」が選べるようになります。
+**レンダー(F12 で実際に出力する側)**の Denoiser に「DLSS」が選べるようになります
+(ビューポートのプレビュー側にも同じ選択肢が出ますが、実際に書き出されるのはレンダー側の設定です)。
 
 ## ビルド(Linux x64)
 
