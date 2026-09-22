@@ -235,6 +235,10 @@ def scan(context=None):
             if not os.path.isdir(p):
                 loose.append({"where": where, "path": p, "error": "unexpected file: %s" % fn})
                 continue
+            if not os.listdir(p):
+                # Empty placeholder folder (e.g. created up front by _ensure_folders): not an
+                # error, just nothing dropped in yet. Treat it as if it did not exist.
+                continue
             rec = check_plugin(p, plat)
             rec["where"] = where
             if rec["id"] and not rec["errors"] and not rec["info"]:
@@ -527,9 +531,24 @@ classes = (
 )
 
 
+def _ensure_folders():
+    """Create `<user config>/falcon_plugins/<kind>/` up front for every known kind, so a
+    first-time user finds an empty, correctly-named folder waiting instead of having to
+    create the path themselves (only the user-config place, not the env/bundle ones)."""
+    try:
+        user = bpy.utils.resource_path('USER')
+        if not user:
+            return
+        for kind in KINDS:
+            os.makedirs(os.path.join(user, FOLDER, kind), exist_ok=True)
+    except Exception as ex:  # never keep Cycles from registering
+        print("[Falcon plugins] ERROR: could not create plugin folder: %r" % ex)
+
+
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
+    _ensure_folders()
     try:
         rescan()
     except Exception as ex:  # never keep Cycles from registering
