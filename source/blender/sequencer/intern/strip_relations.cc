@@ -10,10 +10,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
 
 #include "DNA_scene_types.h"
 #include "DNA_sequence_types.h"
+
+#include "MEM_guardedalloc.h"
 
 #include "BLI_listbase.h"
 #include "BLI_math_base.h"
@@ -263,8 +266,56 @@ static bool seq_cache_keep_final_enabled()
   return keep;
 }
 
+/* 確認用の記録(`FALCON_VSE_CACHE_LOG=1`)。1 秒に 1 行、キャッシュが上限をどう数えて
+ * いるかと、プロセス全体(RSS)・Blender の確保(guarded)・機械の空きを並べて出す。
+ * 「上限を無視して膨らんでいるのか、上限の外で膨らんでいるのか」を切り分けるため。 */
+static void seq_cache_log_tick(const Scene *scene)
+{
+  static const bool enabled = []() {
+    const char *env = getenv("FALCON_VSE_CACHE_LOG");
+    return env != nullptr && env[0] != '0';
+  }();
+  if (!enabled) {
+    return;
+  }
+  static std::atomic<double> last{0.0};
+  const double now = BLI_time_now_seconds();
+  double prev = last.load();
+  if (now - prev < 1.0 || !last.compare_exchange_strong(prev, now)) {
+    return;
+  }
+  long rss_pages = 0;
+  if (FILE *f = fopen("/proc/self/statm", "r")) {
+    long dummy;
+    if (fscanf(f, "%ld %ld", &dummy, &rss_pages) != 2) {
+      rss_pages = 0;
+    }
+    fclose(f);
+  }
+  const size_t mb = 1024 * 1024;
+  const size_t src = source_image_cache_calc_memory_size(scene);
+  const size_t fin = final_image_cache_calc_memory_size(scene);
+  const size_t used = caches_calc_memory_size(scene);
+  printf("[vse-cache] t=%.1f limit=%zu used=%zu (src %zu x%zu / fin %zu x%zu) guarded=%zu "
+         "rss=%ld avail=%zu full=%d stop=%d\n",
+         now,
+         size_t(U.memcachelimit),
+         used / mb,
+         src / mb,
+         source_image_cache_get_image_count(scene),
+         fin / mb,
+         final_image_cache_get_image_count(scene),
+         MEM_get_memory_in_use() / mb,
+         rss_pages * 4096 / long(mb),
+         seq_system_memory_available_throttled() / mb,
+         int(is_cache_full(scene)),
+         int(cache_should_stop_growing(scene)));
+  fflush(stdout);
+}
+
 bool evict_caches_if_full(Scene *scene)
 {
+  seq_cache_log_tick(scene);
   if (!is_cache_full(scene)) {
     /* Cache is not full, we don't have to evict anything. */
     return false;

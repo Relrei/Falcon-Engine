@@ -2327,6 +2327,12 @@ void falcon_decode_images_ahead(
   {
     return;
   }
+  /* ★キャッシュが上限に当たっている・これ以上太れない時は先回りしない。入れた先から追い出されて
+   * 「12 コマ読んでは捨てる」を繰り返し、画面側がまた自分で読むので、並列にしない時より遅くなる
+   * (9-22 のデモ点検: キャッシュ 16GB の上限付近で PNG 区間が 0.6fps まで落ちた)。 */
+  if (is_cache_full(orig_scene) || cache_should_stop_growing(orig_scene)) {
+    return;
+  }
   Editing *ed = editing_get(scene_eval);
   if (ed == nullptr) {
     return;
