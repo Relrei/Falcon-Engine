@@ -466,6 +466,27 @@ def _falcon_caustics_on_update(self, context):
         _run()
 
 
+def _falcon_caustics_photon_update(self, context):
+    """ライトパス ▸ コースティクス のチェック(2026-09-22・本当の入口にする)。
+
+    点マップを足すかどうかは C++ 側が同じチェックを読んで決める(integrator の
+    falcon_caustics_on)。ここでやるのは 2 つだけ:
+      1. 焼いた物が効いている間は、Cycles 自身の集光をチェックの逆にする
+         (焼いた時に切った物。切ったままだと「素の Cycles と同じ絵」にならない)
+      2. 描き直しを起こす(アドオンのプロパティは画面から変えても depsgraph が動かない)
+    """
+    import os
+    if os.environ.get("FALCON_PHOTON_MODE") == "add":
+        pt = not bool(self.falcon_caustics_photon)
+        self.caustics_reflective = pt
+        self.caustics_refractive = pt
+    scene = self.id_data
+    try:
+        scene.update_tag()
+    except Exception:
+        pass
+
+
 class CyclesRenderSettings(bpy.types.PropertyGroup):
     __slots__ = ()
 
@@ -1547,6 +1568,7 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
                     "in Octane, it only works once enabled. While off, its settings are "
                     "hidden and no photon passes run (the same image as plain Cycles)",
         default=True,
+        update=_falcon_caustics_photon_update,
     )
     falcon_lt_mode: EnumProperty(
         name="Mode",

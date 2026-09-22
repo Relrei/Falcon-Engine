@@ -351,6 +351,7 @@ NODE_DEFINE(Integrator)
   SOCKET_FLOAT(falcon_photon_point_radius_m, "Falcon Photon Point Radius", 0.03f);
   SOCKET_FLOAT(falcon_photon_point_normal_deg, "Falcon Photon Point Normal Cone", 30.0f);
   SOCKET_FLOAT(falcon_photon_point_gain, "Falcon Photon Point Gain", 1.0f);
+  SOCKET_BOOLEAN(falcon_caustics_on, "Falcon Caustics", true);
   SOCKET_FLOAT(falcon_lt_gain, "Falcon LT Gain", 1.0f);
   SOCKET_FLOAT(falcon_lt_splat_radius, "Falcon LT Splat Radius", 0.0f);
   SOCKET_BOOLEAN(falcon_lt_visibility, "Falcon LT Visibility", false);
@@ -1111,7 +1112,10 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
                  << (accumulate ? " (accumulating)" : "");
       }
     }
-    if (photon_mode && strcmp(photon_mode, "add") == 0 && !sharc_active) {
+    /* ★2026-09-22: チェック(falcon_caustics_photon)を本当の入口にする。今までは Python の
+     * 出し分けだけで、焼いた物は環境変数で武装されたまま絵に足され続けていた(ビューポートで
+     * 入/切しても絵が変わらない)。ソケットなので切り替えると積分器が汚れて描き直しが走る。 */
+    if (photon_mode && strcmp(photon_mode, "add") == 0 && !sharc_active && falcon_caustics_on) {
       /* Point map (Round 9) takes priority: FALCON_PHOTON_POINTS file =
        * header {magic 'FPH1', uint32 count} + count * 9 floats (pos3, flux3,
        * normal3). The neighbor grid is rebuilt here every scene update, so the

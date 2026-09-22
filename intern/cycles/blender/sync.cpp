@@ -616,6 +616,7 @@ void BlenderSync::sync_integrator(blender::ViewLayer &b_view_layer,
     integrator->set_falcon_photon_point_normal_deg(
         get_float(cscene, "falcon_photon_point_normal_deg"));
     integrator->set_falcon_photon_point_gain(get_float(cscene, "falcon_photon_point_gain"));
+    integrator->set_falcon_caustics_on(get_boolean(cscene, "falcon_caustics_photon"));
     integrator->set_falcon_lt_gain(get_float(cscene, "falcon_lt_gain"));
     integrator->set_falcon_lt_splat_radius(get_float(cscene, "falcon_lt_blur"));
     integrator->set_falcon_lt_visibility(get_boolean(cscene, "falcon_lt_visibility"));

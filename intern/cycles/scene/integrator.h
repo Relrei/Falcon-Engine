@@ -190,6 +190,8 @@ class Integrator : public Node {
   NODE_SOCKET_API(float, falcon_photon_point_radius_m);
   NODE_SOCKET_API(float, falcon_photon_point_normal_deg);
   NODE_SOCKET_API(float, falcon_photon_point_gain);
+  /* Falcon: UI の「コースティクス」チェック。切ると焼いた点マップ/格子を足さない。 */
+  NODE_SOCKET_API(bool, falcon_caustics_on);
   NODE_SOCKET_API(float, falcon_lt_gain);
   NODE_SOCKET_API(float, falcon_lt_splat_radius);
   NODE_SOCKET_API(bool, falcon_lt_visibility);
