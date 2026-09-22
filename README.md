@@ -27,10 +27,21 @@ Blender 5.2.2 をベースに、個人で手を入れているカスタムビル
 
 - Cycles に光子(フォトン)・SHARC・分散を足し、コースティクスをチェック 1 つで出せるようにしたもの
 
+| コースティクス ON(焼いた点マップを合成) | コースティクス OFF(素の Cycles と画素一致) |
+|---|---|
+| ![コースティクスON](docs/images/2026-09-23-caustics-dlss/caustics-on.png) | ![コースティクスOFF](docs/images/2026-09-23-caustics-dlss/caustics-off.png) |
+
+チェックを切ると、焼いた物を一切足さず素の Cycles と同じ絵に戻ります(同じサンプル数で比較)。
+
 ### DLSS
 
 - 受け口とプラグインフォルダ(下の「DLSS」)
 - アニメーションを書き出す時にメモリが尽きて落ちる不具合を修正(書き出しの間だけ永続データを自動で使う)
+
+![レンダープロパティのDenoiserにDLSSが出る](docs/images/2026-09-23-caustics-dlss/dlss-denoiser-panel.png)
+
+プラグインフォルダに NVIDIA の DLSS ランタイムを置いてアドオンを有効にすると、
+Viewport / Render 双方の Denoiser に「DLSS」が選べるようになります。
 
 ## ビルド(Linux x64)
 
