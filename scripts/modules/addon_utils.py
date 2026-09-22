@@ -51,6 +51,9 @@ _addons_hidden_core = {
     "falcon_language",
     # Falcon Engine: VSE の代役(プロキシ)をボタン 1 つで用意する(既定で有効)。
     "falcon_vse_proxy",
+    # サードパーティ(usrname0・GPL-3.0-or-later・github.com/usrname0/BL_EasyCrop)。
+    # VSE プレビューでハンドルを掴んでクロップできる操作(Shift+C)。本人の要望で追加。
+    "bl_easycrop",
     "io_anim_bvh",
     "io_curve_svg",
     "io_mesh_uv_layout",
