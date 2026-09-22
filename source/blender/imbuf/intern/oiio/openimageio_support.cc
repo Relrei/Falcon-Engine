@@ -7,6 +7,7 @@
 #include <OpenImageIO/imagebufalgo.h>
 
 #include <algorithm>
+#include <atomic>
 
 #include "BLI_listbase.h"
 #include "BLI_string_utf8.h"
@@ -16,6 +17,7 @@
 #include "DNA_ID.h"
 
 #include "IMB_colormanagement.hh"
+#include "IMB_falcon_prefer_byte.hh"
 #include "IMB_filetype.hh"
 #include "IMB_metadata.hh"
 
@@ -185,13 +187,22 @@ static void set_file_colorspace(ImFileColorSpace &r_colorspace,
 /**
  * Get an #ImBuf filled in with pixel data and associated metadata using the provided ImageInput.
  */
+static thread_local bool falcon_prefer_byte = false;
+static std::atomic<bool> falcon_byte_downgrade_happened{false};
+
 static ImBuf *get_oiio_ibuf(ImageInput *in, const ReadContext &ctx, ImFileColorSpace &r_colorspace)
 {
   const ImageSpec &spec = in->spec();
   const int width = spec.width;
   const int height = spec.height;
   const bool has_alpha = spec.alpha_channel != -1;
-  const bool is_float = spec.format.basesize() > 1;
+  bool is_float = spec.format.basesize() > 1;
+  /* Falcon: プレビューでは 16bit 整数の画像を 8bit で読む(`IMB_prefer_byte_for_thread`)。
+   * 変換は OIIO が読む時に行う(16bit の値を 257 で割って丸める)。 */
+  if (is_float && falcon_prefer_byte && spec.format.basetype == TypeDesc::UINT16) {
+    is_float = false;
+    falcon_byte_downgrade_happened.store(true, std::memory_order_relaxed);
+  }
 
   /* Only a maximum of 4 channels are supported by ImBuf. */
   const int channels = spec.nchannels <= 4 ? spec.nchannels : 4;
@@ -547,4 +558,15 @@ ImageSpec imb_create_write_spec(const WriteContext &ctx, int file_channels, Type
 }
 
 }  // namespace imbuf
+
+void IMB_prefer_byte_for_thread(const bool prefer_byte)
+{
+  imbuf::falcon_prefer_byte = prefer_byte;
+}
+
+bool IMB_take_byte_downgrade_happened()
+{
+  return imbuf::falcon_byte_downgrade_happened.exchange(false);
+}
+
 }  // namespace blender

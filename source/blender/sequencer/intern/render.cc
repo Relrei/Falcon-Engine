@@ -50,6 +50,7 @@
 #include "GPU_context.hh"
 
 #include "IMB_colormanagement.hh"
+#include "IMB_falcon_prefer_byte.hh"
 #include "IMB_imbuf.hh"
 #include "IMB_imbuf_types.hh"
 #include "IMB_metadata.hh"
@@ -999,6 +1000,8 @@ void convert_multilayer_ibuf(ImBuf *ibuf)
 /**
  * Render individual view for multi-view or single (default view) for mono-view.
  */
+static bool falcon_preview_8bit();
+
 static ImBuf *seq_render_image_strip_view(const RenderData *context,
                                           Strip *strip,
                                           char *filepath,
@@ -1012,6 +1015,11 @@ static ImBuf *seq_render_image_strip_view(const RenderData *context,
   if (strip->alpha_mode == SEQ_ALPHA_PREMUL) {
     flag |= ImBufFlags::AlphaPremul;
   }
+
+  /* Falcon: プレビューでは 16bit の画像も 8bit で読む(`falcon_preview_8bit`)。
+   * 先回りの並列読み(`falcon_decode_images_ahead`)の糸もここを通る。 */
+  IMB_prefer_byte_for_thread(context->render == nullptr && falcon_preview_8bit());
+  BLI_SCOPED_DEFER([]() { IMB_prefer_byte_for_thread(false); });
 
   if (prefix[0] == '\0') {
     ibuf = IMB_load_image_from_filepath(filepath, flag, strip->data->colorspace_settings.name);
@@ -1314,8 +1322,11 @@ static void vse_prefetch_task_run(TaskPool * /*pool*/, void *taskdata)
    * captured from the main thread at dispatch time. `IMB_load_image_from_
    * filepath()` is confirmed thread-safe (task brief); nothing in
    * `imbuf/` is touched or modified here. */
+  /* Falcon: プレビューでは 16bit の画像も 8bit で読む(`falcon_preview_8bit`)。 */
+  IMB_prefer_byte_for_thread(data->context.render == nullptr && falcon_preview_8bit());
   ImBuf *ibuf = IMB_load_image_from_filepath(
       data->filepath.c_str(), data->flag, data->colorspace);
+  IMB_prefer_byte_for_thread(false);
 
   if (ibuf != nullptr) {
     convert_multilayer_ibuf(ibuf);
@@ -2681,7 +2692,9 @@ ImBuf *render_give_ibuf(const RenderData *context, float timeline_frame, int cha
 
   /* Falcon: プレビューで 8bit へ落とした動画の絵がキャッシュに残っていたら、書き出しの前に捨てる
    * (`falcon_preview_8bit`)。書き出しは浮動小数で読み直す。 */
-  if (context->render != nullptr && MOV_take_byte_downgrade_happened()) {
+  if (context->render != nullptr &&
+      (MOV_take_byte_downgrade_happened() | IMB_take_byte_downgrade_happened()))
+  {
     cache_cleanup(scene, CacheCleanup::All);
   }
 
