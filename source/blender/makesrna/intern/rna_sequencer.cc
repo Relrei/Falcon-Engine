@@ -28,6 +28,7 @@
 #include "UI_resources.hh"
 
 #include "SEQ_effects.hh"
+#include "SEQ_prefetch.hh"
 #include "SEQ_sequencer.hh"
 #include "SEQ_sound.hh"
 
@@ -578,6 +579,13 @@ static bool rna_SequenceEditor_selected_retiming_key_get(PointerRNA *ptr)
 {
   Scene *scene = id_cast<Scene *>(ptr->owner_id);
   return seq::retiming_selection_get(seq::editing_get(scene)).size() != 0;
+}
+
+/* Falcon: UI に「読み込み中」を出すための問い合わせ専用(#SEQ_prefetch.hh)。 */
+static bool rna_SequenceEditor_is_prefetching_get(PointerRNA *ptr)
+{
+  Scene *scene = id_cast<Scene *>(ptr->owner_id);
+  return seq::prefetch_is_catching_up(scene);
 }
 
 static void rna_Strip_views_format_update(Main *bmain, Scene *scene, PointerRNA *ptr)
@@ -2995,6 +3003,15 @@ static void rna_def_editor(BlenderRNA *brna)
   prop = RNA_def_property(srna, "selected_retiming_keys", PROP_BOOLEAN, PROP_NONE);
   RNA_def_property_ui_text(prop, "Retiming Key Selection Status", "");
   RNA_def_property_boolean_funcs(prop, "rna_SequenceEditor_selected_retiming_key_get", nullptr);
+  RNA_def_property_clear_flag(prop, PROP_EDITABLE);
+
+  prop = RNA_def_property(srna, "is_prefetching", PROP_BOOLEAN, PROP_NONE);
+  RNA_def_property_ui_text(
+      prop,
+      "Prefetching",
+      "The playback cache is still catching up on newly added or edited media "
+      "(playback may stutter until it finishes)");
+  RNA_def_property_boolean_funcs(prop, "rna_SequenceEditor_is_prefetching_get", nullptr);
   RNA_def_property_clear_flag(prop, PROP_EDITABLE);
 
   prop = RNA_def_property(srna, "show_overlay_frame", PROP_BOOLEAN, PROP_NONE);

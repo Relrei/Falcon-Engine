@@ -782,11 +782,10 @@ bool prefetch_need_redraw(const bContext *C, Scene *scene)
   bool running = seq_prefetch_job_is_running(scene);
   bool suspended = seq_prefetch_job_is_waiting(scene);
 
-  SpaceSeq *sseq = CTX_wm_space_seq(C);
-  bool showing_cache = sseq->cache_overlay.flag & SEQ_CACHE_SHOW;
-
-  /* force redraw, when prefetching and using cache view. */
-  if (running && !playing && !suspended && showing_cache) {
+  /* force redraw while prefetching is still catching up (used to require the cache
+   * overlay to be on; Falcon also drives the header's "loading" indicator off this,
+   * which needs the redraw regardless of whether the overlay is shown). */
+  if (running && !playing && !suspended) {
     return true;
   }
   /* Sometimes scrubbing flag is set when not scrubbing. In that case I want to catch "event" of
@@ -795,6 +794,11 @@ bool prefetch_need_redraw(const bContext *C, Scene *scene)
     return true;
   }
   return false;
+}
+
+bool prefetch_is_catching_up(Scene *scene)
+{
+  return seq_prefetch_job_is_running(scene) && !seq_prefetch_job_is_waiting(scene);
 }
 
 }  // namespace seq

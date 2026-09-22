@@ -90,11 +90,25 @@ class SEQUENCER_HT_header(Header):
 
         SEQUENCER_MT_editor_menus.draw_collapsible(context, layout)
 
+        # Falcon: 「チャンネル」欄(左のトラック名の列)は今まで境目をドラッグしてしか
+        # 出し入れできず、既存の `show_region_channels` も View メニューの奥にしか
+        # 無く気付きにくかった。ヘッダーに常時見えるボタンとして置く。
+        if st.view_type == 'SEQUENCER':
+            row = layout.row(align=True)
+            row.prop(st, "show_region_channels", text="", icon='OUTLINER')
+
         layout.separator_spacer()
 
         scene = context.sequencer_scene
         tool_settings = scene.tool_settings if scene else None
         sequencer_tool_settings = tool_settings.sequencer_tool_settings if tool_settings else None
+
+        # Falcon: 連番/動画を足した直後は裏でキャッシュを埋めている最中で、
+        # そのままだと理由も分からず再生がもたつく。追いついている間だけ出す。
+        ed = scene.sequence_editor if scene else None
+        if ed is not None and ed.is_prefetching:
+            row = layout.row(align=True)
+            row.label(text="Loading...", icon='SORTTIME')
 
         if st.view_type in {'SEQUENCER', 'SEQUENCER_PREVIEW'}:
             row = layout.row(align=True)
@@ -119,6 +133,16 @@ class SEQUENCER_HT_header(Header):
             layout.prop(st, "display_mode", text="", icon_only=True)
             layout.prop(st, "preview_channels", text="", icon_only=True)
 
+            # Falcon: プレビューの解像度(スケール)をヘッダーから直接変えたいという要望。
+            # 中身は既存の `proxy_render_size`(今まで Proxy メニューの奥だけ)。
+            row = layout.row(align=True)
+            row.prop(st, "proxy_render_size", text="")
+
+            # Falcon: 「チャンネルのショートカット」要望。中身は既存の `display_channel`
+            # (これ以下のチャンネルだけプレビューする・今まで View メニューの奥だけ)。
+            row = layout.row(align=True)
+            row.prop(st, "display_channel", text="")
+
             # Gizmo toggle & popover.
             row = layout.row(align=True)
             # FIXME: place-holder icon.
@@ -129,6 +153,12 @@ class SEQUENCER_HT_header(Header):
                 panel="SEQUENCER_PT_gizmo_display",
                 text="",
             )
+
+        # Falcon: フレーム番号かタイムコード(秒)かが見た目だけでは分からない
+        # ("00:15+01" のような表示が数字だけでは判別できない)という指摘を受けて追加。
+        # 既存の `show_seconds` はメニューの奥にしかなく気付きにくかった。
+        row = layout.row(align=True)
+        row.prop(st, "show_seconds", text="", icon='TIME')
 
         row = layout.row(align=True)
         row.prop(st, "show_overlays", text="", icon='OVERLAY')
