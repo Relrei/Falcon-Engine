@@ -11,11 +11,11 @@ Blender 5.2.2 をベースに、個人で手を入れているカスタムビル
 ### VSE(動画編集)
 
 - **書き出しの高速化**: 切っただけの区間は復号も符号化もせずに通す(fast path)・GPU での符号化(NVENC)・GPU で開けない時は CPU の符号化へ落とす
-- **再生を GPU で**: 動画は GPU でデコード(NVDEC)し、色の変換と表示まで CPU のメモリに降ろさずに GPU の中で完結(NVIDIA の GPU がある時・既定で有効)。10bit の動画もプレビューでは 8bit で読むので軽く、画像の連番(PNG など)は複数の処理で先読み
+- **再生時のデコードを GPU で**: NVIDIA の GPU がある時は、動画を GPU でデコード(NVDEC)します(既定で有効)。狙いは速さよりも CPU の負担を減らすことで、再生の速さは素材によって変わります。8bit の動画は色の変換も GPU で行います。10bit の動画はプレビューだけ 8bit で読み、画像の連番(PNG など)は複数の処理で先読みします
 - **チャンネル**: 段を 10 まで増やせる・段の並びを上下逆にできる(`FALCON_VSE_CHANNELS` / `FALCON_VSE_FLIP_CHANNELS`)・上下の矢印ボタンで隣のチャンネルと中身をまるごと前後入れ替え
 - **ヘッダーの表示切り替え**: 秒/フレーム表示・チャンネル欄の開閉・プレビュー解像度・チャンネル番号を常時表示(今まではメニューの奥)
 - **クロップ**: プレビューでハンドルをドラッグして範囲を決められる([BL Easy Crop](https://github.com/usrname0/BL_EasyCrop) をサードパーティ製として同梱・GPL-3.0-or-later)
-- **プロキシ・キャッシュ**: 追加した映像も自動でスムーズに再生する仕組み(16bit の画像連番にも対応)・書き出しの末尾のコマの直し・書き出しで何が効いたかを 1 行で出す・書き出し後にメモリを返す
+- **プロキシ・キャッシュ**: 最初に 1 回設定すると、あとから追加した映像にもプレビュー用のプロキシを自動で作る仕組み(16bit の画像連番で正しく作れなかった不具合を修正)・書き出しの末尾のコマの直し・書き出しで何が効いたかを 1 行で出す・書き出し後にメモリを返す
 - **連携アドオン**(レンダーエンジン「VSE」と書き出しのプリセット)
 - **再生中の不具合修正**: Strip を削除すると落ちる不具合・再生開始直後だけ GPU が正しく使われない不具合
 
@@ -23,7 +23,8 @@ Blender 5.2.2 をベースに、個人で手を入れているカスタムビル
 
 ### F-Cycles(レンダリング)
 
-- Cycles に光子(フォトン)・SHARC・分散を足し、コースティクスをチェック 1 つで出せるようにしたもの。
+- Cycles に光子(フォトン)・SHARC・分散を足して、コースティクスを出せるようにしたものです。**既定は無効**で、
+  チェックを入れると光子を自動で焼いて、以降のレンダーに足します。**まだ試験中**で、シーンによっては落ちる不具合が分かっています。
   チェックを切ると、焼いた物を一切足さず素の Cycles と同じ絵に戻ります(実測: 画素一致)。
   ★分かりやすい比較画像は準備中です(単純な球体だけのテストシーンだと違いが伝わりにくいため)。
 
@@ -82,7 +83,7 @@ cmake -B ../build-falcon -DWITH_CYCLES_DEVICE_ONEAPI=OFF -DWITH_CYCLES_ONEAPI_BI
 | `../build-falcon/bin/blender` | そちらで建てた時の実行ファイル |
 
 いまのところ、動作を確かめているのは Linux x64 だけです。
-- **Windows**: 対応するつもりです。ビルド自体は本家と同じ手順で通るかもしれませんが、まだ試せていません。
+- **Windows**: 対応するつもりです。いまビルドを試している最中で、まだ通っていません。
   足した機能は NVIDIA の GPU(CUDA / NVENC / DLSS)と x86-64 の CPU が前提の物が多いので、使えない機能がそれなりに出ると思います。
 - **macOS**: 対応しません。足した機能の多くが NVIDIA の GPU と x86-64 の CPU 前提なのと、私が Mac を持っていなくて確かめようがないためです。ごめんなさい。
 
@@ -144,4 +145,4 @@ NVIDIA と DLSS は NVIDIA Corporation の商標です。
 
 ---
 
-*English:* Falcon Engine is my personal custom build of Blender 5.2.2 — I fix the things that feel slow or awkward in my own video editing and rendering. It builds with the same steps as upstream Blender (`make update && make release`); only Linux x64 is verified. Windows is planned (the build may work, but many features are limited because they assume an NVIDIA GPU and an x86-64 CPU); macOS is not supported (I don't have a Mac to test on, sorry). It adds GPU-accelerated VSE playback (NVDEC decoding and on-GPU colour conversion without copying frames back to the CPU, 8-bit preview for 10-bit video, parallel decoding of image sequences), faster VSE export (a pass-through fast path and NVENC encoding, which needs an FFmpeg built with NVENC; the upstream precompiled FFmpeg has it disabled, so a plain build encodes on the CPU), VSE fixes, a VSE bridge add-on, and F-Cycles (Cycles with photon mapping, SHARC and dispersion for caustics). DLSS support is optional (`-DWITH_DLSS=ON -DDLSS_SDK_ROOT=...`); the NVIDIA DLSS SDK and runtime are not included. The plugin folder (`falcon_plugins/dlss/` under Blender's user config folder) is created empty on first launch, so just drop the runtime there together with the `falcon_plugin.toml` manifest shown above; if you'd rather browse to it than type the path, the "Open Plugin Folder" button in the 3D viewport sidebar's Falcon tab, Plugins panel, opens it for you (that tab only shows up while the render engine is set to Cycles — Blender defaults to EEVEE). The "NVIDIA DLSS denoiser" add-on then appears in Preferences > Add-ons, and enabling it offers DLSS as a denoiser. Features still in testing are not part of this repository. Bugs and progress are tracked in Issues — feel free to drop by.
+*English:* Falcon Engine is my personal custom build of Blender 5.2.2 — I fix the things that feel slow or awkward in my own video editing and rendering. It builds with the same steps as upstream Blender (`make update && make release`); only Linux x64 is verified. Windows is planned (a Windows build is being tried but does not pass yet, and many features will be limited because they assume an NVIDIA GPU and an x86-64 CPU); macOS is not supported (I don't have a Mac to test on, sorry). It adds GPU video decoding for VSE playback (NVDEC, mainly to lower CPU load — playback speed depends on the footage; 8-bit preview for 10-bit video, parallel decoding of image sequences), faster VSE export (a pass-through fast path and NVENC encoding, which needs an FFmpeg built with NVENC; the upstream precompiled FFmpeg has it disabled, so a plain build encodes on the CPU), VSE fixes, a VSE bridge add-on, and F-Cycles (caustics for Cycles with photon mapping, SHARC and dispersion — off by default; ticking the checkbox bakes the photons automatically and adds them to the following renders; still experimental, with known crashes in some scenes). DLSS support is optional (`-DWITH_DLSS=ON -DDLSS_SDK_ROOT=...`); the NVIDIA DLSS SDK and runtime are not included. The plugin folder (`falcon_plugins/dlss/` under Blender's user config folder) is created empty on first launch, so just drop the runtime there together with the `falcon_plugin.toml` manifest shown above; if you'd rather browse to it than type the path, the "Open Plugin Folder" button in the 3D viewport sidebar's Falcon tab, Plugins panel, opens it for you (that tab only shows up while the render engine is set to Cycles — Blender defaults to EEVEE). The "NVIDIA DLSS denoiser" add-on then appears in Preferences > Add-ons, and enabling it offers DLSS as a denoiser. Features still in testing are not part of this repository. Bugs and progress are tracked in Issues — feel free to drop by.
