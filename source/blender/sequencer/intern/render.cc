@@ -641,6 +641,20 @@ static bool vse_modifier_scale_before_apply_enabled()
   return enabled;
 }
 
+/* Compositor モディファイアは、走った後に `result.translation` へ足す(MOD_compositor.cc)。それを使う変形は
+ * モディファイアの**後**でないと行えない。加えて、ノードの数値(ぼかしの画素数・移動量など)は「その絵の画素」の
+ * 単位なので、縮めた後の絵で走らせると出力の大きさで結果が変わる。上流と同じ順に保つため、
+ * これを持つストリップは「縮めてからモディファイア」の道(`scale_before_modifiers`)へ入れない。 */
+static bool strip_has_compositor_modifier(const Strip *strip)
+{
+  for (StripModifierData &smd : strip->modifiers) {
+    if (smd.type == eSeqModifierType_Compositor) {
+      return true;
+    }
+  }
+  return false;
+}
+
 static SeqResult input_preprocess(const RenderData *context,
                                   SeqRenderState *state,
                                   Strip *strip,
@@ -729,6 +743,7 @@ static SeqResult input_preprocess(const RenderData *context,
 
   const bool scale_before_modifiers = strip->modifiers.first != nullptr &&
                                       need_transform_pre_modifiers && would_downscale &&
+                                      !strip_has_compositor_modifier(strip) &&
                                       vse_modifier_scale_before_apply_enabled();
 
   if (scale_before_modifiers) {
@@ -1003,6 +1018,14 @@ void convert_multilayer_ibuf(ImBuf *ibuf)
  */
 static bool falcon_preview_8bit();
 
+/* 画面のプレビュー・先読みか(8bit へ落としてよい場面)。★`context->render` だけでは書き出しと
+ * 区別できない: `render.opengl(sequencer=True)`(render_opengl.cc)も `render` は空のまま実際の出力を書く。
+ * あちらは必ず `gpu_offscreen` を持つ(`render_new_render_data()` は空にするので、プレビューは空のまま)。 */
+static bool falcon_context_is_preview(const RenderData *context)
+{
+  return context->render == nullptr && context->gpu_offscreen == nullptr;
+}
+
 static ImBuf *seq_render_image_strip_view(const RenderData *context,
                                           Strip *strip,
                                           char *filepath,
@@ -1019,7 +1042,7 @@ static ImBuf *seq_render_image_strip_view(const RenderData *context,
 
   /* Falcon: プレビューでは 16bit の画像も 8bit で読む(`falcon_preview_8bit`)。
    * 先回りの並列読み(`falcon_decode_images_ahead`)の糸もここを通る。 */
-  IMB_prefer_byte_for_thread(context->render == nullptr && falcon_preview_8bit());
+  IMB_prefer_byte_for_thread(falcon_context_is_preview(context) && falcon_preview_8bit());
   BLI_SCOPED_DEFER([]() { IMB_prefer_byte_for_thread(false); });
 
   if (prefix[0] == '\0') {
@@ -1324,7 +1347,7 @@ static void vse_prefetch_task_run(TaskPool * /*pool*/, void *taskdata)
    * filepath()` is confirmed thread-safe (task brief); nothing in
    * `imbuf/` is touched or modified here. */
   /* Falcon: プレビューでは 16bit の画像も 8bit で読む(`falcon_preview_8bit`)。 */
-  IMB_prefer_byte_for_thread(data->context.render == nullptr && falcon_preview_8bit());
+  IMB_prefer_byte_for_thread(falcon_context_is_preview(&data->context) && falcon_preview_8bit());
   ImBuf *ibuf = IMB_load_image_from_filepath(
       data->filepath.c_str(), data->flag, data->colorspace);
   IMB_prefer_byte_for_thread(false);
@@ -1584,7 +1607,7 @@ static ImBuf *seq_render_movie_strip_view(const RenderData *context,
 
   /* Falcon: プレビューでは 8bit を超える動画も 8bit の絵で読む(`falcon_preview_8bit`)。
    * 書き出し(`context->render` がある時)は今まで通り浮動小数。 */
-  MOV_prefer_byte_for_thread(context->render == nullptr && falcon_preview_8bit());
+  MOV_prefer_byte_for_thread(falcon_context_is_preview(context) && falcon_preview_8bit());
   BLI_SCOPED_DEFER([]() { MOV_prefer_byte_for_thread(false); });
 
   if (can_use_proxy(context, strip, psize)) {
@@ -2729,6 +2752,12 @@ static void falcon_decode_movies_parallel(const RenderData *context,
   {
     return;
   }
+  /* 空きが柔らかい下限を割っている間は素材キャッシュへ入れられない(`cache_should_stop_growing`)。
+   * 並列に復号しても入れた先から捨てるだけで、錠の中でもう一度読むことになる
+   * (`falcon_decode_images_ahead` と同じ判断)。 */
+  if (cache_should_stop_growing(orig_scene)) {
+    return;
+  }
   /* `seq_render_strip_stack` が上から見て実際に描く物だけ。REPLACE か「不透明で画面を覆う alpha over」で
    * 止まる(その下は隠れる)。★`is_opaque_alpha_over()` だけでは止めない — それは絵の中身が不透明かで、
    * 縮めた動画は透明な縁を持つので下も描かれる。判定は保守的で、読まなかった分は今まで通り錠の中で順に読む。 */
@@ -2786,7 +2815,7 @@ ImBuf *render_give_ibuf(const RenderData *context, float timeline_frame, int cha
 
   /* Falcon: プレビューで 8bit へ落とした動画の絵がキャッシュに残っていたら、書き出しの前に捨てる
    * (`falcon_preview_8bit`)。書き出しは浮動小数で読み直す。 */
-  if (context->render != nullptr &&
+  if (!falcon_context_is_preview(context) &&
       (MOV_take_byte_downgrade_happened() | IMB_take_byte_downgrade_happened()))
   {
     cache_cleanup(scene, CacheCleanup::All);

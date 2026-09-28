@@ -36,6 +36,7 @@
 
 #include "MOV_read.hh"
 
+#include "SEQ_gpu_preview.hh"
 #include "SEQ_iterator.hh"
 #include "SEQ_prefetch.hh"
 #include "SEQ_preview_cache.hh"
@@ -182,12 +183,14 @@ static bool seq_system_memory_is_low()
 
 size_t caches_calc_memory_size_unique(const Scene *scene)
 {
-  Set<const ImBuf *> seen;
+  /* 大きさは集める時に(各キャッシュの錠の中で)測ってある。ここで `ImBuf` を読み直すと、
+   * 錠を放した後に別のスレッドが追い出した絵を読むことがある。 */
+  Map<const ImBuf *, size_t> seen;
   source_image_cache_collect_images(scene, seen);
   final_image_cache_collect_images(scene, seen);
   size_t size = 0;
-  for (const ImBuf *ibuf : seen) {
-    size += IMB_get_size_in_memory(ibuf);
+  for (const size_t ibuf_size : seen.values()) {
+    size += ibuf_size;
   }
   return size;
 }
@@ -433,6 +436,9 @@ void relations_invalidate_cache(Scene *scene, Strip *strip)
   /* Needed to update VSE sound. */
   DEG_id_tag_update(&scene->id, ID_RECALC_SEQUENCER_STRIPS);
   prefetch_stop(scene);
+  /* Falcon: GPU プレビューの輪は、上の `preview_cache_invalidate()` で一度空にしてあるが、その時点では
+   * 先読みの糸がまだ走っていて、編集前の絵を作って輪へ預け直すことがある。糸が止まった後でもう一度空にする。 */
+  gpu_preview_ring_clear();
 }
 
 void relations_tag_temporary_animation_frame(Scene *scene)

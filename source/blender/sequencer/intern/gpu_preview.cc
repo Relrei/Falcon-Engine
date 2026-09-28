@@ -49,6 +49,7 @@
 #include "SEQ_gpu_preview.hh"
 #include "SEQ_prefetch.hh"
 #include "SEQ_iterator.hh"
+#include "SEQ_relations.hh"
 #include "SEQ_render.hh"
 #include "SEQ_sequencer.hh"
 
@@ -303,7 +304,9 @@ static bool strip_is_eligible(const Strip *strip, const bool is_bottom, int *r_u
   if (strip->modifiers.first != nullptr) {
     return false;
   }
-  if ((strip->flag & (SEQ_DEINTERLACE | SEQ_MAKE_FLOAT)) != 0) {
+  /* 上下・左右の反転は `input_preprocess()` が変形の後で画素を裏返す。GPU 側の行列には鏡の項が無いので、
+   * 通すと反転していない絵が出る(`strip_fastpath.cc` も同じ理由で外している)。 */
+  if ((strip->flag & (SEQ_DEINTERLACE | SEQ_MAKE_FLOAT | SEQ_FLIPX | SEQ_FLIPY)) != 0) {
     return false;
   }
   if (strip->sat != 1.0f || strip->mul != 1.0f) {
@@ -524,8 +527,12 @@ static std::atomic<bool> g_yuv_shader_failed{false};
 
 static gpu::Shader *gpu_yuv_shader()
 {
+  /* 主スレッドと先読みのスレッドの両方から呼ばれる。錠を取らないと、片方が `tried` だけ
+   * 立った状態(`shader` はまだ空)を見て「作れなかった」と取り違える。 */
+  static std::mutex mutex;
   static gpu::Shader *shader = nullptr;
   static bool tried = false;
+  std::lock_guard<std::mutex> lock(mutex);
   if (tried) {
     return shader;
   }
@@ -826,8 +833,20 @@ static gpu::Texture *gpu_preview_composite(const RenderData *context,
 
   Vector<GpuYuvTextures> yuv_textures(layers.size());
 
+  /* 1 層でも送れなかったら、その 1 コマは GPU 経路で返さない(層が欠けた絵を「正しい 1 コマ」として
+   * 輪や画面へ渡さない)。呼び手は nullptr を受けて今までの CPU 経路へ落ちる。 */
+  bool failed = false;
+
   for (const int64_t li : layers.index_range()) {
     GpuLayer &layer = layers[li];
+
+    if (failed) {
+      /* 前の層で失敗した。残りは描かずに手放すだけ。 */
+      IMB_freeImBuf(layer.image);
+      layer.image = nullptr;
+      MOV_yuv_frame_free(layer.yuv);
+      continue;
+    }
 
     /* 動画を YUV の面のまま持っている層: 面を送って、シェーダで RGB にしながら描く。 */
     if (layer.image == nullptr && layer.yuv.frame != nullptr) {
@@ -901,6 +920,9 @@ static gpu::Texture *gpu_preview_composite(const RenderData *context,
         immUnbindProgram();
         immBindBuiltinProgram(GPU_SHADER_3D_IMAGE_COLOR);
       }
+      else {
+        failed = true;
+      }
       MOV_yuv_frame_free(layer.yuv);
       continue;
     }
@@ -945,6 +967,9 @@ static gpu::Texture *gpu_preview_composite(const RenderData *context,
     }
     src_textures[li] = tex;
     if (tex == nullptr) {
+      failed = true;
+      IMB_freeImBuf(layer.image);
+      layer.image = nullptr;
       continue;
     }
 
@@ -1014,6 +1039,11 @@ static gpu::Texture *gpu_preview_composite(const RenderData *context,
   }
   GPU_framebuffer_free(fb);
 
+  if (failed) {
+    GPU_texture_free(out);
+    return nullptr;
+  }
+
   /* ★表示側の標本の仕方を CPU 経路(`create_texture()`)と合わせる。
    * 合わせないと、プレビューを縮小表示している時だけ片方が滑らかになって絵が変わる
    * (2026-09-20: これを忘れて最大差 102 段の食い違いが出た)。 */
@@ -1031,6 +1061,9 @@ static gpu::Texture *gpu_preview_composite(const RenderData *context,
  * \{ */
 
 struct GpuFrameItem {
+  /** 元のシーン(先読みの側は複製を持つので `prefetch_get_original_scene()` で揃える)。
+   * 別のシーンの同じコマ番号・同じ大きさの絵を取り違えないため。 */
+  const Scene *scene = nullptr;
   int timeline_frame = -1;
   int view_id = -1;
   int chanshown = -1;
@@ -1040,10 +1073,16 @@ struct GpuFrameItem {
   gpu::Texture *texture = nullptr;
   const char *colorspace = nullptr;
 
-  bool matches(const int frame, const int view, const int chan, const int w, const int h) const
+  bool matches(const Scene *scene_orig,
+               const int frame,
+               const int view,
+               const int chan,
+               const int w,
+               const int h) const
   {
-    return this->texture != nullptr && this->timeline_frame == frame && this->view_id == view &&
-           this->chanshown == chan && this->width == w && this->height == h;
+    return this->texture != nullptr && this->scene == scene_orig &&
+           this->timeline_frame == frame && this->view_id == view && this->chanshown == chan &&
+           this->width == w && this->height == h;
   }
 };
 
@@ -1069,6 +1108,7 @@ void gpu_preview_ring_clear()
       GPU_texture_free(item.texture);
       item.texture = nullptr;
     }
+    item.scene = nullptr;
     item.timeline_frame = -1;
   }
 }
@@ -1132,10 +1172,13 @@ bool gpu_preview_produce(const RenderData *context, const float timeline_frame, 
   }
 
   /* 既にあるなら作らない。 */
+  const Scene *scene_orig = prefetch_get_original_scene(context);
   {
     std::lock_guard<std::mutex> lock(g_ring.mutex);
     for (GpuFrameItem &item : g_ring.items) {
-      if (item.matches(frame, context->view_id, chanshown, context->rectx, context->recty)) {
+      if (item.matches(
+              scene_orig, frame, context->view_id, chanshown, context->rectx, context->recty))
+      {
         return true;
       }
     }
@@ -1195,6 +1238,7 @@ bool gpu_preview_produce(const RenderData *context, const float timeline_frame, 
         GPU_texture_free(slot->texture);
       }
       slot->texture = texture;
+      slot->scene = scene_orig;
       slot->timeline_frame = frame;
       slot->view_id = context->view_id;
       slot->chanshown = chanshown;
@@ -1232,6 +1276,11 @@ gpu::Texture *gpu_preview_render(const RenderData *context,
   const int frame = int(timeline_frame);
   g_ring.last_wanted.store(frame, std::memory_order_relaxed);
 
+  /* 見えているストリップの分だけ動画の読み手を残す。通常の経路の `render_give_ibuf()` は
+   * 1 コマごとにこれを呼んでいるが、GPU 経路は通らないので、ここで同じ形に呼ぶ
+   * (無いと、`seq_render_movie_strip_yuv()` が開いた読み手が再生ヘッドが動いても閉じられない)。 */
+  relations_free_all_anim_ibufs(context->scene, timeline_frame);
+
   /* ★素材をキャッシュへ入れる前に、上限に当たっていれば追い出す。
    * 通常の経路は `render_give_ibuf()` が 1 コマごとにここを通っているが、GPU 経路は通らない。
    * 先読みの側は通っているので上限そのものは守られるが、先読みが止まっている間は
@@ -1241,13 +1290,33 @@ gpu::Texture *gpu_preview_render(const RenderData *context,
   seq_render_evict_caches_if_full(context);
 
   /* ①先読みの側が作ってくれていれば、それを描くだけ(転送も合成も要らない)。 */
+  const Scene *scene_orig = prefetch_get_original_scene(context);
+  bool ring_hit = false;
   {
     std::lock_guard<std::mutex> lock(g_ring.mutex);
     for (GpuFrameItem &item : g_ring.items) {
-      if (item.matches(frame, context->view_id, chanshown, context->rectx, context->recty)) {
+      if (item.matches(
+              scene_orig, frame, context->view_id, chanshown, context->rectx, context->recty))
+      {
+        ring_hit = true;
+        break;
+      }
+    }
+  }
+  if (ring_hit) {
+    g_gpu_preview_active.store(true, std::memory_order_relaxed);
+    /* ★`g_ring.mutex` を持ったまま呼ばないこと(この錠は再入できない)。止まっている先読みを
+     * 起こし直す時、`seq_prefetch_start()` は複製のシーンを作り直す
+     * (`free_depsgraph()` → `editing_free()` → `preview_cache_destroy()` → `gpu_preview_ring_clear()`)ので、
+     * 同じ錠をもう一度取りに来て自分で自分を待つ。作り直しで輪が空になることもあるので、
+     * 呼んだ後にもう一度探して、無ければ下の②で作る。 */
+    seq_prefetch_start(context, timeline_frame);
+    std::lock_guard<std::mutex> lock(g_ring.mutex);
+    for (GpuFrameItem &item : g_ring.items) {
+      if (item.matches(
+              scene_orig, frame, context->view_id, chanshown, context->rectx, context->recty))
+      {
         item.last_used = ++g_ring.tick;
-        g_gpu_preview_active.store(true, std::memory_order_relaxed);
-        seq_prefetch_start(context, timeline_frame);
         if (timing_start != 0.0) {
           timing::frame_done(frame, BLI_time_now_seconds() - timing_start, false);
         }

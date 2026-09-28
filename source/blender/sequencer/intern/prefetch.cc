@@ -639,24 +639,43 @@ static int seq_prefetch_window_frames(const Scene *scene)
 }
 
 /** 先読みが走ってよい範囲。GPU 経路の時は仕上がりを置く輪の大きさで頭を押さえる。 */
-static int seq_prefetch_window_frames_effective(const Scene *scene)
+static int seq_prefetch_window_frames_effective(const PrefetchJob *pfjob)
 {
-  int frames = seq_prefetch_window_frames(scene);
+  int frames = seq_prefetch_window_frames(pfjob->scene);
   if (gpu_preview_enabled() && gpu_preview_is_active()) {
     /* ★輪より先へ行っても押し出されるだけ。行った先の仕事は丸ごと捨てることになる。 */
     const int ahead = gpu_preview_ahead_frames();
     if (ahead > 0) {
-      frames = std::min(frames, ahead);
+      /* `num_frames_prefetched` は `pfjob->cfra`(再生ヘッドの `before_playhead_frames` 手前)から数える。
+       * 輪の大きさは**再生ヘッドから**何コマ先かなので、手前の分を足す(足さないと 8 コマ先のつもりが
+       * 3 コマ先までしか読まず、しかも再生ヘッド自身は飛ばされる)。`+ 1` は再生ヘッドのコマ
+       * (`seq_prefetch_must_skip_frame` が飛ばす)の分で、`gpu_preview_produce()` が受ける
+       * 「再生ヘッド + ahead」のコマまで含める。 */
+      const int before = std::max(0, pfjob->scene->r.cfra - pfjob->cfra);
+      frames = std::min(frames, before + ahead + 1);
     }
   }
   return frames;
 }
 
+/**
+ * 空きメモリが柔らかい下限を割っている間、素材・仕上がりのキャッシュへの格納は全部何もしない
+ * (`cache_should_stop_growing`)。先読みが走っても復号して捨てるだけなので眠る。
+ * GPU 経路が通っている間の先読みは仕上がりを輪へ置くので、キャッシュの状態とは関係ない。
+ */
+static bool seq_prefetch_memory_is_low(const PrefetchJob *pfjob)
+{
+  if (gpu_preview_enabled() && gpu_preview_is_active()) {
+    return false;
+  }
+  return cache_should_stop_growing(pfjob->scene);
+}
+
 static bool seq_prefetch_need_suspend(PrefetchJob *pfjob)
 {
-  return seq_prefetch_is_cache_full(pfjob->scene) || pfjob->is_scrubbing ||
-         (pfjob->num_frames_prefetched >= pfjob->timeline_length) ||
-         (pfjob->num_frames_prefetched >= seq_prefetch_window_frames_effective(pfjob->scene));
+  return seq_prefetch_is_cache_full(pfjob->scene) || seq_prefetch_memory_is_low(pfjob) ||
+         pfjob->is_scrubbing || (pfjob->num_frames_prefetched >= pfjob->timeline_length) ||
+         (pfjob->num_frames_prefetched >= seq_prefetch_window_frames_effective(pfjob));
 }
 
 static void seq_prefetch_do_suspend(PrefetchJob *pfjob)

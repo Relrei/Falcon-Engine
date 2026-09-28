@@ -306,7 +306,7 @@ void source_image_cache_iterate(Scene *scene,
   }
 }
 
-void source_image_cache_collect_images(const Scene *scene, Set<const ImBuf *> &r_images)
+void source_image_cache_collect_images(const Scene *scene, Map<const ImBuf *, size_t> &r_images)
 {
   std::lock_guard lock(source_image_cache_mutex);
   SourceImageCache *cache = query_source_image_cache(scene);
@@ -315,8 +315,10 @@ void source_image_cache_collect_images(const Scene *scene, Set<const ImBuf *> &r
   }
   for (const SourceImageCache::StripEntry &entry : cache->map_.values()) {
     for (const SourceImageCache::FrameEntry &frame : entry.frames.values()) {
-      if (frame.image.is_valid()) {
-        r_images.add(frame.image.image);
+      const ImBuf *image = frame.image.image;
+      if (frame.image.is_valid() && !r_images.contains(image)) {
+        /* 錠を持っている間に大きさを測る(放した後は追い出しで解放されうる)。 */
+        r_images.add_new(image, IMB_get_size_in_memory(image));
       }
     }
   }

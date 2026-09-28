@@ -199,15 +199,18 @@ void final_image_cache_iterate(Scene *scene,
   }
 }
 
-void final_image_cache_collect_images(const Scene *scene, Set<const ImBuf *> &r_images)
+void final_image_cache_collect_images(const Scene *scene, Map<const ImBuf *, size_t> &r_images)
 {
   std::lock_guard lock(final_image_cache_mutex);
   FinalImageCache *cache = query_final_image_cache(scene);
   if (cache == nullptr) {
     return;
   }
-  for (ImBuf *frame : cache->map_.values()) {
-    r_images.add(frame);
+  for (const ImBuf *frame : cache->map_.values()) {
+    if (!r_images.contains(frame)) {
+      /* 錠を持っている間に大きさを測る(放した後は追い出しで解放されうる)。 */
+      r_images.add_new(frame, IMB_get_size_in_memory(frame));
+    }
   }
 }
 
