@@ -266,7 +266,10 @@ void RenderScheduler::set_is_animation(bool is_animation)
 
 void RenderScheduler::set_playback(bool playback)
 {
-  playback_ = playback;
+  /* Not applied here: playback shrinks the path trace resolution (see
+   * playback_upscale_factor), and changing that while samples are accumulating would have the
+   * next work read the buffer in a different layout. reset() takes it over. */
+  playback_next_ = playback;
 }
 
 void RenderScheduler::set_dlss_history_warm()
@@ -314,6 +317,8 @@ int RenderScheduler::get_num_rendered_samples() const
 
 void RenderScheduler::reset(const BufferParams &buffer_params)
 {
+  playback_ = playback_next_;
+
   /* A frame was rendered, so the DLSS-RR history it left behind carries into
    * the next one and the pre-roll is no longer needed. */
   if (background_ && state_.num_rendered_samples > 0 && !dlss_history_cut_pending_) {
@@ -512,7 +517,10 @@ bool RenderScheduler::done() const
    * stream). With carry ON the viewport accumulates the buffer normally, so
    * the default check below already honors the sample limit. */
   if (use_dlss_stream()) {
-    return state_.num_dlss_stream_samples >= num_samples_;
+    /* The samples of the latest work still sit in num_rendered_samples until the next work
+     * folds them into the total, so count them too: otherwise completion is only noticed one
+     * work late. */
+    return state_.num_dlss_stream_samples + state_.num_rendered_samples >= num_samples_;
   }
 
   return get_num_rendered_samples() >= get_pass_num_samples();
@@ -766,6 +774,12 @@ RenderWork RenderScheduler::get_render_work()
     state_.time_limit_reached = false;
     state_.start_render_time = 0.0;
     preroll_same_frame_restart_ = true;
+    /* A pass that ended on its sample count has already written its tile and scheduled the
+     * postprocess. Those belong to the pass, not to the frame: left set, the kept pass would
+     * never schedule the cryptomatte postprocess, and would skip the final tile write when it
+     * ends on the time limit or on adaptive sampling. */
+    state_.tile_result_was_written = false;
+    state_.postprocess_work_scheduled = false;
 
     if (getenv("FALCON_DLSS_DEBUG")) {
       fprintf(stderr, "[preroll] restart, %d passes left\n", preroll_passes_left_);
@@ -847,6 +861,7 @@ RenderWork RenderScheduler::get_render_work()
   render_work.path_trace.start_sample = get_start_sample_to_path_trace();
   render_work.path_trace.num_samples = get_num_samples_to_path_trace();
   render_work.path_trace.sample_offset = get_sample_offset();
+  render_work.path_trace.sample_base = preroll_sample_base_ + stream_sample_base();
 
   /* Each pre-roll pass starts from an empty buffer: it is a fresh render of the
    * frame, not a continuation of the previous pass. */
@@ -1397,9 +1412,16 @@ int RenderScheduler::get_num_samples_to_path_trace() const
    * more than N samples. */
   const int num_samples_pot = round_num_samples_to_power_of_2(num_samples_per_update);
 
-  const int max_num_samples_to_render = sample_offset_ + preroll_sample_base_ +
-                                        stream_sample_base() + get_pass_num_samples() -
-                                        path_trace_start_sample;
+  int max_num_samples_to_render = sample_offset_ + preroll_sample_base_ + stream_sample_base() +
+                                  get_pass_num_samples() - path_trace_start_sample;
+  if (use_dlss_stream()) {
+    /* The stream ends on its total (see done()), not on the per-work counter that the limit
+     * above is measured against, so the last batch has to be cut to what is left of it. */
+    max_num_samples_to_render = min(max_num_samples_to_render,
+                                    max(num_samples_ - state_.num_dlss_stream_samples -
+                                            state_.num_rendered_samples,
+                                        1));
+  }
 
   int num_samples_to_render = min(num_samples_pot, max_num_samples_to_render);
 
@@ -1506,8 +1528,9 @@ int RenderScheduler::get_num_samples_to_path_trace() const
    * is to ensure that the final render is pixel-matched regardless of how many samples per second
    * compute device can do. */
 
-  return adaptive_sampling_.align_samples(path_trace_start_sample - sample_offset_,
-                                          num_samples_to_render);
+  /* Pass-relative, like work_need_adaptive_filter(): the pre-roll and stream bases are not part
+   * of it. */
+  return adaptive_sampling_.align_samples(state_.num_rendered_samples, num_samples_to_render);
 }
 
 int RenderScheduler::get_num_samples_during_navigation(const int resolution_divider) const

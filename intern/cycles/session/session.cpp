@@ -322,8 +322,10 @@ RenderWork Session::run_update_for_next_iteration()
 
   /* An error raised while updating the scene means the render is refused, not
    * merely interrupted: the device was never brought up for it, so the camera
-   * and buffer updates below would talk to an unloaded module. */
-  if (progress.get_cancel()) {
+   * and buffer updates below would talk to an unloaded module. A plain user
+   * cancel (ESC) is not an error: it must fall through to the scheduler, which
+   * reschedules the final write of the samples rendered so far. */
+  if (progress.get_error()) {
     return RenderWork();
   }
 
@@ -594,7 +596,11 @@ void Session::reset(const SessionParams &session_params, const BufferParams &buf
   /* A final render restarts here once per frame, which is where the DLSS-RR
    * sub-pixel jitter should move to its next position -- and stay there for all
    * of that frame's samples. See Integrator::pin_pixel_jitter_per_frame. */
-  if (scene && scene->integrator) {
+  /* Only for DLSS-RR (which is what forces the pixel jitter on): any other
+   * renderer keeps the stock free-running jitter untouched. */
+  if (scene && scene->integrator && scene->integrator->get_use_denoise() &&
+      scene->integrator->get_denoiser_type() == DENOISER_DLSS)
+  {
     /* The stream mode wants a fresh jitter for every one-sample iteration, which
      * is the free-running behaviour; everything else wants one position held for
      * the whole frame. FALCON_DLSS_NO_JITTER_PIN restores the old free-running
@@ -606,6 +612,10 @@ void Session::reset(const SessionParams &session_params, const BufferParams &buf
     scene->integrator->pin_pixel_jitter_per_frame(session_params.background && !stream_final &&
                                                   !no_pin);
     scene->integrator->advance_pixel_jitter();
+  }
+  else if (scene && scene->integrator) {
+    /* Switched away from DLSS-RR: release the pin. */
+    scene->integrator->pin_pixel_jitter_per_frame(false);
   }
 
   {

@@ -41,6 +41,15 @@ class RenderWork {
     int start_sample = 0;
     int num_samples = 0;
     int sample_offset = 0;
+
+    /* How far into the sample sequence this pass starts, on top of sample_offset: a DLSS
+     * pre-roll pass or stream update renders a fresh part of the sequence. start_sample already
+     * carries it, and it stays out of sample_offset because that is subtracted from start_sample
+     * for the progress display. It still has to reach the kernel together with sample_offset:
+     * with adaptive sampling on, the kernel takes the sample index from the per-pixel counter
+     * plus that offset and ignores start_sample, so without it every pass draws the same
+     * samples. */
+    int sample_base = 0;
   } path_trace;
 
   struct {
@@ -567,8 +576,11 @@ class RenderScheduler {
   /* Background (offline) rendering. */
   bool background_;
 
-  /* The viewport is playing the timeline (see set_playback). */
+  /* The viewport is playing the timeline (see set_playback). Only changes in reset(): the render
+   * size follows it, and accumulated samples do not survive a change of size. */
   bool playback_ = false;
+  /* What set_playback() last reported, taken over by playback_ at the next reset(). */
+  bool playback_next_ = false;
 
   /* This render is a frame of an animation, so the DLSS-RR history from the
    * previous frame carries into this one -- except on the very first frame. */
