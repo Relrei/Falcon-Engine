@@ -57,6 +57,12 @@ struct NGXDriver {
   tNVSDK_NGX_CUDA_AllocateParameters AllocateParameters = nullptr;
   tNVSDK_NGX_CUDA_DestroyParameters DestroyParameters = nullptr;
 
+  /* init() writes the pointers above and is reached from several threads (device enumeration under
+   * the device mutex, `use_dlss_denoiser`, the DLSSDenoiser constructor on render threads), so it
+   * must not run concurrently. This is the innermost lock: nothing is called while holding it that
+   * takes another one. */
+  std::mutex init_mutex;
+
   explicit operator bool() const
   {
     return Init_Ext1 != nullptr && Shutdown1 != nullptr && CreateFeature1 != nullptr &&
@@ -66,6 +72,8 @@ struct NGXDriver {
 
   bool init()
   {
+    const std::lock_guard<std::mutex> lock(init_mutex);
+
     if (*this) {
       return true;
     }
@@ -88,16 +96,26 @@ struct NGXDriver {
                                &ngx_key);
       }
       if (result == ERROR_SUCCESS) {
-        DWORD ngx_path_size = ARRAYSIZE(ngx_path);
+        /* The size is in bytes, not characters. Keep room for a terminator: registry strings are
+         * not guaranteed to have one. */
+        DWORD ngx_path_size = sizeof(ngx_path) - sizeof(WCHAR);
         result = RegQueryValueExW(
             ngx_key, L"NGXPath", 0, nullptr, reinterpret_cast<LPBYTE>(ngx_path), &ngx_path_size);
         RegCloseKey(ngx_key);
+        if (result == ERROR_SUCCESS) {
+          ngx_path[ngx_path_size / sizeof(WCHAR)] = L'\0';
+        }
       }
       if (result != ERROR_SUCCESS) {
         return false;
       }
 
-      wcscat_s(ngx_path, L"\\_nvngx.dll");
+      /* wcscat_s takes the invalid parameter handler (process exit) on a buffer that is too small. */
+      static const WCHAR ngx_file[] = L"\\_nvngx.dll";
+      if (wcslen(ngx_path) + ARRAYSIZE(ngx_file) > ARRAYSIZE(ngx_path)) {
+        return false;
+      }
+      wcscat_s(ngx_path, ngx_file);
     }
 #  else
     const char *const ngx_path = "libnvidia-ngx.so.1";
@@ -122,6 +140,17 @@ struct NGXDriver {
       return true;
     }
     else {
+      /* Forget the pointers into the module that is about to be unloaded, so a partial load cannot
+       * leave dangling ones behind (GetFeatureRequirements is optional and not part of the check
+       * above). */
+      Init_Ext1 = nullptr;
+      Shutdown1 = nullptr;
+      GetFeatureRequirements = nullptr;
+      CreateFeature1 = nullptr;
+      EvaluateFeature = nullptr;
+      ReleaseFeature = nullptr;
+      AllocateParameters = nullptr;
+      DestroyParameters = nullptr;
       dynamic_library_close(ngx_module);
       return false;
     }
@@ -140,15 +169,10 @@ static bool dlss_enabled = true;
 
 /* 'NVSDK_NGX_CUDA_GetFeatureRequirements' is an expensive call, so cache the result (since
  * 'is_device_supported' is called a lot). Reset when the plugin folders change. */
-static NVSDK_NGX_Feature_Support_Result dlss_supported_cache[8] = {
-    NVSDK_NGX_FeatureSupportResult_CheckNotPresent,
-    NVSDK_NGX_FeatureSupportResult_CheckNotPresent,
-    NVSDK_NGX_FeatureSupportResult_CheckNotPresent,
-    NVSDK_NGX_FeatureSupportResult_CheckNotPresent,
-    NVSDK_NGX_FeatureSupportResult_CheckNotPresent,
-    NVSDK_NGX_FeatureSupportResult_CheckNotPresent,
-    NVSDK_NGX_FeatureSupportResult_CheckNotPresent,
-    NVSDK_NGX_FeatureSupportResult_CheckNotPresent};
+static NVSDK_NGX_Feature_Support_Result dlss_supported_cache[8] = {};
+/* Whether the slot above holds a result. 'CheckNotPresent' is a real answer (no runtime found), so
+ * it cannot double as the "not cached" marker. */
+static bool dlss_supported_cached[8] = {};
 
 static std::wstring dlss_to_wide(const string &path)
 {
@@ -156,7 +180,56 @@ static std::wstring dlss_to_wide(const string &path)
   return string_to_wstring(path);
 #  else
   std::wstring wide(path.size(), L' ');
-  wide.resize(std::mbstowcs(wide.data(), path.c_str(), path.size()));
+  const size_t length = std::mbstowcs(wide.data(), path.c_str(), path.size());
+  if (length != size_t(-1)) {
+    wide.resize(length);
+    return wide;
+  }
+
+  /* The path is not valid in the current locale (e.g. non-ASCII under the C locale) and
+   * mbstowcs() said so with (size_t)-1, which resize() would turn into std::length_error.
+   * Decode the UTF-8 by hand instead. */
+  wide.clear();
+  const unsigned char *bytes = reinterpret_cast<const unsigned char *>(path.data());
+  for (size_t i = 0; i < path.size();) {
+    const unsigned char c = bytes[i];
+    int extra = -1;
+    uint32_t code = 0;
+    if (c < 0x80) {
+      extra = 0;
+      code = c;
+    }
+    else if (c >= 0xC0 && c < 0xE0) {
+      extra = 1;
+      code = c & 0x1F;
+    }
+    else if (c >= 0xE0 && c < 0xF0) {
+      extra = 2;
+      code = c & 0x0F;
+    }
+    else if (c >= 0xF0 && c < 0xF8) {
+      extra = 3;
+      code = c & 0x07;
+    }
+
+    bool valid = extra >= 0 && i + size_t(extra) < path.size();
+    for (int k = 1; valid && k <= extra; k++) {
+      if ((bytes[i + k] & 0xC0) != 0x80) {
+        valid = false;
+      }
+      code = (code << 6) | (bytes[i + k] & 0x3F);
+    }
+
+    if (valid && code <= 0x10FFFF) {
+      wide.push_back(wchar_t(code));
+      i += size_t(extra) + 1;
+    }
+    else {
+      /* Invalid sequence: replacement character, and go on with the next byte. */
+      wide.push_back(wchar_t(0xFFFD));
+      i++;
+    }
+  }
   return wide;
 #  endif
 }
@@ -183,8 +256,8 @@ void DLSSDenoiser::set_plugin_paths(const vector<string> &paths)
       return;
     }
     dlss_plugin_paths = paths;
-    for (NVSDK_NGX_Feature_Support_Result &result : dlss_supported_cache) {
-      result = NVSDK_NGX_FeatureSupportResult_CheckNotPresent;
+    for (bool &cached : dlss_supported_cached) {
+      cached = false;
     }
   }
   Device::redetect_devices(DEVICE_MASK_CUDA | DEVICE_MASK_OPTIX);
@@ -204,8 +277,8 @@ void DLSSDenoiser::set_enabled(const bool enabled)
       return;
     }
     dlss_enabled = enabled;
-    for (NVSDK_NGX_Feature_Support_Result &result : dlss_supported_cache) {
-      result = NVSDK_NGX_FeatureSupportResult_CheckNotPresent;
+    for (bool &cached : dlss_supported_cached) {
+      cached = false;
     }
   }
   Device::redetect_devices(DEVICE_MASK_CUDA | DEVICE_MASK_OPTIX);
@@ -355,9 +428,14 @@ bool DLSSDenoiser::use_layer_guides() const
 bool DLSSDenoiser::use_emissive_guide(const DenoiseContext &context) const
 {
   /* GBuffer_Emissive: what the surface emits by itself. RR otherwise has to read a
-   * bright emitter as noisy lighting and average it with its neighbours. The pass only
-   * exists when FALCON_DLSS_EMISSIVE_GUIDE=1 asked sync.cpp for it. */
-  return context.buffer_params.get_pass_offset(PASS_EMISSION) != PASS_UNUSED;
+   * bright emitter as noisy lighting and average it with its neighbours. Off unless
+   * FALCON_DLSS_EMISSIVE_GUIDE=1 (which is also what asks sync.cpp for the pass). The knob is
+   * checked here too, because the Emission render pass a user enables puts PASS_EMISSION in the
+   * buffer as well and must not switch the guide on. */
+  static const bool enabled = getenv("FALCON_DLSS_EMISSIVE_GUIDE") ?
+                                  atoi(getenv("FALCON_DLSS_EMISSIVE_GUIDE")) != 0 :
+                                  false;
+  return enabled && context.buffer_params.get_pass_offset(PASS_EMISSION) != PASS_UNUSED;
 }
 
 bool DLSSDenoiser::use_specular_hit_distance(const DenoiseContext &context) const
@@ -473,6 +551,18 @@ DLSSDenoiser::~DLSSDenoiser()
 
 bool DLSSDenoiser::is_device_supported(const DeviceInfo &device)
 {
+  if (device.type == DEVICE_MULTI || !device.multi_devices.empty()) {
+    /* A multi-device has num = 0 (and type DEVICE_MULTI when the sub-devices differ), so it says
+     * nothing about the GPUs it is made of: ask them, like OIDNDenoiserGPU does. */
+    for (const DeviceInfo &multi_device : device.multi_devices) {
+      if (multi_device.type != DEVICE_CPU && is_device_supported(multi_device)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
   if (device.type != DEVICE_CUDA && device.type != DEVICE_OPTIX) {
     return false;
   }
@@ -485,7 +575,7 @@ bool DLSSDenoiser::is_device_supported(const DeviceInfo &device)
     if (!dlss_enabled) {
       return false;
     }
-    if (dlss_supported_cache[device.num] != NVSDK_NGX_FeatureSupportResult_CheckNotPresent) {
+    if (dlss_supported_cached[device.num]) {
       return dlss_supported_cache[device.num] == NVSDK_NGX_FeatureSupportResult_Supported;
     }
   }
@@ -532,6 +622,7 @@ bool DLSSDenoiser::is_device_supported(const DeviceInfo &device)
   if (NVSDK_NGX_SUCCEED(result)) {
     const thread_scoped_lock lock(dlss_plugin_mutex);
     dlss_supported_cache[device.num] = requirement.FeatureSupported;
+    dlss_supported_cached[device.num] = true;
     return requirement.FeatureSupported == NVSDK_NGX_FeatureSupportResult_Supported;
   }
   else {
@@ -729,31 +820,38 @@ bool DLSSDenoiser::denoise_configure_if_needed(DenoiseContext & /*context*/)
 bool DLSSDenoiser::denoise_filter_color_preprocess(const DenoiseContext &context,
                                                    const DenoisePass &pass)
 {
-  if (pass.type != PASS_COMBINED) {
-    return false;
-  }
+  /* The shadow catcher passes are denoised as plain colour images (see denoise_run): what the
+   * transmission, volume and albedo guides describe is the combined pass, so none of it applies to
+   * them and the "before" guides are the colour itself. */
+  const bool is_combined = pass.type == PASS_COMBINED;
 
   // Input params (with resolution divider applied)
   const BufferParams &buffer_params = context.buffer_params;
 
   const int work_size = buffer_params.width * buffer_params.height;
 
-  const int pass_transmission_direct = buffer_params.get_pass_offset(PASS_TRANSMISSION_DIRECT);
-  const int pass_transmission_indirect = buffer_params.get_pass_offset(
-      PASS_TRANSMISSION_INDIRECT);
+  const int pass_transmission_direct = is_combined ?
+                                           buffer_params.get_pass_offset(
+                                               PASS_TRANSMISSION_DIRECT) :
+                                           PASS_UNUSED;
+  const int pass_transmission_indirect = is_combined ?
+                                             buffer_params.get_pass_offset(
+                                                 PASS_TRANSMISSION_INDIRECT) :
+                                             PASS_UNUSED;
 
   /* FALCON_DLSS_DEMOD=1: feed RR the colour divided by (diffuse+specular)
    * albedo and multiply it back in the postprocess. Sweep knob, default off. */
   const int pass_specular_albedo = buffer_params.get_pass_offset(PASS_DENOISING_SPECULAR_ALBEDO);
-  const int demodulate = dlss_demodulate() ? 1 : 0;
+  const int demodulate = (is_combined && dlss_demodulate()) ? 1 : 0;
   const float color_scale = dlss_color_scale();
 
   /* Layer guides (FALCON_DLSS_LAYER_GUIDES): surfaces are 0 when off, the
    * kernel skips the writes. */
   const int layer_guides = use_layer_guides() ? 1 : 0;
-  const int pass_volume_direct = layer_guides ? buffer_params.get_pass_offset(PASS_VOLUME_DIRECT) :
-                                                PASS_UNUSED;
-  const int pass_volume_indirect = layer_guides ?
+  const int pass_volume_direct = (layer_guides && is_combined) ?
+                                     buffer_params.get_pass_offset(PASS_VOLUME_DIRECT) :
+                                     PASS_UNUSED;
+  const int pass_volume_indirect = (layer_guides && is_combined) ?
                                        buffer_params.get_pass_offset(PASS_VOLUME_INDIRECT) :
                                        PASS_UNUSED;
 
@@ -788,10 +886,6 @@ bool DLSSDenoiser::denoise_filter_color_preprocess(const DenoiseContext &context
 bool DLSSDenoiser::denoise_filter_color_postprocess(const DenoiseContext &context,
                                                     const DenoisePass &pass)
 {
-  if (pass.type != PASS_COMBINED) {
-    return false;
-  }
-
   // Output params
   const BufferParams &buffer_params = context.denoised_buffer_params;
 
@@ -799,7 +893,8 @@ bool DLSSDenoiser::denoise_filter_color_postprocess(const DenoiseContext &contex
 
   const int pass_specular_albedo = context.buffer_params.get_pass_offset(
       PASS_DENOISING_SPECULAR_ALBEDO);
-  const int demodulate = dlss_demodulate() ? 1 : 0;
+  /* Only the combined pass was demodulated by the preprocess. */
+  const int demodulate = (pass.type == PASS_COMBINED && dlss_demodulate()) ? 1 : 0;
   const float inv_color_scale = 1.0f / dlss_color_scale();
 
   /* ★The factor handed to this kernel is what maps an *output* pixel back to
@@ -1106,9 +1201,13 @@ bool DLSSDenoiser::load_particles_guide(const DenoiseContext &context, const cha
 
 bool DLSSDenoiser::denoise_run(const DenoiseContext &context, const DenoisePass &pass)
 {
-  if (pass.type != PASS_COMBINED) {
-    return false;
-  }
+  /* Scenes with a shadow catcher also hand over the shadow catcher matte and shadow catcher passes
+   * (the matte is what the viewport shows instead of the combined pass), which the other denoisers
+   * simply denoise as further colour images. RR can do that too, but its temporal history belongs
+   * to one image sequence: these passes are evaluated as single frames (Reset=1) and the history
+   * is dropped afterwards, so the next combined evaluation starts cold. A scene with a shadow
+   * catcher therefore gets no temporal accumulation from RR. */
+  const bool is_aux_pass = pass.type != PASS_COMBINED;
 
   NVSDK_NGX_Parameter *params = nullptr;
   if (NVSDK_NGX_FAILED(NVSDK_NGX_CUDA.AllocateParameters(&params))) {
@@ -1161,7 +1260,7 @@ bool DLSSDenoiser::denoise_run(const DenoiseContext &context, const DenoisePass 
    * pre-roll. That frame then starts cold, exactly as the first frame of a
    * sequence used to, and everything after it carries normally. The poisoned
    * history never reaches a frame that moves. */
-  if (preroll_mode == 2) {
+  if (preroll_mode == 2 && !is_aux_pass) {
     if (preroll_pass_ || same_frame_restart_) {
       /* Still inside the pre-rolled frame. */
       preroll_history_poisoned_ = true;
@@ -1178,7 +1277,7 @@ bool DLSSDenoiser::denoise_run(const DenoiseContext &context, const DenoisePass 
   static const bool cut_reset = getenv("FALCON_DLSS_CUT_RESET") ?
                                     atoi(getenv("FALCON_DLSS_CUT_RESET")) != 0 :
                                     true;
-  if (pending_reset_) {
+  if (pending_reset_ && !is_aux_pass) {
     if (cut_reset) {
       is_reset = true;
     }
@@ -1240,7 +1339,7 @@ bool DLSSDenoiser::denoise_run(const DenoiseContext &context, const DenoisePass 
    * their point is to chain *independent* estimates and they run this path
    * several times over already. */
   int num_evaluations = 1;
-  if (is_reset && !preroll_pass_ && params_.cut_warmup) {
+  if (is_reset && !preroll_pass_ && params_.cut_warmup && !is_aux_pass) {
     static const int warmup_count = getenv("FALCON_DLSS_CUT_WARMUP") ?
                                         atoi(getenv("FALCON_DLSS_CUT_WARMUP")) :
                                         1;
@@ -1249,8 +1348,15 @@ bool DLSSDenoiser::denoise_run(const DenoiseContext &context, const DenoisePass 
     }
   }
 
-  last_num_samples_ = context.num_samples;
-  last_frame_ = frame_;
+  if (is_aux_pass) {
+    /* Not part of the combined pass's sequence: no history to keep, and none of the bookkeeping
+     * above may be advanced by it. */
+    is_reset = true;
+  }
+  else {
+    last_num_samples_ = context.num_samples;
+    last_frame_ = frame_;
+  }
   params->Set(NVSDK_NGX_Parameter_Reset, is_reset ? 1 : 0);
 
   /* RR places the samples at (its pixel centre + jitter) and reconstructs at
@@ -1485,7 +1591,12 @@ bool DLSSDenoiser::denoise_run(const DenoiseContext &context, const DenoisePass 
 
   NVSDK_NGX_CUDA.DestroyParameters(params);
 
-  if (NVSDK_NGX_SUCCEED(result)) {
+  if (is_aux_pass) {
+    /* What RR holds now is this pass, not the combined image: drop the history (the next combined
+     * evaluation is told to Reset). */
+    clear_temporal_history();
+  }
+  else if (NVSDK_NGX_SUCCEED(result)) {
     have_history_ = true;
   }
   return NVSDK_NGX_SUCCEED(result);
