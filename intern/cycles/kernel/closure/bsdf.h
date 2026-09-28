@@ -170,6 +170,31 @@ ccl_device_inline bool bsdf_is_transmission(const ccl_private ShaderClosure *sc,
   return dot(sc->N, wo) < 0.0f;
 }
 
+/* Convert radiance sampling to adjoint transport for light-originating paths.
+ * A shading normal changes the projected solid-angle measure at a surface.
+ * The eta correction in shade_surface.h does not account for that change.
+ * Apply this per closure, in both sample and eval, so mixtures with different
+ * normals retain the same estimator. Curves use a separate scattering model. */
+ccl_device_inline float falcon_bsdf_adjoint_normal_correction(
+    KernelGlobals kg,
+    const ccl_private ShaderData *sd,
+    const ccl_private ShaderClosure *sc,
+    const float3 wo)
+{
+  if (!(kernel_data.integrator.falcon_lighttrace ||
+        kernel_data.integrator.falcon_photon_pass) ||
+      (sd->type & PRIMITIVE_CURVE) ||
+      sc->type == CLOSURE_BSDF_TRANSPARENT_ID ||
+      sc->type == CLOSURE_BSDF_RAY_PORTAL_ID || isequal(sc->N, sd->Ng))
+  {
+    return 1.0f;
+  }
+
+  const float numerator = fabsf(dot(sc->N, sd->wi) * dot(sd->Ng, wo));
+  const float denominator = fabsf(dot(sd->Ng, sd->wi) * dot(sc->N, wo));
+  return safe_divide(numerator, denominator);
+}
+
 ccl_device_inline int bsdf_sample(KernelGlobals kg,
                                   ccl_private ShaderData *sd,
                                   const ccl_private ShaderClosure *sc,
@@ -320,6 +345,10 @@ ccl_device_inline int bsdf_sample(KernelGlobals kg,
       *eval *= shift_cos_in(cosNO, frequency_multiplier);
     }
     *eval *= bump_shadowing_term(sd, sc, *wo, false);
+  }
+
+  if (*pdf > 0.0f) {
+    *eval *= falcon_bsdf_adjoint_normal_correction(kg, sd, sc, *wo);
   }
 
 #ifdef WITH_CYCLES_DEBUG
@@ -654,6 +683,10 @@ ccl_device_inline
     if (cosNO >= 0.0f) {
       eval *= shift_cos_in(cosNO, frequency_multiplier);
     }
+  }
+
+  if (*pdf > 0.0f) {
+    eval *= falcon_bsdf_adjoint_normal_correction(kg, sd, sc, wo);
   }
 
 #ifdef WITH_CYCLES_DEBUG

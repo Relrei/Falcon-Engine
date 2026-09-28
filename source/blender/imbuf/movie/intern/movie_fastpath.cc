@@ -443,8 +443,8 @@ static bool reencoder_open_encoder(const SourceInfo &src,
     re->enc->width = par->width;
     re->enc->height = par->height;
     re->enc->pix_fmt = AVPixelFormat(par->format);
-    re->enc->time_base = AVRational{rd->frs_sec_base, rd->frs_sec};
-    re->enc->framerate = AVRational{rd->frs_sec, rd->frs_sec_base};
+    re->enc->time_base = AVRational{int(rd->frs_sec_base), rd->frs_sec};
+    re->enc->framerate = AVRational{rd->frs_sec, int(rd->frs_sec_base)};
     re->enc->sample_aspect_ratio = par->sample_aspect_ratio;
     re->enc->color_range = AVColorRange(par->color_range);
     re->enc->colorspace = AVColorSpace(par->color_space);
@@ -1041,7 +1041,7 @@ bool MOV_fastpath_write(const Scene *scene,
 
   /* 段3: 1本の muxer へ流す。 */
   OutputStream out;
-  out.frame_tb = AVRational{rd->frs_sec_base, rd->frs_sec};
+  out.frame_tb = AVRational{int(rd->frs_sec_base), rd->frs_sec};
   if (avformat_alloc_output_context2(&out.fmt, nullptr, nullptr, out_path) < 0 ||
       out.fmt == nullptr)
   {
@@ -1073,7 +1073,7 @@ bool MOV_fastpath_write(const Scene *scene,
   out.stream->codecpar->color_trc = AVCOL_TRC_BT709;
   out.stream->codecpar->color_space = AVCOL_SPC_BT709;
   out.stream->time_base = out.frame_tb;
-  out.stream->avg_frame_rate = AVRational{rd->frs_sec, rd->frs_sec_base};
+  out.stream->avg_frame_rate = AVRational{rd->frs_sec, int(rd->frs_sec_base)};
 
   /* ★パラメータ集合を区間の頭へ貼り直すのが要るのは H.264/H.265 だけ。
    * VP9 と AV1 はキーフレームが自分で完結しているので、貼る物が無くても

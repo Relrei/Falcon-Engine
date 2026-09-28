@@ -13,8 +13,12 @@
 #include <cmath>
 #include <cstdio>
 #include <atomic>
-#include <dlfcn.h>
-#include <unistd.h>
+#ifdef _WIN32
+#  include <windows.h>
+#else
+#  include <dlfcn.h>
+#  include <unistd.h>
+#endif
 #include <mutex>
 #include <sys/types.h>
 
@@ -546,7 +550,15 @@ static FalconCudaGL &falcon_cuda_gl()
 {
   static FalconCudaGL api = []() {
     FalconCudaGL a;
+#ifdef _WIN32
+    /* Windows のドライバは同じ関数を nvcuda.dll に持つ。 */
+    HMODULE lib = LoadLibraryA("nvcuda.dll");
+    auto dlsym = [](HMODULE h, const char *name) {
+      return reinterpret_cast<void *>(GetProcAddress(h, name));
+    };
+#else
     void *lib = dlopen("libcuda.so.1", RTLD_NOW | RTLD_LOCAL);
+#endif
     if (lib == nullptr) {
       return a;
     }
@@ -1919,6 +1931,14 @@ bool MOV_yuv_plane_copy_to_gpu_buffer(const MovieYUVFrame &frame,
     c.Height = size_t(rows);
     return api.memcpy2d(&c) == 0;
   };
+#ifdef _WIN32
+  /* Windows の Vulkan は fd でなく HANDLE を書き出す。取り込みは未対応 = 呼び手は CPU 経路へ戻る。 */
+  if (is_vulkan_fd) {
+    falcon_CUcontext popped_vk = nullptr;
+    api.ctx_pop(&popped_vk);
+    return false;
+  }
+#else
   if (is_vulkan_fd) {
     /* Vulkan: 書き出した fd を取り込む(取り込みに成功すると fd は CUDA のもの)。Cycles と同じ。 */
     if (!api.vk_ok) {
@@ -1949,6 +1969,7 @@ bool MOV_yuv_plane_copy_to_gpu_buffer(const MovieYUVFrame &frame,
     api.ctx_pop(&popped_vk);
     return ok;
   }
+#endif
   falcon_CUgraphicsResource res = nullptr;
   /* 2 = CU_GRAPHICS_REGISTER_FLAGS_WRITE_DISCARD(前の中身は要らない)。 */
   if (api.gl_register_buffer(&res, unsigned(handle), 2) == 0) {

@@ -6,6 +6,7 @@
  * \ingroup spimage
  */
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -56,6 +57,85 @@
 
 namespace blender {
 
+/**
+ * Falcon 2026-09-21: while the picture on screen is not the real picture yet -- the frames the
+ * DLSS warm-up renders and throws away, and the stretch before the first tile arrives -- the
+ * image is plain black. The thin info line at the top says what is going on, but on a black
+ * screen it is easy to miss and the render window is often taller than the display, so the line
+ * is off-screen entirely. 作者「DLSS の蓄積の時真っ暗で使う側には何が起こってるか分からない」.
+ *
+ * Draw the same words large, in the middle of the image. `RenderResult::falcon_notice` is set by
+ * the render job (`render_internal.cc`) and is null whenever the real picture is on screen, so
+ * this costs nothing once pixels are coming in. The first line is the phase, the rest is detail.
+ */
+static void falcon_draw_render_notice(ARegion *region, const char *notice)
+{
+  if (notice == nullptr || notice[0] == '\0') {
+    return;
+  }
+
+  char buf[256];
+  BLI_strncpy_utf8(buf, notice, sizeof(buf));
+
+  const char *lines[4];
+  int num_lines = 0;
+  for (char *line = buf; line != nullptr && num_lines < 4;) {
+    lines[num_lines++] = line;
+    char *newline = strchr(line, '\n');
+    if (newline == nullptr) {
+      break;
+    }
+    *newline = '\0';
+    line = newline + 1;
+  }
+
+  const uiStyle *style = ui::style_get_dpi();
+  const int fontid = style->widget.uifont_id;
+  const float size_head = style->widget.points * UI_SCALE_FAC * 1.9f;
+  const float size_rest = style->widget.points * UI_SCALE_FAC * 1.1f;
+
+  float line_width[4];
+  float line_height[4];
+  float text_width = 0.0f;
+  float text_height = 0.0f;
+  for (int i = 0; i < num_lines; i++) {
+    BLF_size(fontid, (i == 0) ? size_head : size_rest);
+    line_width[i] = BLF_width(fontid, lines[i], BLF_DRAW_STR_DUMMY_MAX);
+    line_height[i] = BLF_height_max(fontid) * 1.45f;
+    text_width = std::max(text_width, line_width[i]);
+    text_height += line_height[i];
+  }
+
+  const rcti *vis = ED_region_visible_rect(region);
+  const float center_x = BLI_rcti_cent_x_fl(vis);
+  const float center_y = BLI_rcti_cent_y_fl(vis);
+  const float pad = 1.2f * UI_UNIT_X;
+
+  /* A dark plate behind the words: the image is black, but a render that has already produced
+   * some pixels is not, and the words have to stay readable on both. */
+  GPU_blend(GPU_BLEND_ALPHA);
+  const uint pos = GPU_vertformat_attr_add(
+      immVertexFormat(), "pos", gpu::VertAttrType::SFLOAT_32_32);
+  immBindBuiltinProgram(GPU_SHADER_3D_UNIFORM_COLOR);
+  immUniformColor4f(0.0f, 0.0f, 0.0f, 0.55f);
+  immRectf(pos,
+           center_x - text_width * 0.5f - pad,
+           center_y - text_height * 0.5f - pad,
+           center_x + text_width * 0.5f + pad,
+           center_y + text_height * 0.5f + pad);
+  immUnbindProgram();
+  GPU_blend(GPU_BLEND_NONE);
+
+  float y = center_y + text_height * 0.5f;
+  for (int i = 0; i < num_lines; i++) {
+    BLF_size(fontid, (i == 0) ? size_head : size_rest);
+    BLF_color4f(fontid, 1.0f, 1.0f, 1.0f, (i == 0) ? 0.95f : 0.75f);
+    y -= line_height[i];
+    BLF_position(fontid, center_x - line_width[i] * 0.5f, y + line_height[i] * 0.28f, 0.0f);
+    BLF_draw(fontid, lines[i], BLF_DRAW_STR_DUMMY_MAX);
+  }
+}
+
 static void draw_render_info(
     const bContext *C, Scene *scene, Image *ima, ARegion *region, float zoomx, float zoomy)
 {
@@ -70,6 +150,10 @@ static void draw_render_info(
   if (rr && rr->text) {
     float fill_color[4] = {0.0f, 0.0f, 0.0f, 0.25f};
     ED_region_info_draw(region, rr->text, fill_color, true);
+  }
+
+  if (rr) {
+    falcon_draw_render_notice(region, rr->falcon_notice);
   }
 
   BKE_image_release_renderresult(stats_scene, ima, rr);

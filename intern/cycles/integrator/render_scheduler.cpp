@@ -122,12 +122,18 @@ int RenderScheduler::get_pass_num_samples() const
 
 /* ★FALCON_DLSS_ANIM_WARMUP -- the animation warm-up decided in RE_RenderAnim
  * (source/blender/render/intern/pipeline.cc). Cycles cannot ask the render
- * pipeline, so it reads the same variable with the same default. ★The two
- * defaults have to move together: pipeline.cc falcon_anim_warmup_frames(). */
-static int falcon_anim_warmup_frames()
+ * pipeline, so it reads the same variable with the same default.
+ *
+ * ★2026-09-21: the count now comes from the scene ("Accumulation Renders",
+ * DenoiseParams::preroll_passes) as well, so pass the synced value in rather
+ * than reading a constant here -- pipeline.cc reads the same property off the
+ * scene's IDProperties. The constant is only the fallback for a scene that
+ * carries no Cycles properties at all, and it and
+ * FALCON_DLSS_ANIM_WARMUP_DEFAULT in pipeline.cc still have to move together. */
+static int falcon_anim_warmup_frames(const int scene_passes)
 {
   const char *env = getenv("FALCON_DLSS_ANIM_WARMUP");
-  const int n = env ? atoi(env) : RenderScheduler::DLSS_ANIM_WARMUP_DEFAULT;
+  const int n = env ? atoi(env) : scene_passes;
   return (n > 0) ? n : 0;
 }
 
@@ -163,8 +169,13 @@ int RenderScheduler::get_dlss_preroll_passes() const
   }
 
   if (!is_animation_) {
+    /* ★2026-09-21: a still has no frames before it, so the scene's "Accumulation
+     * Renders" count is implemented here, as pre-roll passes. It used to read
+     * FALCON_DLSS_STILL_PREROLL only (default 0), which left the knob in the UI
+     * doing nothing at all -- 作者「蓄積レンダリングの指定数を無視してる」.
+     * The environment variable still wins when it is set. */
     const char *env_still = getenv("FALCON_DLSS_STILL_PREROLL");
-    return max(env_still ? atoi(env_still) : DLSS_STILL_PREROLL_DEFAULT, 0);
+    return max(env_still ? atoi(env_still) : denoiser_params_.preroll_passes, 0);
   }
 
   /* The history is cold for two different reasons, and they do not want the
@@ -226,7 +237,7 @@ int RenderScheduler::get_dlss_preroll_passes() const
    * (FALCON_DLSS_ANIM_WARMUP=0) gives the scene setting back, unchanged --
    * that is the whole of the old behaviour, and the way to ask for the pre-roll
    * from a .blend. FALCON_DLSS_PREROLL above asks for both. */
-  if (falcon_anim_warmup_frames() > 0) {
+  if (falcon_anim_warmup_frames(denoiser_params_.preroll_passes) > 0) {
     return 0;
   }
 

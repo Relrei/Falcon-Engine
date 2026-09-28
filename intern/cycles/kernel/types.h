@@ -283,6 +283,10 @@ enum PathRayFlag : uint32_t {
   /* Primary surface replacement: the camera hit a delta mirror, so the denoising guides were
    * held back and get written for the virtual image behind it instead. */
   PATH_RAY_PSR = (1U << 26U),
+
+  /* Falcon LT has sampled a specular reflection or a non-unit-IOR refraction.
+   * Straight-through IOR=1 glass is direct illumination, not a caustic. */
+  PATH_RAY_FALCON_CAUSTIC_EVENT = (1U << 27U),
 };
 
 // 8bit enum, just in case we need to move more variables in it

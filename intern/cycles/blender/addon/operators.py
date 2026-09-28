@@ -34,6 +34,8 @@ def _falcon_reset_photon_state(*_args):
     import os
     for k in _FALCON_PHOTON_ADD_ENV:
         os.environ.pop(k, None)
+    from .properties import _falcon_restore_pt_caustics
+    _falcon_restore_pt_caustics()
     # 開き直した後は、前のファイルの「写しの場面」を指す物が残っていても意味が無い
     _falcon_lt_scrap.clear()
 
@@ -1079,8 +1081,8 @@ class CYCLES_OT_falcon_photon_bake(Operator):
         # PT's own caustics: with soft/large lights PT finds the same light
         # itself and the add mode double-counts (audit 2026-07-05: truth-base
         # ~=0, so everything the layer added was a second copy).
-        cscene.caustics_reflective = False
-        cscene.caustics_refractive = False
+        from .properties import _falcon_override_pt_caustics
+        _falcon_override_pt_caustics(cscene, bool(cscene.falcon_caustics_photon))
         mode_txt = rpt_("GPU point map") if (use_points and os.path.exists(points_path)) else (
             "GPU" if cscene.falcon_photon_gpu else "CPU")
         self.report({'INFO'}, rpt_("Caustics baked (%s, %.0f s) — active from the next render")
@@ -1100,9 +1102,8 @@ class CYCLES_OT_falcon_photon_clear(Operator):
     def execute(self, context):
         import os
         os.environ.pop("FALCON_PHOTON_MODE", None)
-        cscene = context.scene.cycles
-        cscene.caustics_reflective = True
-        cscene.caustics_refractive = True
+        from .properties import _falcon_restore_pt_caustics
+        _falcon_restore_pt_caustics()
         self.report({'INFO'}, "Photon caustics disabled")
         return {'FINISHED'}
 
@@ -1212,6 +1213,14 @@ class CYCLES_OT_falcon_bake_and_render_range(Operator):
                     % (rpt_("rebake every frame") if self.per_frame else rpt_("bake once"),
                        proc.pid, log_path))
         return {'FINISHED'}
+
+
+def _falcon_lt_artistic_layer(layer, settings, blur):
+    from .falcon_lt_look import prepare
+    if settings.falcon_lt_gain == 0:
+        import numpy as np
+        return np.zeros_like(layer)
+    return settings.falcon_lt_gain * _falcon_lt_normconv(prepare(layer, settings), blur)
 
 
 def _falcon_lt_normconv(layer, radius):
@@ -1394,7 +1403,7 @@ def _falcon_lt_publish(context, scene, stem, comp, w, h, report, display=True):
     if name in bpy.data.images:
         bpy.data.images.remove(bpy.data.images[name])
     out = bpy.data.images.new(name, w, h, alpha=True, float_buffer=True)
-    out.pixels[:] = comp.ravel()
+    out.pixels.foreach_set(comp.ravel())
     out.filepath_raw = out_path
     out.file_format = 'OPEN_EXR'
     # ★save() は linear -> sRGB を掛ける(_falcon_lt_write_exr の説明)。
@@ -1809,6 +1818,17 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
             steps = [("light", i) for i in range(len(lights))]
         if world_l > 0.0:
             steps.append(("world", None))
+        requested_mpaths = cscene.falcon_lt_render_mpaths
+        if requested_mpaths > 0:
+            import math
+            lt_spp = max(1, math.ceil(requested_mpaths * 1e6 / (w * h * len(steps))))
+            maximum = cscene.bl_rna.properties['samples'].hard_max
+            if lt_spp > maximum:
+                self.report({'ERROR'}, "Requested LT accumulation exceeds the sample limit at this resolution")
+                return None
+        print("Falcon LT budget: requested=%gM, actual=%.6fM, samples/pass=%d, passes=%d" %
+              (requested_mpaths, w * h * lt_spp * len(steps) / 1e6,
+               lt_spp, len(steps)), flush=True)
         if not self.defer_beauty:
             steps.append(("beauty", None))
 
@@ -1996,7 +2016,7 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
                 # the guided pass renders to its own scratch file, so the
                 # destination has to be remembered here rather than read
                 # back off r.filepath afterwards
-                layer = self._guided_pass(scene, cscene, r, w, h, spp, tiles,
+                layer = self._guided_pass(scene, cscene, r, w, h, st["lt_spp"], tiles,
                                           stem, self._lt_load_rgba)
                 _falcon_lt_write_exr(out_path, layer, w, h)
             else:
@@ -2092,8 +2112,8 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
                                  "should be sparse). Compositor output or the background may "
                                  "have leaked into it")
                             % (100.0 * lit_frac))
-            overlay = cscene.falcon_lt_gain * _falcon_lt_normconv(
-                st["lt_sum"], st["blur"])
+            overlay = _falcon_lt_artistic_layer(
+                st["lt_sum"], cscene, st["blur"])
         else:
             overlay = np.zeros((h, w, 3), dtype=np.float32)
         # ★ここが 9-03 の穴だった所。EXR を書いて別画像へ「発行」するのではなく、
@@ -2153,7 +2173,9 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
         # is baked into the pass files (must stay 1.0/0.0).
         with open(stem + "_manifest.json", "w") as f:
             json.dump({"w": w, "h": h, "spp": st["spp"], "raw_gain": 1.0,
-                       "raw_blur": 0.0, "passes": st["pass_files"],
+                       "raw_blur": 0.0, "lt_spp": st["lt_spp"],
+                       "launched_paths": st["photons_done"],
+                       "passes": st["pass_files"],
                        "beauty": stem + "_beauty.exr"}, f)
         t_pub = time.time()
         # 自動/疑似は「押したら出ている」道なので、Render Result と重なる
@@ -2369,22 +2391,28 @@ def _falcon_lt_f12_pre(scene, depsgraph=None):
     cscene = getattr(scene, "cycles", None)
     if not getattr(cscene, "falcon_caustics_photon", False):
         return
-    # ★窓がある時は、ここから光子の段を回さない(2026-09-21・落ちる件 3 本)。
-    #   render_pre は**レンダーの糸**で鳴る(実測: thread=Dummy-1 / main=False)。
-    #   そこから bpy.ops / temp_override / scenes.remove を呼ぶと、主糸の
-    #   event loop と同じ物を取り合って落ちる:
+    # ★窓の有無に関わらず、ここから光子の段を回さない(2026-09-21 に窓ありの
+    #   3 本を直したが、2026-09-23 に `-b` 単体(GUI 無し・event loop 無し)でも
+    #   同じ経路が落ちることを実測で確認: glasszoo 系(ガラス+ライト)の入った
+    #   実シーンを `-b --python` から bpy.ops.render.render() で焼くと 3/3 で
+    #   segfault(pthread_once の中・入れ子の2つ目の Cycles Session が device
+    #   キューを作る所と衝突していると見られる)。「窓が無ければ event loop が
+    #   無いから安全」という前提は誤りだった ⇒ 見込みが外れたのでここで止めて
+    #   直す。render_pre は**レンダーの糸**で鳴る(実測: thread=Dummy-1 /
+    #   main=False)。そこから bpy.ops / temp_override / scenes.remove を呼ぶと
+    #   何かと取り合って落ちる:
     #     153104 深さ deg_check_base_in_depsgraph (base_orig=NULL)
     #     229505 / 331575 BPY_context_member_get (context の Python 辞書)
     #     381421 DepsgraphNodeBuilder::begin_build (入れ子のレンダーが
     #            同じ場面の depsgraph を建て直す)
-    #   窓なし(`-f` / `-b`)は event loop が無いので今までどおり回す。
-    #   窓がある時の集光は「ライトトレース合成レンダー」ボタン ―― あちらは
-    #   主糸の operator なので同じ絵が安全に出る(門 G7 で画素一致)。
-    if not bpy.app.background:
+    #   窓あり・窓なしのどちらでも、集光は「ライトトレース合成レンダー」
+    #   ボタン(主糸の operator・門 G7 で画素一致)を使ってもらう。
+    if True:
         if not _falcon_lt_f12["warned"]:
             _falcon_lt_f12["warned"] = True
-            print("Falcon LT: automatic caustics on F12 are off while a window is open; "
-                  "use the Light-Traced Composite Render button instead", flush=True)
+            print("Falcon LT: automatic caustics on F12/-b are off; "
+                  "use the Light-Traced Composite Render button instead "
+                  "(nested-render crash, see 2026-09-23)", flush=True)
         return
     # ★焼いている最中は絶対に鳴らない (2026-09-20・落ちる不具合の直し)
     #
@@ -2510,6 +2538,8 @@ class CYCLES_OT_falcon_lt_recomposite(Operator):
     bl_idname = "cycles.falcon_lt_recomposite"
     bl_label = "LT Recomposite (Gain/Blur, No Re-Render)"
 
+    preview_only: BoolProperty(name="Preview Only", default=False, options={'SKIP_SAVE'})
+
     @classmethod
     def poll(cls, context):
         return context.scene is not None
@@ -2536,20 +2566,16 @@ class CYCLES_OT_falcon_lt_recomposite(Operator):
                 m = json.load(f)
             w, h = m["w"], m["h"]
 
-            def _load(path):
-                img = bpy.data.images.load(path)
-                px = np.array(img.pixels[:], dtype=np.float32).reshape(h, w, 4)
-                bpy.data.images.remove(img)
-                return px
-
+            from . import falcon_lt_preview
+            from .falcon_lt_look import prepare
             t0 = time.time()
-            lt_sum = None
-            for p in m["passes"]:
-                layer = _load(p)[:, :, :3]
-                lt_sum = layer if lt_sum is None else (lt_sum + layer)
-            comp = _load(m["beauty"])
-            comp[:, :, :3] += cscene.falcon_lt_gain * _falcon_lt_normconv(
-                lt_sum, cscene.falcon_lt_blur)
+            comp = falcon_lt_preview.compose(
+                m, cscene, lambda layer, settings:
+                _falcon_lt_normconv(prepare(layer, settings), settings.falcon_lt_blur))
+            if self.preview_only:
+                falcon_lt_preview.show(context, comp)
+                self.report({'INFO'}, "Saved-frame LT preview: %.3f s (not saved)" % (time.time() - t0))
+                return {'FINISHED'}
             out_path, disp_path = _falcon_lt_publish(
                 context, scene, stem, comp, w, h, self.report)
         except Exception as e:
@@ -2687,24 +2713,42 @@ class CYCLES_OT_falcon_warmup_render(Operator):
         if warm <= 0:
             self.report({'ERROR'}, "Warm-Up Frames is 0")
             return {'CANCELLED'}
+        if scene.render.is_movie_format:
+            self.report({'ERROR'}, "Render with Warm-Up requires image sequence output")
+            return {'CANCELLED'}
 
         cuts = _falcon_cut_frames(scene)
         original_frame = scene.frame_current
+        original_subframe = scene.frame_subframe
+        original_camera = scene.camera
+        original_persistent = scene.render.use_persistent_data
         base_filepath = scene.render.filepath
+        step = max(1, scene.frame_step)
+        output_frames = range(scene.frame_start, scene.frame_end + 1, step)
 
         # ショットの手前にキーが無いとカメラは静止したままで、視差が出ない=温まらない。
         # 補外を直線にすると「そのまま動き続けていた」状態になり、実フレーム相当の視差が出る。
         # ★ショットごとのカメラすべてに掛ける。1台だけだと2本目以降のカットで効かない。
         saved = []
-        for cam in {c for c in (_falcon_shot_camera(scene, cut) for cut in cuts) if c}:
-            for fc in _falcon_camera_fcurves(cam):
-                saved.append((fc, fc.extrapolation))
-                fc.extrapolation = 'LINEAR'
-
-        original_camera = scene.camera
+        seen_curves = set()
         try:
+            for cam in {c for c in (_falcon_shot_camera(scene, cut) for cut in cuts) if c}:
+                for fc in _falcon_camera_fcurves(cam):
+                    if fc.as_pointer() in seen_curves:
+                        continue
+                    seen_curves.add(fc.as_pointer())
+                    saved.append((fc, fc.extrapolation))
+                    fc.extrapolation = 'LINEAR'
+
+            # This operator renders individual stills, bypassing RE_RenderAnim's
+            # automatic persistence. Keep the same Cycles/NGX session for warm-up
+            # and output frames; otherwise every frame starts cold again.
+            scene.render.use_persistent_data = True
             for i, cut in enumerate(cuts):
                 shot_end = (cuts[i + 1] - 1) if i + 1 < len(cuts) else scene.frame_end
+                frames = [f for f in output_frames if cut <= f <= shot_end]
+                if not frames:
+                    continue
                 shot_cam = _falcon_shot_camera(scene, cut)
 
                 # 捨て焼き。連番で焼くのが必須(フレームが飛ぶとカット扱いで履歴が捨てられる)。
@@ -2713,25 +2757,29 @@ class CYCLES_OT_falcon_warmup_render(Operator):
                 #   有効になる(実測: cut=15 の warm 4枚は 11〜14 が全部 CamA だった)。
                 #   それで温めると、カットで捨てられる側の絵で履歴を埋めることになる。
                 #   frame_set の後に、そのショットのカメラへ差し戻す。
-                for f in range(cut - warm, cut):
+                for f in range(frames[0] - warm * step, frames[0], step):
                     scene.frame_set(f)
                     if shot_cam is not None:
                         scene.camera = shot_cam
-                    bpy.ops.render.render(write_still=False)
+                    if 'CANCELLED' in bpy.ops.render.render(write_still=False):
+                        return {'CANCELLED'}
 
                 # 本番。ここから履歴は温まっている。write_stillは連番を付けないので、
                 # アニメーションレンダーと同じ名前になるようパスを自前で組む。
-                for f in range(cut, shot_end + 1):
+                for f in frames:
                     scene.frame_set(f)
                     scene.render.filepath = base_filepath
                     frame_path = scene.render.frame_path(frame=f)
                     scene.render.filepath = os.path.splitext(frame_path)[0]
-                    bpy.ops.render.render(write_still=True)
+                    if 'CANCELLED' in bpy.ops.render.render(write_still=True):
+                        return {'CANCELLED'}
         finally:
             scene.render.filepath = base_filepath
             for fc, mode in saved:
                 fc.extrapolation = mode
-            scene.frame_set(original_frame)
+            scene.frame_set(original_frame, subframe=original_subframe)
+            scene.camera = original_camera
+            scene.render.use_persistent_data = original_persistent
 
         self.report({'INFO'},
                     rpt_("F-Cycles: rendered with %d cuts x %d warm-up frames") %
@@ -3067,6 +3115,8 @@ classes = (
 
 
 def register():
+    from . import falcon_lt_preview
+    falcon_lt_preview.register()
     from bpy.utils import register_class
     for cls in classes:
         register_class(cls)
@@ -3083,6 +3133,8 @@ def register():
 
 
 def unregister():
+    from . import falcon_lt_preview
+    falcon_lt_preview.unregister()
     from bpy.utils import unregister_class
     if _falcon_reset_photon_state in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_falcon_reset_photon_state)

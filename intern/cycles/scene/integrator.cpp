@@ -127,10 +127,27 @@ static string falcon_cache_dir()
     base = string(xdg);
   }
   else {
+#ifdef _WIN32
+    /* Windows には HOME も /tmp も無い。%LOCALAPPDATA%(無ければ %TEMP%)の下へ。 */
+    const char *local = getenv("LOCALAPPDATA");
+    const char *temp = getenv("TEMP");
+    base = string(local && local[0] != '\0' ? local : (temp && temp[0] != '\0' ? temp : "."));
+#else
     const char *home = getenv("HOME");
     base = path_join(string(home && home[0] != '\0' ? home : "/tmp"), ".cache");
+#endif
   }
   return path_join(base, "falcon_photon");
+}
+
+/* 設定が空の時の SHARC の置き場。Linux は今までどおり /tmp(Windows には無いので上の置き場へ)。 */
+static string falcon_default_sharc_cache_path()
+{
+#ifdef _WIN32
+  return path_join(falcon_cache_dir(), "falcon_sharc_cache.bin");
+#else
+  return "/tmp/falcon_sharc_cache.bin";
+#endif
 }
 
 /* SHARC / フォトンキャッシュの書き込み先を、上のディレクトリの中へ閉じ込める。
@@ -600,7 +617,7 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
     const string cache_setting = falcon_confine_cache_path(
         falcon_knob_string("FALCON_SHARC_CACHE", falcon_sharc_cache));
     dscene->falcon_sharc_cache_path = cache_setting.empty() ?
-                                          string("/tmp/falcon_sharc_cache.bin") :
+                                          falcon_default_sharc_cache_path() :
                                           cache_setting;
     const float keep = falcon_knob_float("FALCON_SHARC_KEEP", falcon_sharc_keep);
     dscene->falcon_sharc_keep = keep < 0.0f ? 0.0f : (keep > 1.0f ? 1.0f : keep);

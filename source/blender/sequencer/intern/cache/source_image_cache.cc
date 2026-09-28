@@ -143,7 +143,7 @@ SeqResult source_image_cache_get(const RenderData *context,
   Scene *scene = prefetch_get_original_scene_and_strip(context, strip);
   if (strip == nullptr) {
     /* Falcon: 先読みの糸が持っている Strip は元のシーンの物を名前で探し直す
-     * (`prefetch_get_original_scene_and_strip`)。再生中に本人がその Strip を
+     * (`prefetch_get_original_scene_and_strip`)。再生中に作者がその Strip を
      * 消すと見つからず nullptr に変わり、この下の get_key() が strip->type を
      * 読んで落ちていた(2026-09-22 実機の crash.txt: source_image_cache_get 直下)。 */
     return {};

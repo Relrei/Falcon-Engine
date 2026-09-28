@@ -44,6 +44,7 @@ bl_info = {
 
 import contextlib
 import os
+import sys
 import time
 
 import bpy
@@ -95,7 +96,10 @@ def bridge_enabled():
     ★呼ばれるたびに環境変数を読む(取り込んだ時に1回だけ読まない)。
       門が走っている最中に `os.environ` を倒して両側を測れるようにするため。
     """
-    return os.environ.get("FALCON_VSE_BRIDGE", "1").strip().lower() not in (
+    # ★2026-09-21 作者「消そう、あんまり安定しなくて一度消すことにしよう」。
+    #   9-10 00:11 に一度切って 01:42 に戻した物を、今度は既定で切る。
+    #   戻す口は `FALCON_VSE_BRIDGE=1` のまま。
+    return os.environ.get("FALCON_VSE_BRIDGE", "0").strip().lower() not in (
         "", "0", "off", "false", "no",
     )
 
@@ -108,7 +112,8 @@ def auto_share_enabled():
       ボタンや共有チェックは出さないまま、**まとめる所だけ**を既定で効かせる。
       古い物を掴む欠点は `_render_started` の時刻で落とす。
     """
-    return os.environ.get("FALCON_VSE_AUTO_SHARE", "1").strip().lower() not in (
+    # ★2026-09-21 作者の指示で既定を切った(上の `bridge_enabled` と同じ理由)。
+    return os.environ.get("FALCON_VSE_AUTO_SHARE", "0").strip().lower() not in (
         "", "0", "off", "false", "no",
     )
 
@@ -313,9 +318,27 @@ def preview_path(scene, frame=None):
 
 # --- 差し替えと、戻し ---------------------------------------------------------
 
+def _falcon_internal_render_running():
+    """Falcon が内側で回している補助レンダー(集光 LT の光子パスなど)の最中か。
+
+    ★ここで出力名を掛けてはいけない。LT が置いた一時の書き出し先
+      (`/tmp/falcon_lt_<blend>_passN`)の**ファイル名の側だけ**が出力名に
+      置き換わるので、4 本のパスが 1 本のファイルに重なり、LT は読み戻せず
+      `cannot reshape array of size ...` で落ちる。
+      2026-09-21 実測: 出力名 "test1" のまま classroom を焼くと集光が毎コマ失敗し、
+      出力名を空にすると pass0〜3 が正しい名前で書かれて通る。
+    ★`_saved_filepath` の二重掛け防止は効かない —— LT は `scene.copy()` の上で
+      回すので、鍵になるシーン名が別物になる。
+    """
+    ops = sys.modules.get("cycles.operators")
+    return ops is not None and getattr(ops, "_falcon_lt_running", 0) > 0
+
+
 def apply_output_name(scene):
     """`render.filepath` を出力名を入れた値へ差し替える。差し替えたら True。"""
     if scene is None:
+        return False
+    if _falcon_internal_render_running():
         return False
     composed = composed_filepath(scene)
     if composed is None:
@@ -422,7 +445,8 @@ def output_target(scene):
         return None
 
     # どのコマが出来ているかは、実物を見て決める。
-    frames = range(int(scene.frame_start), int(scene.frame_end) + 1)
+    step = max(1, scene.frame_step)
+    frames = range(int(scene.frame_start), int(scene.frame_end) + 1, step)
 
     paths = []
     first = None
@@ -431,7 +455,9 @@ def output_target(scene):
         if path and os.path.isfile(path) and _written_by_this_render(scene, path):
             if first is None:
                 first = f
-            paths.append(path)
+            # Preserve the duration of stepped renders; repeat references, not image files.
+            hold = min(step, scene.frame_end - f + 1)
+            paths.extend([path] * hold)
     if not paths:
         return None
     return ('IMAGE', paths, int(first))
@@ -580,7 +606,17 @@ _browser_retry_left = 0
 
 
 def browser_follow_enabled(scene):
-    """「ブラウザを出力先に合わせる」が入っているか。既定 ON・OFF なら一切触らない。"""
+    """「ブラウザを出力先に合わせる」が入っているか。★2026-09-21 から既定で切る。
+
+    ここは `render.frame_path()` をタイマーから呼ぶ道で、2026-09-21 18:24 に
+    **落ちた**(場面かカメラを指す値が壊れた状態で名前を読んでいた)。
+    作者の指示で送る一式ごと切るので、ここも既定で通らないようにする。
+    戻す口 = `FALCON_VSE_BROWSER_FOLLOW=1`。
+    """
+    if os.environ.get("FALCON_VSE_BROWSER_FOLLOW", "0").strip().lower() in (
+        "", "0", "off", "false", "no",
+    ):
+        return False
     return bool(getattr(scene, "falcon_vse_browser_follow_output", False))
 
 
@@ -1789,11 +1825,9 @@ def output_rows(context):
       `("operator", bl_idname)`。
     """
     scene = context.scene
-    rows = [("prop", "falcon_output_name")]
-
-    path = preview_path(scene)
-    if path:
-        rows.append(("label", path))
+    # ★出力名と、実際に書かれる道の 1 行は **出力先のすぐ下**へ移した(2026-09-21 作者)。
+    #   ここ(末尾)へは出さない。→ `_draw_output_name`
+    rows = []
 
     if bridge_enabled():
         rows.append(("separator", None))
@@ -1826,6 +1860,165 @@ def _draw_output(self, context):
             column.separator()
         elif kind == "operator":
             column.operator(value, icon='SEQUENCE')
+
+
+_orig_output_draw = None
+
+
+def _draw_output_name(layout, context):
+    """出力名(と、実際に書かれる道)を出す。★出力先のすぐ下に置く。"""
+    scene = context.scene
+    column = layout.column(align=True)
+    column.use_property_split = False
+    column.prop(scene, "falcon_output_name")
+    path = preview_path(scene)
+    if path:
+        row = column.row()
+        row.active = False
+        row.label(text=path)
+
+
+def _draw_output_panel(self, context):
+    """本家の Output の描き方をそのまま借り、`filepath` の直後へ出力名を差し込む。"""
+    from . import output_panels
+    layout = output_panels.InsertAfterLayout(
+        self.layout, "filepath", lambda target: _draw_output_name(target, context))
+    _orig_output_draw(output_panels.LayoutSelf(layout), context)
+
+
+def _is_orig_output_draw(func):
+    return (getattr(func, "__qualname__", "") == "RENDER_PT_output.draw"
+            and getattr(func, "__module__", "") == "bl_ui.properties_output")
+
+
+def _install_output_draw():
+    """本家の描き方(並びの先頭)だけを差し替える。`append` した物はそのまま後ろに残る。"""
+    global _orig_output_draw
+    from bl_ui.properties_output import RENDER_PT_output
+    funcs = RENDER_PT_output._dyn_ui_initialize()
+    for index, func in enumerate(funcs):
+        if _is_orig_output_draw(func):
+            _orig_output_draw = func
+            funcs[index] = _draw_output_panel
+            return True
+    print("falcon_vse_bridge: RENDER_PT_output draw function not found (出力名は末尾に出ます)")
+    return False
+
+
+def _remove_output_draw():
+    global _orig_output_draw
+    from bl_ui.properties_output import RENDER_PT_output
+    if _orig_output_draw is None:
+        return
+    funcs = RENDER_PT_output._dyn_ui_initialize()
+    for index, func in enumerate(funcs):
+        if func is _draw_output_panel:
+            funcs[index] = _orig_output_draw
+            break
+    _orig_output_draw = None
+
+
+# 出力の中の札の並び。★作者 2026-09-21「エンコードはカラーマネジメントの上に」。
+# `bl_order` は登録の時にしか効かないので、本家の札を登録し直して順を付け直す。
+# ★親を先に、子を後に並べること(親を登録し直すと子も一度外れるため)。
+_OUTPUT_CHILD_ORDER = (
+    ("RENDER_PT_encoding", 1),
+    ("RENDER_PT_output_color_management", 2),
+    ("RENDER_PT_output_pixel_density", 3),
+    ("RENDER_PT_output_views", 4),
+    # エンコーディングの中。作者 2026-09-21「オーディオと動画は入れ替えて上下」=
+    # 動画が上。本家もこの順だが、親を登録し直すと子は名前順(audio → video)で
+    # 戻ってしまうので、ここで番号を付けて固定する。
+    ("RENDER_PT_encoding_video", 1),
+    ("RENDER_PT_encoding_audio", 2),
+    # 一番上の階層。作者 2026-09-22「Falcon の札をメタデータの上に」。
+    # Falcon の札(FALCON_PT_machine)は 5 番で、メタデータとその下の後処理を後ろへ送る。
+    # ★後処理も番号を付けないと、0 番のままメタデータより上に来てしまう。
+    ("RENDER_PT_stamp", 10),
+    ("RENDER_PT_post_processing", 11),
+)
+_output_child_order_before = {}
+
+
+def _panel_children(idname):
+    """bl_parent_id がこの札を指している、登録済みの札を返す。
+
+    ★親を登録し直すと、子の親子関係は切れる。`bl_parent_id` は**子の登録の時にしか
+      解決されない**ので、親だけ外して戻すと子は行き場を失って一番上の階層に出る。
+      2026-09-21 作者「エンコードの中から動画は外さなくてよかった」= エンコーディングの
+      並びを変えたら「動画」と「音声」がエンコーディングの外へ出てしまった。
+    """
+    children = []
+    for name in dir(bpy.types):
+        if not name.startswith(("RENDER_PT_", "FALCON_PT_")):
+            continue
+        cls = getattr(bpy.types, name, None)
+        if not isinstance(cls, type) or not issubclass(cls, bpy.types.Panel):
+            continue
+        if getattr(cls, "bl_parent_id", "") == idname:
+            children.append(cls)
+    # 戻す順を決め打ちにする。`dir()` は名前順なので、そのまま戻すと
+    # 「動画 → オーディオ」が「オーディオ → 動画」に化ける。
+    children.sort(key=lambda c: (getattr(c, "bl_order", 0) or 0, c.__name__))
+    return children
+
+
+def _reregister_panel(cls, order):
+    """`bl_order` を変えて登録し直す。子と孫も一緒に付け直す。
+
+    外すのは深い方から、戻すのは浅い方から。順番を間違えると
+    「親が居ない」で登録に失敗して札ごと消える。
+    """
+    idname = getattr(cls, "bl_idname", cls.__name__)
+    children = _panel_children(idname)
+    grandchildren = {
+        child: _panel_children(getattr(child, "bl_idname", child.__name__))
+        for child in children
+    }
+
+    for child in children:
+        for grandchild in grandchildren[child]:
+            bpy.utils.unregister_class(grandchild)
+        bpy.utils.unregister_class(child)
+    bpy.utils.unregister_class(cls)
+
+    cls.bl_order = order
+    bpy.utils.register_class(cls)
+    for child in children:
+        bpy.utils.register_class(child)
+        for grandchild in grandchildren[child]:
+            bpy.utils.register_class(grandchild)
+
+
+def _install_output_child_order():
+    from bl_ui import properties_output
+    for name, order in _OUTPUT_CHILD_ORDER:
+        cls = getattr(properties_output, name, None)
+        if cls is None:
+            continue
+        _output_child_order_before[name] = getattr(cls, "bl_order", 0)
+        if getattr(cls, "bl_order", 0) == order:
+            continue
+        try:
+            _reregister_panel(cls, order)
+        except Exception as ex:  # noqa: BLE001  並びが変わらないだけ
+            print("falcon_vse_bridge:", ex)
+
+
+def _remove_output_child_order():
+    from bl_ui import properties_output
+    for name, _order in _OUTPUT_CHILD_ORDER:
+        cls = getattr(properties_output, name, None)
+        if cls is None or name not in _output_child_order_before:
+            continue
+        before = _output_child_order_before[name]
+        if getattr(cls, "bl_order", 0) == before:
+            continue
+        try:
+            _reregister_panel(cls, before)
+        except Exception as ex:  # noqa: BLE001
+            print("falcon_vse_bridge:", ex)
+    _output_child_order_before.clear()
 
 
 def _draw_sequencer_add(self, context):
@@ -2043,12 +2236,21 @@ def _remove_scene_panel_polls():
 
 
 class FALCON_PT_machine(Panel):
-    """シーンプロパティの札。ここだけ見れば「この機械で何が効いているか」が分かる。"""
+    """出力プロパティの札。ここだけ見れば「この機械で何が効いているか」が分かる。
+
+    ★作者 2026-09-22「出力プロパティのメタデータの上においてほしい」(元はシーンプロパティ)。
+      メタデータ(RENDER_PT_stamp)は `_OUTPUT_CHILD_ORDER` で 10 番に付け直すので、
+      こちらはそれより小さい番号にする。
+      ★並びが効くのは札の並びを保存していないファイルだけ。保存済みの .blend は
+      札の順番を自分で覚えていて、そちらが勝つ(実測: classroom.blend では
+      後処理の下に出る。内部名を変えても同じだった)。一度ドラッグすればそのファイルは覚える。
+    """
     bl_space_type = 'PROPERTIES'
     bl_region_type = 'WINDOW'
-    bl_context = "scene"
+    bl_context = "output"
     bl_label = "Falcon"
     bl_options = {'DEFAULT_CLOSED'}
+    bl_order = 5
 
     def draw(self, context):
         layout = self.layout
@@ -2730,8 +2932,6 @@ def register():
     output_panels.prepare()
     for cls in classes:
         bpy.utils.register_class(cls)
-    # 起動直後の場面にも「自動」を当てる(読み込みの手続きより先に登録が走る版があるため)。
-    bpy.app.timers.register(_apply_auto_all_deferred, first_interval=0.5)
 
     bpy.types.Scene.falcon_output_name = StringProperty(
         name="Output Name",
@@ -2746,7 +2946,7 @@ def register():
         name="Share Output with VSE",
         description="When a render finishes, add what was written to the output path to the "
                     "Sequencer",
-        default=True,
+        default=False,
     )
 
     bpy.types.Scene.falcon_vse_browser_follow_output = BoolProperty(
@@ -2755,7 +2955,7 @@ def register():
             "When Video Editing opens, point its File Browser at the render output folder. "
             "Off leaves Blender's default"
         ),
-        default=True,
+        default=False,
     )
 
     # エンジンの自動切り替えの覚え(シーンに保存される・画面には出さない)。
@@ -2780,6 +2980,10 @@ def register():
 
     from bl_ui.properties_output import RENDER_PT_output
     RENDER_PT_output.append(_draw_output)
+    _install_output_draw()
+    _install_output_child_order()
+    # 起動直後の場面にも「自動」を当てる(読み込みの手続きより先に登録が走る版があるため)。
+    bpy.app.timers.register(_apply_auto_all_deferred, first_interval=0.5)
     from bl_ui.space_topbar import TOPBAR_HT_upper_bar
     TOPBAR_HT_upper_bar.append(_draw_topbar_notice)
     from bl_ui.space_image import IMAGE_HT_header
@@ -2847,6 +3051,8 @@ def unregister():
     IMAGE_HT_header.remove(_draw_image_header)
     from bl_ui.properties_output import RENDER_PT_output
     RENDER_PT_output.remove(_draw_output)
+    _remove_output_draw()
+    _remove_output_child_order()
     from bl_ui.space_topbar import TOPBAR_HT_upper_bar
     TOPBAR_HT_upper_bar.remove(_draw_topbar_notice)
 

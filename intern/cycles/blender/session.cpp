@@ -2,6 +2,7 @@
  *
  * SPDX-License-Identifier: Apache-2.0 */
 
+#include <algorithm>
 #include <cstdlib>
 
 #include "DEG_depsgraph_query.hh"
@@ -279,6 +280,8 @@ void BlenderSession::free_session()
 
   sync.reset();
   session.reset();
+  last_denoiser_visibility_.clear();
+  have_denoiser_visibility_ = false;
 
   display_driver_ = nullptr;
 }
@@ -385,6 +388,54 @@ void BlenderSession::stamp_view_layer_metadata(Scene *scene, const string &view_
   BKE_render_result_stamp_data(b_rr,
                                (prefix + "synchronization_time").c_str(),
                                time_human_readable_from_seconds(total_time - render_time).c_str());
+}
+
+void BlenderSession::clear_denoiser_history_on_visibility_change()
+{
+  /* Synchronization has finished: this is the set of objects the renderer
+   * actually sees, including instances, collection exclusions and ray masks.
+   * A disappearance cannot be described by the surviving objects' motion
+   * vectors, so carrying RR history across it leaves the removed image behind.
+   * Do not include transforms: normal animation must retain its history. */
+  if (!scene->integrator->get_use_denoise() ||
+      scene->integrator->get_denoiser_type() != DENOISER_DLSS)
+  {
+    have_denoiser_visibility_ = false;
+    last_denoiser_visibility_.clear();
+    return;
+  }
+
+  vector<DenoiserVisibilityKey> visibility;
+  visibility.reserve(scene->objects.size());
+  for (const Object *object : scene->objects) {
+    visibility.emplace_back(object->name.c_str(),
+                            object->get_random_id(),
+                            object->get_visibility(),
+                            object->get_use_holdout(),
+                            object->get_is_shadow_catcher());
+  }
+  /* Export order and evaluated Object pointers can change between frames.
+   * Names and instance random IDs remain stable across those evaluations.
+   * Compare the full set, not just its size: a same-count swap is a cut too. */
+  std::sort(visibility.begin(), visibility.end());
+  if (have_denoiser_visibility_ && visibility != last_denoiser_visibility_) {
+    static const bool reset_on_visibility = getenv("FALCON_DLSS_VISIBILITY_RESET") ?
+                                                atoi(getenv("FALCON_DLSS_VISIBILITY_RESET")) != 0 :
+                                                true;
+    if (getenv("FALCON_DLSS_DEBUG")) {
+      fprintf(stderr,
+              "[visibility] frame=%d objects=%zu->%zu reset=%d\n",
+              b_scene->r.cfra,
+              last_denoiser_visibility_.size(),
+              visibility.size(),
+              int(reset_on_visibility));
+    }
+    if (reset_on_visibility) {
+      session->clear_denoiser_temporal_history();
+    }
+  }
+  last_denoiser_visibility_.swap(visibility);
+  have_denoiser_visibility_ = true;
 }
 
 void BlenderSession::clear_denoiser_history_on_cut()
@@ -662,6 +713,8 @@ void BlenderSession::render(blender::Depsgraph &b_depsgraph_)
                     height,
                     &python_thread_state,
                     session_params.denoise_device);
+
+    clear_denoiser_history_on_visibility_change();
 
     /* At the moment we only free if we are not doing multi-view
      * (or if we are rendering the last view). See #58142/D4239 for discussion.
@@ -1102,6 +1155,7 @@ void BlenderSession::synchronize(blender::Depsgraph &b_depsgraph_)
     sync->sync_camera(*b_render, width, height, "");
   }
 
+  clear_denoiser_history_on_visibility_change();
   clear_denoiser_history_on_cut();
   clear_denoiser_history_on_jump();
 

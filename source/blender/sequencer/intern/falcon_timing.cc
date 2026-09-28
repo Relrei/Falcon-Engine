@@ -11,6 +11,11 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <ctime>
+#ifdef _WIN32
+#  include <windows.h>
+#endif
+
 #include "BLI_time.h"
 
 #include "SEQ_falcon_timing.hh"
@@ -65,6 +70,8 @@ const char *stage_name(const Stage stage)
       return "upload";
     case Stage::GpuComposite:
       return "gpu_composite";
+    case Stage::Lock:
+      return "lock";
     case Stage::Count:
       break;
   }
@@ -77,6 +84,31 @@ bool enabled()
 {
   static const bool on = timing_init();
   return on;
+}
+
+/** 外の見張り(python の time.monotonic / sampler.py)と同じ時計 = CLOCK_MONOTONIC の秒。 */
+static double monotonic_seconds()
+{
+#ifdef _WIN32
+  /* Windows の time.monotonic は QueryPerformanceCounter。 */
+  LARGE_INTEGER freq, now;
+  QueryPerformanceFrequency(&freq);
+  QueryPerformanceCounter(&now);
+  return double(now.QuadPart) / double(freq.QuadPart);
+#else
+  timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return double(ts.tv_sec) + double(ts.tv_nsec) * 1.0e-9;
+#endif
+}
+
+void event(const char *name, const int value)
+{
+  if (!enabled()) {
+    return;
+  }
+  fprintf(g_out, "{\"k\":\"vse_ev\",\"ev\":\"%s\",\"v\":%d,\"t\":%.3f}\n", name, value, monotonic_seconds());
+  fflush(g_out);
 }
 
 void add(const Stage stage, const double seconds, const bool prefetch)
@@ -98,9 +130,10 @@ void frame_done(const int timeline_frame, const double wall_seconds, const bool 
   char line[1024];
   int len = snprintf(line,
                      sizeof(line),
-                     "{\"k\":\"vse_frame\",\"who\":\"%s\",\"frame\":%d,\"wall_ms\":%.3f",
+                     "{\"k\":\"vse_frame\",\"who\":\"%s\",\"frame\":%d,\"t\":%.3f,\"wall_ms\":%.3f",
                      prefetch ? "prefetch" : "preview",
                      timeline_frame,
+                     monotonic_seconds(),
                      wall_seconds * 1000.0);
   for (int i = 0; i < int(Stage::Count); i++) {
     /* ★足した分をそのまま出して 0 に戻す = この 1 コマの間に積まれた分。

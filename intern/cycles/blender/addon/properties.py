@@ -431,6 +431,65 @@ def update_pause(self, context):
 _falcon_caustics_syncing = [False]
 
 
+
+# The master checkbox generates once. Defer UI work until the property update
+# has returned; never start a nested render from a render handler.
+_falcon_photon_auto_pending = set()
+_falcon_photon_auto_busy = set()
+_falcon_photon_auto_status = {}
+
+
+def _falcon_photon_enable_update(self, context):
+    scene = self.id_data
+    key = scene.as_pointer()
+    if key in _falcon_photon_auto_busy or key in _falcon_photon_auto_pending:
+        return
+    _falcon_photon_auto_pending.add(key)
+    _falcon_photon_auto_status[key] = "更新待ち"
+
+    def run():
+        try:
+            if not scene.as_pointer():
+                _falcon_photon_auto_pending.discard(key)
+                return None
+            if bpy.app.is_job_running('RENDER') or bpy.app.is_job_running('COMPOSITE'):
+                if not bpy.app.background:
+                    return 0.25
+                raise RuntimeError("レンダー中は集光を生成できません")
+            _falcon_photon_auto_busy.add(key)
+            from . import operators
+            with bpy.context.temp_override(scene=scene, view_layer=scene.view_layers[0]):
+                if scene.cycles.falcon_caustics_photon:
+                    _falcon_photon_auto_status[key] = "生成中"
+                    result = bpy.ops.cycles.falcon_auto_caustics()
+                    if result != {'FINISHED'} or not operators._falcon_caustics_active():
+                        raise RuntimeError("ガラス・ライトと生成結果を確認してください")
+                    _falcon_photon_auto_status[key] = "生成済み"
+                else:
+                    bpy.ops.cycles.falcon_photon_clear()
+                    _falcon_photon_auto_status[key] = "無効"
+        except Exception as error:
+            print("Falcon caustics checkbox: %s" % error, flush=True)
+            _falcon_photon_auto_status[key] = "生成失敗：ガラス・ライトを確認"
+            # Do not leave an enabled checkbox over a failed or stale cache.
+            _falcon_photon_auto_busy.add(key)
+            try:
+                with bpy.context.temp_override(scene=scene, view_layer=scene.view_layers[0]):
+                    bpy.ops.cycles.falcon_photon_clear()
+                scene.cycles.falcon_caustics_photon = False
+            except (ReferenceError, RuntimeError):
+                pass
+        finally:
+            _falcon_photon_auto_busy.discard(key)
+        _falcon_photon_auto_pending.discard(key)
+        return None
+
+    if bpy.app.background:
+        run()
+    else:
+        bpy.app.timers.register(run, first_interval=0.0)
+
+
 def _falcon_caustics_on_update(self, context):
     if _falcon_caustics_syncing[0]:
         return
@@ -466,20 +525,40 @@ def _falcon_caustics_on_update(self, context):
         _run()
 
 
-def _falcon_caustics_photon_update(self, context):
-    """ライトパス ▸ コースティクス のチェック(2026-09-22・本当の入口にする)。
+# Persist the pre-bake settings with the scene so load_post can restore them
+# when the process-local photon cache is discarded. Zero is a valid snapshot.
+_FALCON_PT_CAUSTICS_SNAPSHOT = "_falcon_pt_caustics_before"
 
-    点マップを足すかどうかは C++ 側が同じチェックを読んで決める(integrator の
-    falcon_caustics_on)。ここでやるのは 2 つだけ:
-      1. 焼いた物が効いている間は、Cycles 自身の集光をチェックの逆にする
-         (焼いた時に切った物。切ったままだと「素の Cycles と同じ絵」にならない)
-      2. 描き直しを起こす(アドオンのプロパティは画面から変えても depsgraph が動かない)
-    """
+
+def _falcon_override_pt_caustics(settings, active):
+    """Temporarily suppress PT caustics without changing the user's defaults."""
+    key = _FALCON_PT_CAUSTICS_SNAPSHOT
+    saved = settings.get(key)
+    if active:
+        if saved is None:
+            settings[key] = (int(settings.caustics_reflective) |
+                             (int(settings.caustics_refractive) << 1))
+        settings.caustics_reflective = False
+        settings.caustics_refractive = False
+    elif saved is not None:
+        settings.caustics_reflective = bool(saved & 1)
+        settings.caustics_refractive = bool(saved & 2)
+        del settings[key]
+
+
+def _falcon_restore_pt_caustics():
+    # The photon environment is process-global; restore every overridden scene
+    # when it is cleared, leaving all other scenes untouched.
+    for scene in bpy.data.scenes:
+        _falcon_override_pt_caustics(scene.cycles, False)
+
+
+def _falcon_caustics_photon_update(self, context):
+    """Sync PT suppression with the photon layer and invalidate the scene."""
     import os
-    if os.environ.get("FALCON_PHOTON_MODE") == "add":
-        pt = not bool(self.falcon_caustics_photon)
-        self.caustics_reflective = pt
-        self.caustics_refractive = pt
+    _falcon_override_pt_caustics(
+        self, os.environ.get("FALCON_PHOTON_MODE") == "add" and
+        bool(self.falcon_caustics_photon))
     scene = self.id_data
     try:
         scene.update_tag()
@@ -628,20 +707,27 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
         "(turning it off is recommended for scenes with volumes)",
         default=True,
     )
+    # ★2026-09-21 に名前と説明を書き直した。作者「蓄積レンダリングの指定数を無視してる」。
+    #   それまでこの数はどこにも繋がっていなかった —— アニメは温めコマ(pipeline.cc)が
+    #   走っている間ずっと 0 を返し、静止画は FALCON_DLSS_STILL_PREROLL しか見ていなかった。
+    #   いまは「蓄積レンダリングを何回するか」の 1 つの数として、アニメでは温めコマ数、
+    #   静止画では事前レンダリングの回数になる。画面に出る「DLSS 蓄積中 n/N」の N がこれ。
+    #   ラベルも「pre-roll」でなく、作者が見ている「蓄積」の語に寄せた。
     denoising_preroll_passes: IntProperty(
-        name="First Frame Pre-Roll Passes",
-        description="For the first frame of an animation only, re-render the same frame this "
-        "many times to build up independent estimates in the DLSS temporal history before the "
-        "real frame is output. "
-        "Not used by default: it was replaced by a warm-up that renders and discards the two "
-        "frames before the first one with the real motion "
-        "(re-rendering the same frame builds a history without motion and made the first frame "
-        "noisier; the warm-up gives a better first frame and is 30 seconds faster over 8 frames). "
-        "To use this count, turn the warm-up off with the environment variable "
-        "FALCON_DLSS_ANIM_WARMUP=0. "
-        "0 disables it. A still (a single F12 frame) has no following frames, so its count is set "
-        "separately with FALCON_DLSS_STILL_PREROLL "
-        "(the number of passes run is shown in the render progress and in the image metadata "
+        name="Accumulation Renders",
+        description="How many renders are made and thrown away to fill the DLSS temporal "
+        "history before the first frame that is kept. "
+        "The history needs several independent estimates of the scene, not a cleaner one, so "
+        "extra samples do not replace these. "
+        "In an animation these are the frames before the start of the range, rendered with the "
+        "real motion and discarded (2 is the measured sweet spot: 0 leaves the opening frame "
+        "visibly noisier, more than that costs time without helping). "
+        "In a still, which has no frames before it, the same frame is rendered this many extra "
+        "times instead. "
+        "0 turns it off. "
+        "The environment variables FALCON_DLSS_ANIM_WARMUP (animation) and "
+        "FALCON_DLSS_STILL_PREROLL (still) override it "
+        "(the number run is shown in the render progress and in the image metadata "
         "cycles.dlss.preroll_passes)",
         min=0, max=16, default=2,
     )
@@ -1529,11 +1615,39 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
                     "512spp at 0",
         min=0.0, max=4.0, default=2.0,
     )
+    falcon_lt_render_mpaths: FloatProperty(
+        name="Render Accumulation (M paths)",
+        description="Total launched LT paths across lights and world, in millions. 0 follows the existing mode and beauty samples. Rounded up to whole samples per pass; guidance probes can add work. Independent of viewport and beauty samples",
+        min=0.0, max=1e9, soft_max=10000.0, default=0.0, precision=3,
+    )
     falcon_lt_gain: FloatProperty(
         name="LT Gain",
-        description="Light-traced caustic brightness multiplier (labeled artistic "
-                    "knob: 1 = physically calibrated against E*albedo/pi)",
-        min=0.0, max=32.0, default=1.0,
+        description="Artistic multiplier for the light-traced caustic layer only. "
+                    "0 removes this layer, 1 keeps the computed baseline, and "
+                    "values above 1 boost it. Use Apply Look after changing it "
+                    "to recomposite the last saved passes without re-rendering. "
+                    "Scene, camera or light changes require a new LT render",
+        min=0.0, max=100.0, soft_max=100.0, default=1.0,
+    )
+    falcon_lt_denoise: BoolProperty(
+        name="LT Denoise", default=False,
+        description="Denoise the raw HDR caustic layer before gain and added light. Uses the built-in OpenImageDenoise; may soften fine caustic lines",
+    )
+    falcon_lt_denoise_strength: FloatProperty(
+        name="Denoise Strength", min=0.0, max=1.0, default=1.0,
+        description="Blend the original and denoised caustic layers",
+    )
+    falcon_lt_spill_radius: FloatProperty(
+        name="Added Light Radius", min=0.0, max=512.0, soft_max=256.0, default=0.0,
+        description="Screen-space added light radius in output pixels. 0 disables it. Artistic effect without depth or occlusion; not a new traced light path",
+    )
+    falcon_lt_spill_falloff: FloatProperty(
+        name="Added Light Falloff", min=0.25, max=8.0, default=2.0,
+        description="Higher values concentrate added light near the existing caustic; lower values extend it toward the radius",
+    )
+    falcon_lt_spill_strength: FloatProperty(
+        name="Added Light Strength", min=0.0, max=10.0, soft_max=3.0, default=1.0,
+        description="Additional artistic energy relative to the existing caustic layer; wider radii dilute it. The original focus is preserved",
     )
     falcon_lt_visibility: BoolProperty(
         name="LT Visibility",
@@ -1563,12 +1677,11 @@ class CyclesRenderSettings(bpy.types.PropertyGroup):
         default=True,
     )
     falcon_caustics_photon: BoolProperty(
-        name="Caustics",
-        description="Caustics from photons shot from the lights. Like Photon path tracing "
-                    "in Octane, it only works once enabled. While off, its settings are "
-                    "hidden and no photon passes run (the same image as plain Cycles)",
-        default=True,
-        update=_falcon_caustics_photon_update,
+        name="集光",
+        description="ONにしたときにフォトン集光を生成し、次のレンダーへ反映します。"
+                    "OFFで集光を無効化します。光子数やシーン変更後はOFF→ONで再生成します",
+        default=False,
+        update=_falcon_photon_enable_update,
     )
     falcon_lt_mode: EnumProperty(
         name="Mode",

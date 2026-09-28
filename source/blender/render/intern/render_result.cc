@@ -101,6 +101,9 @@ void render_result_free(RenderResult *rr)
   if (rr->error) {
     MEM_delete(rr->error);
   }
+  if (rr->falcon_notice) {
+    MEM_delete(rr->falcon_notice);
+  }
 
   BKE_stamp_data_free(rr->stamp_data);
 

@@ -4,6 +4,8 @@
 
 #pragma once
 
+#include <tuple>
+
 #include "device/device.h"
 
 #include "scene/scene.h"
@@ -117,6 +119,14 @@ class BlenderSession {
   /* Drop the DLSS-RR history when the frame that follows cannot be reached from
    * the last one by motion vectors (marker camera switch, timeline jump). */
   void clear_denoiser_history_on_cut();
+
+  /* Keep this beside the session whose denoiser owns the history. Never
+   * share it between viewport windows or independent render sessions. */
+  void clear_denoiser_history_on_visibility_change();
+  using DenoiserVisibilityKey = std::tuple<string, uint, uint, bool, bool>;
+  vector<DenoiserVisibilityKey> last_denoiser_visibility_;
+  bool have_denoiser_visibility_ = false;
+
   /* ★These have to be process-global for the same reason dlss_history_warmed_
    * this_job is (see its declaration): a background animation render builds a
    * fresh BlenderSession for every frame, so a per-instance member is back at

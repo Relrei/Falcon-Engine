@@ -654,6 +654,18 @@ ccl_device_forceinline int integrate_surface_bsdf_bssrdf_bounce(
     bsdf_weight /= sqr(bsdf_eta);
   }
 
+  /* A transmission through IOR=1 glass is a regular direct-light path. Bounce
+   * count alone cannot distinguish it from a refractive caustic; remember only
+   * genuine specular events until the first diffuse receiver. */
+  if ((kernel_data.integrator.falcon_lighttrace || kernel_data.integrator.falcon_photon_pass) &&
+      !(label & LABEL_TRANSPARENT) &&
+      (label & (LABEL_SINGULAR | LABEL_GLOSSY)) &&
+      ((label & LABEL_REFLECT) ||
+       ((label & LABEL_TRANSMIT) && fabsf(bsdf_eta - 1.0f) > 1e-5f)))
+  {
+    INTEGRATOR_STATE_WRITE(state, path, flag) |= PATH_RAY_FALCON_CAUSTIC_EVENT;
+  }
+
   INTEGRATOR_STATE_WRITE(state, path, throughput) *= bsdf_weight;
 
   if (kernel_data.kernel_features & KERNEL_FEATURE_LIGHT_PASSES) {
@@ -1075,7 +1087,8 @@ ccl_device int integrate_surface(KernelGlobals kg,
            * ★ここを疑って潰した仮説7つは全部「スプラット由来」の前提を共有していた
            * = 独立していなかった((internal notes))。 */
           if (d_avg > 0.0f && world_frontface &&
-              (bounce > 0 || kernel_data.integrator.falcon_lt_direct)) {
+              ((path_flag & PATH_RAY_FALCON_CAUSTIC_EVENT) ||
+               kernel_data.integrator.falcon_lt_direct)) {
             /* Throughput is RELATIVE (init 1.0, see init_from_camera); the
              * physical per-photon flux converts it here. The 4x cap now
              * clamps relative spikes (microfacet eval/pdf fireflies), not
@@ -1146,7 +1159,11 @@ ccl_device int integrate_surface(KernelGlobals kg,
           }
           return LABEL_NONE;
         }
-        if (bounce > 0 && d_avg > 0.0f) {
+        /* Same classification as the LT splat above: a photon that only went straight
+         * through IOR=1 glass is direct light, not a caustic (IOR=1 negative control put
+         * +0.268 on the shadow head through the photon map while LT stayed at 0). */
+        (void)bounce;
+        if ((path_flag & PATH_RAY_FALCON_CAUSTIC_EVENT) && d_avg > 0.0f) {
           const float cell_size =
               falcon_sharc_cell_size(kernel_data.integrator.falcon_sharc_cell_size);
           ccl_global float *cache =

@@ -151,6 +151,12 @@ struct RenderResult {
   char *text = nullptr;
   char *error = nullptr;
 
+  /* Falcon: a short notice drawn large in the middle of the image while the picture on screen is
+   * not the real picture yet (DLSS accumulation, the frames before the first one). The image is
+   * plain black there, so the thin info line at the top is easy to miss -- 作者 2026-09-21
+   * 「DLSS の蓄積の時真っ暗で使う側には何が起こってるか分からない」. Null = draw nothing. */
+  char *falcon_notice = nullptr;
+
   struct StampData *stamp_data = nullptr;
 
   bool passes_allocated = false;
@@ -163,6 +169,19 @@ struct RenderStats {
   const char *infostr, *statstr;
   char scene_name[MAX_ID_NAME - 2];
   int mem_used, mem_peak;
+
+  /* Falcon 2026-09-21: the frames rendered and thrown away before the first real one, to fill the
+   * DLSS temporal history (`falcon_anim_warmup_frames`). While these run the frame counter goes
+   * below the start of the range and the image stays black, which read as the render being stuck.
+   * `falcon_warmup_index` counts 1..`falcon_warmup_total`; 0 means a real frame. */
+  int falcon_warmup_index, falcon_warmup_total;
+
+  /* Falcon 2026-09-21: the whole job, not just the current frame. `starttime` above restarts on
+   * every frame, so an animation never showed how long it had been going -- 作者「レンダリングし
+   * 切るのにかかった時間がわかるようにはできるかな」. 0 = not started. */
+  double falcon_job_starttime;
+  /* Real frames finished so far in this job (warm-up frames are not counted). */
+  int falcon_job_frames;
 };
 
 /* *********************** API ******************** */

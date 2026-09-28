@@ -40,8 +40,14 @@ enum class Stage : int {
   Upload,
   /** GPU 経路での変形と重ね(`SEQ_gpu_preview.hh`)。 */
   GpuComposite,
+  /** `seq_render_mutex` を取るまでの待ち(復号と合成を 1 つの錠の中でやっているので、
+   * 先読みと画面側が同時にコマを作ろうとした時にここへ出る)。2026-09-24。 */
+  Lock,
   Count,
 };
+
+/** 先読みの眠り・目覚めなど、コマでない出来事を 1 行で出す(`{"k":"vse_ev","ev":...,"t":...}`)。 */
+void event(const char *name, int value);
 
 /** 計器が入っているか(環境変数を 1 回だけ読む)。 */
 bool enabled();

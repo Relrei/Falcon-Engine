@@ -52,28 +52,32 @@ JA = (
      "ナビ中の低解像度プレビューは無効になるため操作は重くなる。"
      "ボリュームはモーションベクタを持たないため移動中に尾を引く"
      "(ボリューム入りシーンはOFF推奨)"),
-    ("First Frame Pre-Roll Passes", "初回蓄積レンダリング回数"),
-    ("For the first frame of an animation only, re-render the same frame this "
-     "many times to build up independent estimates in the DLSS temporal history before the "
-     "real frame is output. "
-     "Not used by default: it was replaced by a warm-up that renders and discards the two "
-     "frames before the first one with the real motion "
-     "(re-rendering the same frame builds a history without motion and made the first frame "
-     "noisier; the warm-up gives a better first frame and is 30 seconds faster over 8 frames). "
-     "To use this count, turn the warm-up off with the environment variable "
-     "FALCON_DLSS_ANIM_WARMUP=0. "
-     "0 disables it. A still (a single F12 frame) has no following frames, so its count is set "
-     "separately with FALCON_DLSS_STILL_PREROLL "
-     "(the number of passes run is shown in the render progress and in the image metadata "
+    # ★2026-09-21 に付け替えた。旧「初回蓄積レンダリング回数」は英語側が
+    #   "First Frame Pre-Roll Passes" で、しかもどこにも繋がっていなかった。
+    ("Accumulation Renders", "蓄積レンダリング回数"),
+    ("How many renders are made and thrown away to fill the DLSS temporal "
+     "history before the first frame that is kept. "
+     "The history needs several independent estimates of the scene, not a cleaner one, so "
+     "extra samples do not replace these. "
+     "In an animation these are the frames before the start of the range, rendered with the "
+     "real motion and discarded (2 is the measured sweet spot: 0 leaves the opening frame "
+     "visibly noisier, more than that costs time without helping). "
+     "In a still, which has no frames before it, the same frame is rendered this many extra "
+     "times instead. "
+     "0 turns it off. "
+     "The environment variables FALCON_DLSS_ANIM_WARMUP (animation) and "
+     "FALCON_DLSS_STILL_PREROLL (still) override it "
+     "(the number run is shown in the render progress and in the image metadata "
      "cycles.dlss.preroll_passes)",
-     "アニメーションの1枚目だけ、同じフレームをこの回数だけ焼き直して"
-     "DLSSの時間履歴に独立した推定を溜めてから本番の1枚を出す。"
-     "★既定では走らない: 1枚目の前の2コマを本番と同じ動きで焼いて捨てる「温め」に置き換えた"
-     "(同じフレームの焼き直しは動きの無い履歴を作り、1枚目をかえって荒くしていた。"
-     "温めのほうが1枚目が良く、8コマで30秒速い)。"
-     "この回数を使うには環境変数 FALCON_DLSS_ANIM_WARMUP=0 で温めを切る。"
-     "0で無効。静止画(F12で1枚だけ)は続くコマが無いので"
-     "FALCON_DLSS_STILL_PREROLLで回数を別に決める"
+     "残す1枚目の前に、DLSSの時間履歴を埋めるために焼いて捨てるレンダーの回数。"
+     "履歴が要るのは「より綺麗な1つの推定」ではなく「独立した複数の推定」なので、"
+     "サンプル数を増やしても代わりにはならない。"
+     "アニメーションでは範囲の前のコマを本番と同じ動きで焼いて捨てる"
+     "(実測では2が丁度良い。0だと1枚目が目に見えて荒く、増やしても時間だけ掛かる)。"
+     "静止画は前のコマが無いので、同じコマをこの回数だけ余分に焼く。"
+     "0で無効。"
+     "環境変数 FALCON_DLSS_ANIM_WARMUP(アニメ)と FALCON_DLSS_STILL_PREROLL(静止画)が"
+     "指定されていればそちらが勝つ"
      "(走った回数はレンダー中の進捗と画像のメタデータ cycles.dlss.preroll_passes に出る)"),
     ("Pre-Roll Passes at Cuts", "カット時の蓄積レンダリング回数"),
     ("At Cuts (0 = Same as First)", "カット時(0=初回と同じ)"),
@@ -600,6 +604,14 @@ JA = (
     ("Toggle Interface Language", "インターフェースの言語を切り替え"),
     ("Switch the interface language between English and the second language",
      "インターフェースの言語を英語と第2言語で切り替える"),
+    # --- レンダーの情報行と、真っ暗な間の案内 (editors/render/render_internal.cc) -----------
+    ("DLSS Accumulating:", "DLSS 蓄積中:"),
+    ("DLSS Accumulating", "DLSS 蓄積中"),
+    ("This frame is rendered to fill the history and then discarded",
+     "このコマは履歴を作るために焼いて、そのまま捨てます"),
+    ("Preparing the scene", "シーンの準備中"),
+    ("Total:", "合計:"),
+    ("frames,", "コマ・1コマ"),
 )
 
 

@@ -2723,6 +2723,32 @@ def _falcon_draw_status(layout, context):
         col.label(text="SHARC: %s" % cscene.falcon_sharc_mode, icon='OUTLINER_OB_LIGHT')
 
 
+def _falcon_draw_lt_artistic(layout, context):
+    """Post-render controls for the light-traced caustic layer."""
+    col = layout.column(align=True)
+    col.label(text='Caustic Art Direction (LT)')
+    col.prop(context.scene.cycles, "falcon_lt_gain", text='Strength', slider=True)
+    col.prop(context.scene.cycles, "falcon_lt_denoise", text='LT Denoise')
+    if context.scene.cycles.falcon_lt_denoise:
+        col.prop(context.scene.cycles, "falcon_lt_denoise_strength", text='Denoise Strength', slider=True)
+    col.prop(context.scene.cycles, "falcon_lt_spill_radius", text='Added Light Radius (px)')
+    if context.scene.cycles.falcon_lt_spill_radius > 0:
+        col.prop(context.scene.cycles, "falcon_lt_spill_falloff", text='Falloff')
+        col.prop(context.scene.cycles, "falcon_lt_spill_strength", text='Added Light Strength')
+        col.label(text='Screen-space light; no occlusion', icon='INFO')
+    col.prop(context.scene.cycles, "falcon_lt_render_mpaths", text='Render Accumulation (M paths)')
+    col.label(text='0 = Follow samples; re-render LT after changing')
+    row = col.row(align=True)
+    for value in (0.0, 1.0, 2.0, 4.0):
+        op = row.operator("wm.context_set_float", text="%gx" % value)
+        op.data_path = "scene.cycles.falcon_lt_gain"
+        op.value = value
+    col.label(text='0 = Off / 1 = Baseline / 2+ = Boost')
+    col.operator("cycles.falcon_lt_recomposite", text='Quick Preview (Saved Frame)', icon='IMAGE_DATA').preview_only = True
+    col.label(text='Scene changes require a new LT render')
+    col.operator("cycles.falcon_lt_recomposite", text='Apply Look (No Re-render)', icon='FILE_REFRESH')
+
+
 def _falcon_draw_classic(layout, context):
     """従来の F-Cycles 親パネル(既定)。"""
     from . import operators as _fops
@@ -2752,14 +2778,19 @@ def _falcon_draw_classic(layout, context):
             r = box.row(align=True)
             r.label(text="Enabled — caustics appear in renders", icon='CHECKMARK')
             r.operator("cycles.falcon_photon_clear", text="", icon='X')
-            # 強さは焼き直し不要の render-time ノブ(点マップ gain の env を更新)
-            box.prop(cscene, "falcon_photon_point_gain", text="Strength", slider=True)
         elif _fops._falcon_scene_has_caustics(context.scene):
             box.label(text="Glass and light detected", icon='CHECKMARK')
             box.operator("cycles.falcon_auto_caustics", icon='SHADERFX')
         else:
             # 空状態=「最初の一手」を案内(黙って無反応にしない)
             box.label(text="Add glass or refraction and a light to make caustics", icon='INFO')
+        # ★2026-09-22 作者「コースティクス自体の強度を自由にいじれるようにしたい」。
+        #   強さはどちらも**後掛け**の値で焼き直しが要らない(点マップは次のレンダー
+        #   から効き、ライトトレース側は下の再合成でその場で効く)。焼いた後だけに
+        #   出していたのをやめて、集光が入っていれば常に触れる所に置く。
+        gain = box.column(align=True)
+        gain.prop(cscene, "falcon_photon_point_gain", text="Strength", slider=True)
+        _falcon_draw_lt_artistic(gain, context)
         # 清書コースティクス(LT): フォトンと別経路の仕上げ。検出時は常に選べる。
         if _fops._falcon_scene_has_caustics(context.scene):
             sub = box.column(align=True)
@@ -2801,7 +2832,10 @@ def _falcon_draw_simple(layout, context):
         return
 
     body = layout.column(align=True)
-    body.prop(cscene, "falcon_photon_point_gain", text="Strength", slider=True)
+    if cscene.falcon_caustics_quality == 'CLEAN':
+        _falcon_draw_lt_artistic(body, context)
+    else:
+        body.prop(cscene, "falcon_photon_point_gain", text="Strength", slider=True)
     body.separator()
     # ★2択は行いっぱいに置く。ラベルと同じ行に入れると N パネルの幅で
     #   「清書(数分)」が丸ごと消える(実測)。
@@ -2843,54 +2877,20 @@ def _falcon_draw_presets(layout, context):
 
 
 def _falcon_draw_photon(layout, context):
-    import os as _os
     cscene = context.scene.cycles
-
     col = layout.column(align=True)
-    row = col.row(align=True)
-    row.prop(cscene, "falcon_photon_photons", text="Photons")
-    row = col.row(align=True)
-    row.prop(cscene, "falcon_photon_cell", text="Cell")
-    row.prop(cscene, "falcon_photon_dispersion", text="Chromatic Dispersion")
-    row = col.row(align=True)
-    row.prop(cscene, "falcon_photon_gpu", text="GPU (Fast)")
-    row.prop(cscene, "falcon_photon_point", text="Point Map")
-    if cscene.falcon_photon_gpu:
-        # The blur width is asked for in pixels and measured out in the
-        # scene, so it reads the same whether it ends up as a lookup radius
-        # (point map) or a cell size (grid).
-        row = col.row(align=True)
-        row.prop(cscene, "falcon_photon_point_radius_auto", text="Auto Radius")
-        if cscene.falcon_photon_point_radius_auto:
-            row.prop(cscene, "falcon_photon_point_radius_px", text="Pixel Radius")
-        row = col.row(align=True)
-        sub = row.row()
-        sub.active = not cscene.falcon_photon_point_radius_auto
-        if cscene.falcon_photon_point:
-            sub.prop(cscene, "falcon_photon_point_radius", text="Radius (m)")
-            row.prop(cscene, "falcon_photon_point_gain", text="Gain")
-        else:
-            sub.prop(cscene, "falcon_photon_cell", text="Cell (m)")
-            row.prop(cscene, "falcon_photon_radius", text="Spread")
-        if cscene.falcon_photon_point:
-            row = col.row(align=True)
-            row.prop(cscene, "falcon_photon_point_maxpts", text="Point Cap")
-            row.prop(cscene, "falcon_photon_point_normal_deg", text="Normal Angle (Degrees)")
+    col.use_property_split = True
+    col.use_property_decorate = False
+    col.prop(cscene, "falcon_photon_photons", text="光子数")
+    col.prop(cscene, "falcon_photon_dispersion", text="分散")
+    col.prop(cscene, "falcon_photon_point_radius_auto", text="半径を自動調整")
+    if cscene.falcon_photon_point_radius_auto:
+        col.prop(cscene, "falcon_photon_point_radius_px", text="半径 (px)")
     else:
-        row = col.row(align=True)
-        row.prop(cscene, "falcon_photon_radius", text="Caustic Smoothness")
-    col.operator("cycles.falcon_photon_bake", icon='LIGHT_SUN')
-    # Runs in a separate background process (safe against the Vulkan
-    # viewport crash); confirmation dialog picks once/per-frame bake.
-    col.operator("cycles.falcon_bake_and_render_range",
-                 icon='RENDER_ANIMATION')
-    if _os.environ.get("FALCON_PHOTON_MODE") == "add":
-        r = col.row(align=True)
-        if _os.environ.get("FALCON_PHOTON_POINTS"):
-            r.label(text="Composite: on (point map)", icon='CHECKMARK')
-        else:
-            r.label(text="Composite: on", icon='CHECKMARK')
-        r.operator("cycles.falcon_photon_clear", text="", icon='X')
+        col.prop(cscene, "falcon_photon_point_radius", text="半径 (m)")
+    col.prop(cscene, "falcon_photon_point_gain", text="強さ")
+    col.prop(cscene, "falcon_photon_point_maxpts", text="保存点数の上限")
+    col.prop(cscene, "falcon_photon_point_normal_deg", text="法線角 (度)")
 
 
 def _falcon_draw_lt(layout, context):
@@ -2906,14 +2906,14 @@ def _falcon_draw_lt(layout, context):
         return
 
     col = layout.column(align=True)
+    col.use_property_split = True
+    col.use_property_decorate = False
     row = col.row(align=True)
-    row.prop(cscene, "falcon_lt_mode", expand=True)
-    # 自動は摘みを持たない(場面から決める)ので、下の摘みは蓄積/疑似だけ出す
+    row.prop(cscene, "falcon_lt_mode", text="方式")
+    _falcon_draw_lt_artistic(col, context)
+    col.prop(cscene, "falcon_lt_blur", text="Blur (px)")
     col2 = col.column(align=True)
     col2.active = (cscene.falcon_lt_mode != 'AUTO')
-    row = col2.row(align=True)
-    row.prop(cscene, "falcon_lt_blur", text="Blur (px)")
-    row.prop(cscene, "falcon_lt_gain", text="Gain")
     row = col2.row(align=True)
     row.prop(cscene, "falcon_lt_visibility", text="Visibility (Remove Occluded/Through-Glass)")
     row = col2.row(align=True)
@@ -2922,9 +2922,7 @@ def _falcon_draw_lt(layout, context):
     row.prop(cscene, "falcon_lt_guide_tiles", text="Emission Guiding")
     row = col2.row(align=True)
     row.prop(cscene, "falcon_lt_world", text="World Photons (Caustics Inside Shadows)")
-    col.operator("cycles.falcon_lighttrace_render", icon='RENDER_STILL')
-    # 生パスが残っていれば、ゲイン/ぼかし変更は再レンダー不要で反映できる
-    col.operator("cycles.falcon_lt_recomposite", icon='FILE_REFRESH')
+    col.operator("cycles.falcon_lighttrace_render", text="LTでレンダー", icon='RENDER_STILL')
 
 
 def _falcon_draw_culling(layout, context):
@@ -3312,42 +3310,83 @@ class VIEW3D_PT_falcon_cyclesf_adv_sharc(_FalconSharc, FalconSidebarAdvancedChil
     pass
 
 
+
+# Feature controls live with the standard render settings they affect.
+class CYCLES_RENDER_PT_light_paths_photon(CyclesButtonsPanel, Panel):
+    bl_label = "集光"
+    bl_parent_id = "CYCLES_RENDER_PT_light_paths"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw_header(self, context):
+        self.layout.prop(context.scene.cycles, "falcon_caustics_photon", text="")
+
+    def draw(self, context):
+        from .properties import _falcon_photon_auto_status
+        col = self.layout.column()
+        col.enabled = context.scene.cycles.falcon_caustics_photon
+        _falcon_draw_photon(col, context)
+        status = _falcon_photon_auto_status.get(context.scene.as_pointer())
+        if status:
+            self.layout.label(text=status)
+
+
+class CYCLES_RENDER_PT_light_paths_photon_lt(CyclesButtonsPanel, Panel):
+    bl_label = "ライトトレース (LT)"
+    bl_parent_id = "CYCLES_RENDER_PT_light_paths_photon"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        return (CyclesButtonsPanel.poll(context) and
+                context.scene.cycles.falcon_caustics_photon)
+
+    def draw(self, context):
+        _falcon_draw_lt(self.layout, context)
+
+
+class CYCLES_RENDER_PT_simplify_auto_culling(CyclesButtonsPanel, Panel):
+    bl_label = "自動カリング"
+    bl_parent_id = "CYCLES_RENDER_PT_simplify"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        _falcon_draw_culling(self.layout, context)
+
+
+class CYCLES_RENDER_PT_sharc_cache(CyclesButtonsPanel, Panel):
+    bl_label = "SHARC キャッシュ (実験的)"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        _falcon_draw_sharc(self.layout, context)
+
+
+
+class CYCLES_OUTPUT_PT_temporal(CyclesButtonsPanel, Panel):
+    bl_label = "Temporal（ちらつき低減）"
+    bl_context = "output"
+    bl_parent_id = "RENDER_PT_output"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        return (CyclesButtonsPanel.poll(context) and
+                not context.scene.render.is_movie_format)
+
+    def draw(self, context):
+        col = self.layout.column(align=True)
+        col.operator("cycles.falcon_temporal_setup",
+                     text="後処理用の素材保存を設定", icon='NODE_COMPOSITING')
+        col.label(text="画像と動きベクトルをEXRに保存")
+        col.label(text="ちらつき低減の適用はレンダー後の別処理", icon='INFO')
+
+
 classes = (
+    CYCLES_OUTPUT_PT_temporal,
     CYCLES_PT_sampling_presets,
     CYCLES_PT_viewport_sampling_presets,
     CYCLES_PT_integrator_presets,
     CYCLES_PT_performance_presets,
-    CYCLES_RENDER_PT_falcon,
-    CYCLES_RENDER_PT_falcon_presets,
-    CYCLES_RENDER_PT_falcon_photon,
-    CYCLES_RENDER_PT_falcon_lt,
-    CYCLES_RENDER_PT_falcon_culling,
-    CYCLES_RENDER_PT_falcon_temporal,
-    CYCLES_RENDER_PT_falcon_sharc,
-    # 簡単表示(falcon_simple_panel=True)の時だけ poll が通る組。
-    # 既定 False では1枚も出ないので、見た目は今までと同じ。
-    CYCLES_RENDER_PT_falcon_advanced,
-    CYCLES_RENDER_PT_falcon_adv_presets,
-    CYCLES_RENDER_PT_falcon_adv_photon,
-    CYCLES_RENDER_PT_falcon_adv_lt,
-    CYCLES_RENDER_PT_falcon_adv_culling,
-    CYCLES_RENDER_PT_falcon_adv_temporal,
-    CYCLES_RENDER_PT_falcon_adv_sharc,
-    VIEW3D_PT_falcon_cyclesf,
-    VIEW3D_PT_falcon_cyclesf_advanced,
-    VIEW3D_PT_falcon_cyclesf_adv_presets,
-    VIEW3D_PT_falcon_cyclesf_adv_photon,
-    VIEW3D_PT_falcon_cyclesf_adv_lt,
-    VIEW3D_PT_falcon_cyclesf_adv_culling,
-    VIEW3D_PT_falcon_cyclesf_adv_temporal,
-    VIEW3D_PT_falcon_cyclesf_adv_sharc,
-    VIEW3D_PT_falcon_cyclesf_presets,
-    VIEW3D_PT_falcon_cyclesf_photon,
-    VIEW3D_PT_falcon_cyclesf_lt,
-    VIEW3D_PT_falcon_cyclesf_culling,
-    VIEW3D_PT_falcon_cyclesf_temporal,
-    VIEW3D_PT_falcon_cyclesf_plugins,
-    VIEW3D_PT_falcon_cyclesf_sharc,
     CYCLES_RENDER_PT_sampling,
     CYCLES_RENDER_PT_sampling_viewport,
     CYCLES_RENDER_PT_sampling_viewport_denoise,
@@ -3363,6 +3402,8 @@ classes = (
     CYCLES_RENDER_PT_light_paths_clamping,
     CYCLES_RENDER_PT_light_paths_caustics,
     CYCLES_RENDER_PT_light_paths_fast_gi,
+    CYCLES_RENDER_PT_light_paths_photon,
+    CYCLES_RENDER_PT_light_paths_photon_lt,
     CYCLES_RENDER_PT_volumes,
     CYCLES_RENDER_PT_subdivision,
     CYCLES_RENDER_PT_curves,
@@ -3371,6 +3412,7 @@ classes = (
     CYCLES_RENDER_PT_simplify_viewport,
     CYCLES_RENDER_PT_simplify_render,
     CYCLES_RENDER_PT_simplify_culling,
+    CYCLES_RENDER_PT_simplify_auto_culling,
     CYCLES_VIEW3D_PT_simplify_greasepencil,
     CYCLES_VIEW3D_PT_shading_lighting,
     CYCLES_VIEW3D_PT_shading_render_pass,
@@ -3429,6 +3471,7 @@ classes = (
     CYCLES_MATERIAL_PT_settings,
     CYCLES_MATERIAL_PT_settings_surface,
     CYCLES_MATERIAL_PT_settings_volume,
+    CYCLES_RENDER_PT_sharc_cache,
     CYCLES_RENDER_PT_bake,
     CYCLES_RENDER_PT_bake_influence,
     CYCLES_RENDER_PT_bake_selected_to_active,

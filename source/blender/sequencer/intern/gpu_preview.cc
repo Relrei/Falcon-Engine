@@ -47,6 +47,7 @@
 
 #include "SEQ_falcon_timing.hh"
 #include "SEQ_gpu_preview.hh"
+#include "SEQ_prefetch.hh"
 #include "SEQ_iterator.hh"
 #include "SEQ_render.hh"
 #include "SEQ_sequencer.hh"
@@ -1104,6 +1105,10 @@ static bool gpu_preview_no(const int why)
 
 bool gpu_preview_produce(const RenderData *context, const float timeline_frame, const int chanshown)
 {
+  /* Falcon 2026-09-26: レンダーの間は先回りしない(読み手をレンダーの糸と取り合わない)。 */
+  if (render_exclusive_active()) {
+    return false;
+  }
   if (!gpu_preview_enabled() || gpu_preview_ahead_frames() == 0) {
     return gpu_preview_no(0);
   }

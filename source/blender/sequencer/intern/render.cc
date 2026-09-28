@@ -70,6 +70,7 @@
 #include "SEQ_proxy.hh"
 #include "SEQ_relations.hh"
 #include "SEQ_falcon_timing.hh"
+#include "SEQ_prefetch.hh"
 #include "SEQ_render.hh"
 #include "SEQ_sequencer.hh"
 #include "SEQ_time.hh"
@@ -2301,7 +2302,11 @@ void seq_render_evict_caches_if_full(const RenderData *context)
   if (orig_scene == nullptr || orig_scene->ed == nullptr) {
     return;
   }
-  std::scoped_lock lock(seq_render_mutex);
+  std::unique_lock<Mutex> lock(seq_render_mutex, std::defer_lock);
+  {
+    timing::Scope timer(timing::Stage::Lock, context->is_prefetch_render);
+    lock.lock();
+  }
   timing::Scope timer(timing::Stage::Evict, context->is_prefetch_render);
   evict_caches_if_full(orig_scene);
 }
@@ -2358,7 +2363,11 @@ void falcon_decode_images_ahead(
   Vector<Job> jobs;
   for (int frame = from; frame <= to; frame++) {
     for (Strip *strip : query_rendered_strips(scene_eval, channels, seqbase, frame, 0)) {
-      if (strip->type == STRIP_TYPE_IMAGE) {
+      /* Proxies are not retained in the source cache. Reading them here only
+       * discards the result and makes playback decode them a second time. */
+      if (strip->type == STRIP_TYPE_IMAGE &&
+          !can_use_proxy(context, strip, rendersize_to_proxysize(context->preview_render_size)))
+      {
         jobs.append({strip, frame});
       }
     }
@@ -2386,6 +2395,10 @@ void falcon_decode_images_ahead(
 /** 画面側(再生中)が素材キャッシュを外した時、その先を並列に復号する。 */
 static void falcon_preview_decode_ahead(const RenderData *context, const int timeline_frame)
 {
+  /* Falcon 2026-09-26: レンダーの間は先回りしない(#render_exclusive_begin)。 */
+  if (render_exclusive_active()) {
+    return;
+  }
   const int threads = falcon_image_decode_threads();
   if (threads <= 1 || context->is_prefetch_render || context->render != nullptr ||
       !context->is_playing)
@@ -2674,6 +2687,87 @@ static SeqResult seq_render_strip_stack(const RenderData *context,
   return out;
 }
 
+/* -------------------------------------------------------------------- */
+/** \name 同じコマに重なった動画を並列に復号する(2026-09-24・公開 Issue #16)
+ *
+ * ★なぜ要るか(実測・FHD H.264 を 4 本重ねた場面・demo・4 CPU): 先読みは 1 本の糸で 1 コマ 66ms
+ * (復号 39 + 下ごしらえ 26 + 変形 24 …)= 15fps しか作れず、30fps の再生に追い越される。追い越された後は
+ * 画面側が自分でコマを作る(1 コマ 183ms)が、その **2/3(中央値 120ms)は `seq_render_mutex` を先読みと
+ * 奪い合う待ち**で、表示は 3.5fps まで落ちる(`labs/2026-09/vse-stack4-20260924/`)。
+ *
+ * 直し: 復号だけを錠の**外**へ出し、重なっている動画を糸ごとに並列に読んで素材キャッシュへ入れておく。
+ * 錠の中に残るのは下ごしらえ・変形・重ね(復号済みの絵に対する処理)だけ。動画ごとに読み手(MovieReader)が
+ * 別なので、別々の動画を別の糸で読んでも順番の制約は無い(画像の連番と同じ理屈・`falcon_decode_images_ahead`)。
+ * 読み手を開く所(`strip_open_anim_file`)は並列に入る前に済ませる。
+ *
+ * 触らない所: GPU 経路の先読み(`gpu_preview_produce` は読み手から YUV の面を直に取るので、ここで RGB に
+ * 復号してしまうと読み手の位置が進んで巻き戻しになる)・プロキシ(素材キャッシュに入らない)・
+ * 書き出しの `skip_cache`。戻す口 `FALCON_VSE_PARALLEL_MOVIE=0`。糸の数は `FALCON_VSE_PREFETCH_DECODE_THREADS`。
+ * \{ */
+
+static bool falcon_parallel_movie_decode_enabled()
+{
+  static const bool on = []() {
+    const char *env = getenv("FALCON_VSE_PARALLEL_MOVIE");
+    return env == nullptr || env[0] == '\0' || strcmp(env, "0") != 0;
+  }();
+  return on;
+}
+
+static void falcon_decode_movies_parallel(const RenderData *context,
+                                          const Vector<Strip *> &strips,
+                                          const float timeline_frame)
+{
+  if (!falcon_parallel_movie_decode_enabled() || context->skip_cache ||
+      falcon_image_decode_threads() <= 1)
+  {
+    return;
+  }
+  Scene *orig_scene = prefetch_get_original_scene(context);
+  if (orig_scene == nullptr || orig_scene->ed == nullptr ||
+      !(orig_scene->ed->cache_flag & SEQ_CACHE_STORE_RAW))
+  {
+    return;
+  }
+  /* `seq_render_strip_stack` が上から見て実際に描く物だけ。REPLACE か「不透明で画面を覆う alpha over」で
+   * 止まる(その下は隠れる)。★`is_opaque_alpha_over()` だけでは止めない — それは絵の中身が不透明かで、
+   * 縮めた動画は透明な縁を持つので下も描かれる。判定は保守的で、読まなかった分は今まで通り錠の中で順に読む。 */
+  Vector<Strip *> jobs;
+  for (int64_t i = strips.size() - 1; i >= 0; i--) {
+    Strip *strip = strips[i];
+    if (strip->type == STRIP_TYPE_MOVIE &&
+        !can_use_proxy(context, strip, rendersize_to_proxysize(context->preview_render_size)))
+    {
+      jobs.append(strip);
+    }
+    if (strip->blend_mode == STRIP_BLEND_REPLACE ||
+        (is_opaque_alpha_over(strip, context) && is_strip_covering_screen(context, strip)))
+    {
+      break;
+    }
+  }
+  if (jobs.size() < 2) {
+    return;
+  }
+  for (Strip *strip : jobs) {
+    strip_open_anim_file(context->scene, strip, false);
+  }
+  threading::parallel_for(jobs.index_range(), 1, [&](const IndexRange range) {
+    for (const int64_t i : range) {
+      SeqRenderState state;
+      bool is_proxy_image = false;
+      /* 素材キャッシュに当たりがあればそれを返すだけ、無ければ復号して入れる。 */
+      SeqResult res = seq_render_strip_source_only(
+          context, &state, jobs[i], timeline_frame, &is_proxy_image);
+      if (res.is_valid()) {
+        IMB_freeImBuf(res.image);
+      }
+    }
+  });
+}
+
+/** \} */
+
 ImBuf *render_give_ibuf(const RenderData *context, float timeline_frame, int chanshown)
 {
   /* 1 コマの壁時計。工程ごとの合計(並列込み)は `timing::Scope` が別に積む。 */
@@ -2745,7 +2839,11 @@ ImBuf *render_give_ibuf(const RenderData *context, float timeline_frame, int cha
   if (context->is_prefetch_render && gpu_preview_enabled() && gpu_preview_is_active() &&
       !strips.is_empty() && !out)
   {
-    std::scoped_lock lock(seq_render_mutex);
+    std::unique_lock<Mutex> lock(seq_render_mutex, std::defer_lock);
+    {
+      timing::Scope timer(timing::Stage::Lock, true);
+      lock.lock();
+    }
     {
       timing::Scope timer(timing::Stage::Evict, true);
       evict_caches_if_full(orig_scene);
@@ -2768,7 +2866,14 @@ ImBuf *render_give_ibuf(const RenderData *context, float timeline_frame, int cha
   }
 
   if (!strips.is_empty() && !out) {
-    std::scoped_lock lock(seq_render_mutex);
+    /* ★重なった動画の復号は錠の外で並列に(`falcon_decode_movies_parallel`)。 */
+    falcon_decode_movies_parallel(context, strips, timeline_frame);
+    /* ★錠を取るまでの待ちを計器に出す(2026-09-24・Issue #16: 先読みと画面側が同じ錠を奪い合う)。 */
+    std::unique_lock<Mutex> lock(seq_render_mutex, std::defer_lock);
+    {
+      timing::Scope timer(timing::Stage::Lock, context->is_prefetch_render);
+      lock.lock();
+    }
     /* Try to make space before we add any new frames to the cache if it is full.
      * If we do this after we have added the new cache, we risk removing what we just added. */
     {

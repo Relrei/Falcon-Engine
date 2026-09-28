@@ -101,10 +101,16 @@ class DenoiseParams : public Node {
    * carries across navigation restarts using the interactive motion passes. */
   bool carry_history = false;
 
-  /* DLSS-RR: how many times the first frame of an animation is re-rendered into
-   * the same history before the kept pass. Only independent estimates of the
-   * frame grow the history, so the opening frame needs them made on purpose. */
-  int preroll_passes = 4;
+  /* DLSS-RR: how many accumulation renders the opening of a render gets -- the
+   * frames rendered and thrown away before the first frame of an animation
+   * (RE_RenderAnim), or the extra passes of a still. Only independent estimates
+   * of the frame grow the history, so the opening needs them made on purpose.
+   * ★The default is the scene property's default (2) and
+   * RenderScheduler::DLSS_ANIM_WARMUP_DEFAULT / pipeline.cc's
+   * FALCON_DLSS_ANIM_WARMUP_DEFAULT; all three have to move together, or the
+   * warm-up and the pre-roll disagree about whether the other one is running
+   * (2026-09-21: it was 4 here while the other two were 2). */
+  int preroll_passes = 2;
 
   /* DLSS-RR: the same, for the first frame after a cut (the history was thrown
    * away there too, but the scene is already loaded and the shot is usually

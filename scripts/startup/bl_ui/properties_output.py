@@ -500,6 +500,22 @@ class RENDER_PT_encoding(RenderOutputButtonsPanel, Panel):
         layout.prop(ffmpeg, "use_autosplit")
 
 
+def _seq_export_active(context):
+    """この場面の書き出しがシーケンサー(VSE)を通るか。
+
+    Blender 側の `RE_seq_render_active()` と同じ条件 ―― 出力でシーケンサーを使う
+    設定で、実際にストリップが 1 本でもある時だけ。名前は版で `strips` と
+    `sequences` の両方があり得るので、両方見る。
+    """
+    scene = context.scene
+    if not scene.render.use_sequencer:
+        return False
+    sed = scene.sequence_editor
+    if sed is None:
+        return False
+    return bool(getattr(sed, "strips", None) or getattr(sed, "sequences", None))
+
+
 class RENDER_PT_encoding_video(RenderOutputButtonsPanel, Panel):
     bl_label = "Video"
     bl_parent_id = "RENDER_PT_encoding"
@@ -538,8 +554,13 @@ class RENDER_PT_encoding_video(RenderOutputButtonsPanel, Panel):
             layout.prop(ffmpeg, "codec")
 
             # GPUエンコード: H.264 / HEVC のときだけ意味があるので、
-            # コーデックを選んだ直後に置く
-            if ffmpeg.codec in {'H264', 'H265'}:
+            # コーデックを選んだ直後に置く。
+            # ★2026-09-22 作者「レンダリング(3D)はいらないけど VSE のほうは必要」。
+            #   3D のレンダー出力では 1 コマの描画が符号化より桁違いに長いので、
+            #   GPU へ逃がしても総時間は変わらない(実測 FHD 1 コマ: 符号化 13ms /
+            #   パストレース 数秒〜数分)。効くのは符号化そのものが律速になる
+            #   シーケンサーの書き出しなので、その時だけ出す。
+            if ffmpeg.codec in {'H264', 'H265'} and _seq_export_active(context):
                 layout.prop(ffmpeg, "use_hardware_encoder")
 
         if needs_codec and ffmpeg.codec == 'NONE':

@@ -103,6 +103,54 @@ class FilteredLayout:
         setattr(self._layout, name, value)
 
 
+class InsertAfterLayout:
+    """UILayout の代わり。**指定の項目を描いた直後に 1 回だけ**差し込む。他は本物へそのまま渡す。
+
+    ★なぜ要るか(2026-09-21 作者「名前の設定は出力の下の段に置いて欲しい」): 本家の
+      `RENDER_PT_output.draw` の中ほど(出力先のすぐ下)へ行を足したいが、`append()` では
+      末尾にしか置けない。本家の描き方はそのまま借りたいので、`layout` の側で受けて差し込む。
+    """
+
+    __slots__ = ("_layout", "_after", "_insert", "_state")
+
+    def __init__(self, layout, after, insert, state=None):
+        object.__setattr__(self, "_layout", layout)
+        object.__setattr__(self, "_after", after)
+        object.__setattr__(self, "_insert", insert)
+        object.__setattr__(self, "_state", {"done": False} if state is None else state)
+
+    def __getattr__(self, name):
+        attr = getattr(self._layout, name)
+        if name in _SUB_LAYOUTS:
+            after, insert, state = self._after, self._insert, self._state
+
+            def sub(*args, **kwargs):
+                return InsertAfterLayout(attr(*args, **kwargs), after, insert, state)
+            return sub
+        if name == "prop":
+            after, insert, state = self._after, self._insert, self._state
+            layout = self._layout
+
+            def prop(data, property, *args, **kwargs):  # noqa: A002  UILayout.prop と同じ名前
+                result = attr(data, property, *args, **kwargs)
+                if (not state["done"]) and property == after:
+                    state["done"] = True
+                    insert(layout)
+                return result
+            return prop
+        return attr
+
+    def __setattr__(self, name, value):
+        setattr(self._layout, name, value)
+
+
+class LayoutSelf:
+    """本家の `draw(self, context)` に渡す `self`(使うのは `layout` だけ)。"""
+
+    def __init__(self, layout):
+        self.layout = layout
+
+
 class _FormatSelf:
     """`RENDER_PT_format.draw` に渡す `self`(使うのは `layout` と `draw_framerate` だけ)。"""
 

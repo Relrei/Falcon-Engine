@@ -567,6 +567,68 @@ static bool image_parse_filepaths(PyObject *pyfilepaths, vector<string> &filepat
   return true;
 }
 
+/* Falcon LT look (addon/falcon_lt_look.py): OIDN "RT" on one linear HDR RGB layer, using the
+ * OIDN that Cycles already links, so the caustic denoise does not need an `oidnDenoise`
+ * executable on PATH. Takes and returns packed little-endian float32 RGB (height x width x 3). */
+static PyObject *falcon_oidn_denoise_rgb_func(PyObject * /*self*/, PyObject *args)
+{
+#ifdef WITH_OPENIMAGEDENOISE
+  Py_buffer view;
+  int width, height;
+  if (!PyArg_ParseTuple(args, "y*ii", &view, &width, &height)) {
+    return nullptr;
+  }
+  const size_t num_floats = size_t(width) * size_t(height) * 3;
+  if (width <= 0 || height <= 0 || view.len != Py_ssize_t(num_floats * sizeof(float))) {
+    PyBuffer_Release(&view);
+    PyErr_SetString(PyExc_ValueError, "oidn_denoise_rgb: buffer size does not match width x height x 3 floats");
+    return nullptr;
+  }
+  if (!openimagedenoise_supported()) {
+    PyBuffer_Release(&view);
+    PyErr_SetString(PyExc_RuntimeError, "oidn_denoise_rgb: OpenImageDenoise is not supported on this CPU");
+    return nullptr;
+  }
+  PyObject *result = PyBytes_FromStringAndSize(nullptr, Py_ssize_t(num_floats * sizeof(float)));
+  if (result == nullptr) {
+    PyBuffer_Release(&view);
+    return nullptr;
+  }
+  float *output = reinterpret_cast<float *>(PyBytes_AS_STRING(result));
+  std::string error;
+
+  Py_BEGIN_ALLOW_THREADS;
+  oidn::DeviceRef device = oidn::newDevice(oidn::DeviceType::CPU);
+  /* Same as OIDNDenoiser: thread pinning goes through tbbbind/hwloc, which aborts inside
+   * Blender ("free(): invalid size" in hwloc topology init). */
+  device.set("setAffinity", false);
+  device.commit();
+  oidn::FilterRef filter = device.newFilter("RT");
+  filter.setImage("color", view.buf, oidn::Format::Float3, size_t(width), size_t(height));
+  filter.setImage("output", output, oidn::Format::Float3, size_t(width), size_t(height));
+  filter.set("hdr", true);
+  filter.commit();
+  filter.execute();
+  const char *message = nullptr;
+  if (device.getError(message) != oidn::Error::None) {
+    error = message ? message : "unknown error";
+  }
+  Py_END_ALLOW_THREADS;
+
+  PyBuffer_Release(&view);
+  if (!error.empty()) {
+    Py_DECREF(result);
+    PyErr_SetString(PyExc_RuntimeError, ("oidn_denoise_rgb: " + error).c_str());
+    return nullptr;
+  }
+  return result;
+#else
+  (void)args;
+  PyErr_SetString(PyExc_RuntimeError, "oidn_denoise_rgb: built without OpenImageDenoise");
+  return nullptr;
+#endif
+}
+
 static PyObject *denoise_func(PyObject * /*self*/, PyObject *args, PyObject *keywords)
 {
   static const char *keyword_list[] = {
@@ -906,6 +968,7 @@ static PyMethodDef methods[] = {
 
     /* Standalone denoising */
     {"denoise", (PyCFunction)denoise_func, METH_VARARGS | METH_KEYWORDS, ""},
+    {"oidn_denoise_rgb", falcon_oidn_denoise_rgb_func, METH_VARARGS, ""},
     {"merge", (PyCFunction)merge_func, METH_VARARGS | METH_KEYWORDS, ""},
 
     /* Debugging routines */

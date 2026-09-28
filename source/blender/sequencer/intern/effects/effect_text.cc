@@ -1096,9 +1096,14 @@ static SeqResult do_text_effect(const RenderData *context,
   SeqResult out = prepare_effect_imbufs(context, {}, {}, false);
   TextVars *data = static_cast<TextVars *>(strip->effectdata);
 
-  /* Guard against parallel accesses to the fonts map. */
-  std::lock_guard font_map_lock(g_font_map.mutex);
+  /* Guard against parallel accesses to the fonts map.
+   * Lock order must be runtime -> font map, the same as every other holder of
+   * text_runtime_mutex (strip_transform.cc, preview draw, text edit), which lock the
+   * runtime and then reach the font map through text_effect_update_runtime ->
+   * text_font_load. Taking the font map first here deadlocked the prefetch thread
+   * against the preview draw on the main thread (Falcon demo froze 2026-09-24). */
   std::lock_guard text_runtime_lock(text_runtime_mutex);
+  std::lock_guard font_map_lock(g_font_map.mutex);
 
   text_effect_update_runtime(context, *data, {out.image->x, out.image->y});
   const int font = data->runtime->font;

@@ -7,6 +7,7 @@
  */
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -42,6 +43,7 @@
 
 #include "SEQ_channels.hh"
 #include "SEQ_iterator.hh"
+#include "SEQ_falcon_timing.hh"
 #include "SEQ_prefetch.hh"
 #include "SEQ_relations.hh"
 #include "SEQ_render.hh"
@@ -357,6 +359,48 @@ void prefetch_stop(Scene *scene)
   }
 }
 
+/* -------------------------------------------------------------------- */
+/** \name Falcon: レンダーの間は VSE の別スレッドを止める(#render_exclusive_begin)
+ * \{ */
+
+static std::atomic<bool> g_render_exclusive{false};
+
+bool render_exclusive_active()
+{
+  return g_render_exclusive.load(std::memory_order_acquire);
+}
+
+static bool render_exclusive_free_readers_cb(Strip *strip, void * /*user_data*/)
+{
+  strip_free_movie_readers(strip);
+  return true;
+}
+
+void render_exclusive_begin(Main *bmain)
+{
+  g_render_exclusive.store(true, std::memory_order_release);
+  /* 先読みの糸を止める(戻るまで待つ)。 */
+  prefetch_stop_all();
+  /* GPU プレビューが輪に預けた絵を手放す(主スレッド・GPU 文脈あり)。 */
+  gpu_preview_ring_clear();
+  /* 動画の読み手を全部閉じる。レンダーの糸は自分で開き直す(NVDEC の面を抱えた読み手を引き継がない)。 */
+  for (Scene *scene = static_cast<Scene *>(bmain->scenes.first); scene != nullptr;
+       scene = static_cast<Scene *>(scene->id.next))
+  {
+    Editing *ed = editing_get(scene);
+    if (ed != nullptr) {
+      foreach_strip(&ed->seqbase, render_exclusive_free_readers_cb, nullptr);
+    }
+  }
+}
+
+void render_exclusive_end()
+{
+  g_render_exclusive.store(false, std::memory_order_release);
+}
+
+/** \} */
+
 static void seq_prefetch_update_context(const RenderData *context)
 {
   PrefetchJob *pfjob = seq_prefetch_job_get(context->scene);
@@ -369,6 +413,8 @@ static void seq_prefetch_update_context(const RenderData *context)
                          context->preview_render_size,
                          nullptr,
                          &pfjob->context_cpy);
+  /* Keep speculative reads consistent with the preview: use its proxies too. */
+  pfjob->context_cpy.use_proxies = context->use_proxies;
   pfjob->context_cpy.is_prefetch_render = true;
 
   render_new_render_data(pfjob->bmain,
@@ -379,6 +425,7 @@ static void seq_prefetch_update_context(const RenderData *context)
                          context->preview_render_size,
                          nullptr,
                          &pfjob->context);
+  pfjob->context.use_proxies = context->use_proxies;
   pfjob->context.is_prefetch_render = false;
 }
 
@@ -615,12 +662,21 @@ static bool seq_prefetch_need_suspend(PrefetchJob *pfjob)
 static void seq_prefetch_do_suspend(PrefetchJob *pfjob)
 {
   BLI_mutex_lock(&pfjob->prefetch_suspend_mutex);
+  bool slept = false;
   while (seq_prefetch_need_suspend(pfjob) &&
          (pfjob->scene->ed->cache_flag & SEQ_CACHE_PREFETCH_ENABLE) && !pfjob->stop)
   {
+    if (!slept) {
+      /* 計器: 眠りに入った(v = 何コマ先まで読んであるか)。 */
+      timing::event("pf_suspend", pfjob->num_frames_prefetched);
+      slept = true;
+    }
     pfjob->waiting = true;
     BLI_condition_wait(&pfjob->prefetch_suspend_cond, &pfjob->prefetch_suspend_mutex);
     seq_prefetch_update_area(pfjob);
+  }
+  if (slept) {
+    timing::event("pf_resume", pfjob->num_frames_prefetched);
   }
   pfjob->waiting = false;
   BLI_mutex_unlock(&pfjob->prefetch_suspend_mutex);
@@ -767,7 +823,8 @@ void seq_prefetch_start(const RenderData *context, float timeline_frame)
      * cache storage enabled, has strips to render, not rendering, not doing modal transform -
      * important, see D7820. */
     if ((ed->cache_flag & SEQ_CACHE_PREFETCH_ENABLE) && !running && !scrubbing && !playing &&
-        (ed->cache_flag & SEQ_CACHE_ALL_TYPES) && has_strips && !G.is_rendering && !G.moving)
+        (ed->cache_flag & SEQ_CACHE_ALL_TYPES) && has_strips && !G.is_rendering && !G.moving &&
+        !render_exclusive_active())
     {
       seq_prefetch_start_ex(context, timeline_frame);
     }

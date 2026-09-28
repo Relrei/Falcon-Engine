@@ -46,7 +46,6 @@
 
 #include "BLT_translation.hh"
 
-#include "BKE_idprop.hh"
 #include "BKE_anim_data.hh"
 #include "BKE_animsys.h" /* <------ should this be here?, needed for sequencer update */
 #include "BKE_callbacks.hh"
@@ -57,6 +56,7 @@
 #include "BKE_global.hh"
 #include "BKE_image.hh"
 #include "BKE_image_format.hh"
+#include "BKE_idprop.hh"
 #include "BKE_image_save.hh"
 #include "BKE_layer.hh"
 #include "BKE_main.hh"
@@ -2290,6 +2290,12 @@ void RE_RenderFrame(Render *re,
 
   CLOG_INFO(&LOG, "Rendering frame %d", frame);
 
+  /* Falcon: the whole job starts here (a still is one frame, so no warm-up). */
+  re->i.falcon_job_starttime = BLI_time_now_seconds();
+  re->i.falcon_job_frames = 0;
+  re->i.falcon_warmup_index = 0;
+  re->i.falcon_warmup_total = 0;
+
   render_callback_exec_id(re, re->main, &scene->id, BKE_CB_EVT_RENDER_INIT);
 
   /* Ugly global still...
@@ -2765,10 +2771,125 @@ struct FalconExportTimer {
  * 片方だけ動かすと、温めは走らないのに pre-roll も走らない、が起きる。 */
 #define FALCON_DLSS_ANIM_WARMUP_DEFAULT 2
 
-static int falcon_anim_warmup_frames()
+/* ★2026-09-21. 場面の「蓄積レンダリング回数」(`cycles.denoising_preroll_passes`)を読む。
+ *
+ * それまでこの数は環境変数からしか動かせず、UI の摘みはどこにも繋がっていなかった
+ * ―― 作者「蓄積レンダリングの指定数を無視してる」。画面に出ている「DLSS 蓄積中 n/N」は
+ * 上の温めコマの方なので、摘みが温めコマ数になるのが見た目と合う。
+ *
+ * Cycles のプロパティは Scene の IDProperty(グループ "cycles")に入る。ここは Cycles の
+ * 外なので RNA でなく IDProperty を直に引く。無ければ既定(2)。 */
+/* 場面の Cycles プロパティ(整数・真偽)を 1 つ読む。無ければ `fallback`。
+ * 真偽は IDP_BOOLEAN で入る版と IDP_INT で入る版があるので両方見る。 */
+static int falcon_scene_cycles_int(const Scene *scene, const char *name, const int fallback)
+{
+  if (scene == nullptr) {
+    return fallback;
+  }
+  IDProperty *props = IDP_ID_system_properties_get(const_cast<ID *>(&scene->id));
+  if (props == nullptr) {
+    return fallback;
+  }
+  IDProperty *cycles = IDP_GetPropertyTypeFromGroup(props, "cycles", IDP_GROUP);
+  if (cycles == nullptr) {
+    return fallback;
+  }
+  IDProperty *prop = IDP_GetPropertyFromGroup(cycles, name);
+  if (prop == nullptr) {
+    return fallback;
+  }
+  if (prop->type == IDP_INT) {
+    return prop->data.val;
+  }
+  if (prop->type == IDP_BOOLEAN) {
+    return prop->data.val ? 1 : 0;
+  }
+  return fallback;
+}
+
+/* 温めコマを焼く意味があるか。
+ *
+ * ★温めコマは **DLSS-RR の時間履歴を作るためだけ**の物で、履歴を持たないデノイザや
+ * デノイズを切った場面では、捨てるコマを焼くだけの丸損になる。ここに門が無かったので、
+ * 2026-09-21 作者「DLSS なし・デノイズ無効の状態で、レンダリングでフレームが -5 に
+ * 突っ込んで落ちていった。描画なし」。Cycles 側 (`get_dlss_preroll_passes`) が
+ * 見ている 3 つと同じ条件をここでも見る。
+ *
+ * `denoiser` は項目が場面によって変わる列挙なので、値が入っていなければ DLSS ではない
+ * (DLSS は一覧の最後で、GPU とアドオンが揃った時しか出ない)。 */
+static bool falcon_scene_wants_warmup(const Scene *scene)
+{
+  const int denoiser_dlss = 8; /* properties.py の ('DLSS', ..., 8) / DENOISER_DLSS */
+  return falcon_scene_cycles_int(scene, "use_denoising", 1) != 0 &&
+         falcon_scene_cycles_int(scene, "denoiser", 0) == denoiser_dlss &&
+         falcon_scene_cycles_int(scene, "denoising_carry_history", 1) != 0;
+}
+
+/* DLSS でアニメを出す時は、利用者が切っていても永続データを入れる。
+ *
+ * ★永続データが切れていると Cycles は**毎コマ Session を作り直す**ので、DLSS も毎コマ
+ * NGX を Init/Shutdown し直す(ログで 1300 コマに 1298 回)。そのたびにメモリが残り、
+ * 2026-09-22 01:19 に classroom の DLAA 連番 802 枚目で RAM と swap が尽きて
+ * Blender ごとデスクトップが落ちた。実測(8spp・40 コマ): 切 = GPU と共有するメモリが
+ * +10.5MB/コマ・150 秒 / 入 = 増加 0・NGX の初期化 1 回・履歴も続く・63 秒。
+ *
+ * 触るのはこのレンダーの写し(`rd`)だけで、場面の設定は変えない。終わったら
+ * エンジンを捨てて、切の時と同じくメモリを返す(`RE_RenderAnim` の末尾)。
+ * `FALCON_DLSS_ANIM_PERSIST=0` で今までどおり。 */
+static bool falcon_dlss_anim_wants_persistent(const Scene *scene,
+                                              const RenderData &rd,
+                                              const int sfra,
+                                              const int efra)
+{
+  const char *env = getenv("FALCON_DLSS_ANIM_PERSIST");
+  if (env != nullptr && STREQ(env, "0")) {
+    return false;
+  }
+  if (sfra == efra || (rd.mode & R_PERSISTENT_DATA) || !STREQ(rd.engine, "CYCLES")) {
+    return false;
+  }
+  const int denoiser_dlss = 8; /* properties.py の ('DLSS', ..., 8) / DENOISER_DLSS */
+  return falcon_scene_cycles_int(scene, "use_denoising", 1) != 0 &&
+         falcon_scene_cycles_int(scene, "denoiser", 0) == denoiser_dlss;
+}
+
+static int falcon_scene_preroll_passes(const Scene *scene)
+{
+  if (scene == nullptr) {
+    return FALCON_DLSS_ANIM_WARMUP_DEFAULT;
+  }
+  /* ★アドオンが `PointerProperty` で足したデータは、利用者の自由プロパティ
+   * (`IDP_GetProperties`)ではなく**システム側**に入る。2026-09-21 にここを
+   * 間違えて、どの値を入れても既定の 2 しか返らなかった(門で捕まえた)。 */
+  IDProperty *props = IDP_ID_system_properties_get(const_cast<ID *>(&scene->id));
+  if (props == nullptr) {
+    return FALCON_DLSS_ANIM_WARMUP_DEFAULT;
+  }
+  IDProperty *cycles = IDP_GetPropertyTypeFromGroup(props, "cycles", IDP_GROUP);
+  if (cycles == nullptr) {
+    return FALCON_DLSS_ANIM_WARMUP_DEFAULT;
+  }
+  IDProperty *passes = IDP_GetPropertyTypeFromGroup(cycles, "denoising_preroll_passes", IDP_INT);
+  if (passes == nullptr) {
+    return FALCON_DLSS_ANIM_WARMUP_DEFAULT;
+  }
+  return passes->data.val;
+}
+
+/* 環境変数 > 場面の値 > 既定。0 で温めなし。
+ * ★DLSS-RR を使っていない場面では、数がいくつでも 0(上の `falcon_scene_wants_warmup`)。
+ *   環境変数で明示された時だけは、そのまま通す(調べ物のため)。 */
+static int falcon_anim_warmup_frames(const Scene *scene)
 {
   const char *env = getenv("FALCON_DLSS_ANIM_WARMUP");
-  const int n = env ? atoi(env) : FALCON_DLSS_ANIM_WARMUP_DEFAULT;
+  if (env != nullptr) {
+    const int n = atoi(env);
+    return (n > 0) ? n : 0;
+  }
+  if (!falcon_scene_wants_warmup(scene)) {
+    return 0;
+  }
+  const int n = falcon_scene_preroll_passes(scene);
   return (n > 0) ? n : 0;
 }
 
@@ -2868,55 +2989,6 @@ static void render_animation_finish(Render *re, Scene *scene, int frame, float s
   G.is_rendering = false;
 }
 
-/* DLSS でアニメを出す時は、利用者が切っていても永続データを入れる。
- *
- * ★永続データが切れていると Cycles は**毎コマ Session を作り直す**ので、DLSS も毎コマ
- * NGX を Init/Shutdown し直し、そのたびにメモリが残る。2026-09-22 01:19 に 5.2.2 のデモで
- * classroom の DLAA 連番 802 枚目で RAM と swap が尽き、デスクトップごと落ちた。
- * 5.2.2 での実測(8spp・40 コマ): 切 = 共有メモリ +10.5MB/コマ・NGX 46 回・147 秒 /
- * 入 = 増加 0・NGX 1 回・履歴も続く・72 秒(5.2.2 と同じ直し)。
- *
- * 触るのはこのレンダーの `re->r` だけで、場面の設定は変えない。終わったらエンジンを捨てる。
- * `FALCON_DLSS_ANIM_PERSIST=0` で今までどおり。 */
-static int falcon_anim_scene_cycles_int(const Scene *scene, const char *name, const int fallback)
-{
-  /* アドオンの PointerProperty はシステム側の IDProperty(グループ "cycles")に入る。
-   * 真偽は IDP_BOOLEAN の版と IDP_INT の版があるので両方見る。 */
-  IDProperty *props = IDP_ID_system_properties_get(const_cast<ID *>(&scene->id));
-  if (props == nullptr) {
-    return fallback;
-  }
-  IDProperty *cycles = IDP_GetPropertyTypeFromGroup(props, "cycles", IDP_GROUP);
-  if (cycles == nullptr) {
-    return fallback;
-  }
-  IDProperty *prop = IDP_GetPropertyFromGroup(cycles, name);
-  if (prop == nullptr) {
-    return fallback;
-  }
-  if (prop->type == IDP_INT || prop->type == IDP_BOOLEAN) {
-    return prop->data.val;
-  }
-  return fallback;
-}
-
-static bool falcon_dlss_anim_wants_persistent(const Scene *scene,
-                                              const RenderData &rd,
-                                              const int sfra,
-                                              const int efra)
-{
-  const char *env = getenv("FALCON_DLSS_ANIM_PERSIST");
-  if (env != nullptr && STREQ(env, "0")) {
-    return false;
-  }
-  if (sfra == efra || (rd.mode & R_PERSISTENT_DATA) || !STREQ(rd.engine, "CYCLES")) {
-    return false;
-  }
-  const int denoiser_dlss = 8; /* properties.py の ('DLSS', ..., 8) / DENOISER_DLSS */
-  return falcon_anim_scene_cycles_int(scene, "use_denoising", 1) != 0 &&
-         falcon_anim_scene_cycles_int(scene, "denoiser", 0) == denoiser_dlss;
-}
-
 void RE_RenderAnim(Render *re,
                    Main *bmain,
                    Scene *scene,
@@ -2950,15 +3022,18 @@ void RE_RenderAnim(Render *re,
   int nfra, totrendered = 0, totskipped = 0;
 
   /* Falcon: DLSS のアニメは永続データで回す(`falcon_dlss_anim_wants_persistent`)。
-   * ★`render_init_from_main` は `rd` でなく `scene->r` を `re->r` へ写し直す(解像度だけ
-   *   `rd` を見る)ので、写した直後に `re->r` 側へ立て直す。抜ける時は必ず戻す。 */
+   * 途中で return する道でもエンジンを残さないよう、抜ける時に必ず戻す。 */
   const bool falcon_forced_persistent = falcon_dlss_anim_wants_persistent(scene, rd, sfra, efra);
+  /* ★`render_init_from_main` は `rd` でなく `scene->r` を `re->r` へ写し直す(解像度だけ
+   *   `rd` を見る)。なので `rd` に立てても毎コマ消える(実測: 旗を立てたのに NGX の初期化が
+   *   46 回のままだった)。写した直後に `re->r` 側へ立て直す。 */
   auto falcon_apply_persistent = [&]() {
     if (falcon_forced_persistent) {
       re->r.mode |= R_PERSISTENT_DATA;
     }
   };
   if (falcon_forced_persistent) {
+    rd.mode |= R_PERSISTENT_DATA;
     CLOG_INFO(&LOG, "DLSS animation: persistent data on for this render");
     fprintf(stderr, "[dlss] animation: persistent data forced on (FALCON_DLSS_ANIM_PERSIST=0 to skip)\n");
   }
@@ -3093,7 +3168,7 @@ void RE_RenderAnim(Render *re,
   const int falcon_tfra = (tfra > 0) ? tfra : 1;
   /* Not for the sequencer: nothing it draws has a history to warm up (a scene strip is a render
    * of its own per frame), so the two extra frames were only extra work (2026-09-20). */
-  const int falcon_warmup = RE_seq_render_active(scene, &rd) ? 0 : falcon_anim_warmup_frames();
+  const int falcon_warmup = RE_seq_render_active(scene, &rd) ? 0 : falcon_anim_warmup_frames(scene);
   const int falcon_first_fra = sfra - falcon_warmup * falcon_tfra;
   if (falcon_warmup > 0) {
     fprintf(stderr,
@@ -3103,6 +3178,13 @@ void RE_RenderAnim(Render *re,
             falcon_first_fra,
             sfra - falcon_tfra);
   }
+
+  /* Falcon: the whole job starts here, and the warm-up frames are announced to the render info
+   * line so the black picture and the frame numbers below the start have a name (2026-09-21). */
+  re->i.falcon_job_starttime = BLI_time_now_seconds();
+  re->i.falcon_job_frames = 0;
+  re->i.falcon_warmup_total = falcon_warmup;
+  re->i.falcon_warmup_index = 0;
 
   /* ★フレーム補間: どのコマを焼くかをここで決める(falcon_frame_interp_plan)。
    * 動画の書き出しではコマを抜くと絵が飛ぶだけなので走らせない(Python 側でも止めるが、
@@ -3130,6 +3212,10 @@ void RE_RenderAnim(Render *re,
   {
     /* 捨てるコマか。書かない・数えない・触らない。焼くことだけが仕事。 */
     const bool falcon_is_warmup = (scene->r.cfra < sfra);
+    /* Falcon: 何本目の温めか(1..total)。本番のコマでは 0。 */
+    re->i.falcon_warmup_index = falcon_is_warmup ?
+                                    (scene->r.cfra - falcon_first_fra) / falcon_tfra + 1 :
+                                    0;
     CLOG_INFO(&LOG, "Rendering frame %d", nfra);
 
     char filepath[FILE_MAX];
@@ -3275,6 +3361,8 @@ void RE_RenderAnim(Render *re,
     }
     else {
       totrendered++;
+      /* Falcon: real frames only -- the render info line divides by this for the per-frame time. */
+      re->i.falcon_job_frames = totrendered;
     }
 
     const bool should_write = !falcon_is_warmup && !(re->flag & R_SKIP_WRITE);

@@ -66,6 +66,7 @@
 #include "RNA_access.hh"
 #include "RNA_define.hh"
 
+#include "SEQ_prefetch.hh"
 #include "SEQ_relations.hh"
 
 #include "render_intern.hh"
@@ -101,6 +102,19 @@ struct RenderJob : public RenderJobBase {
   int frame_end;
   /** Falcon: `scene->r.frame_step` at the start (for #RenderJobBase::falcon_frame_index). */
   int falcon_frame_step;
+  /**
+   * Falcon 2026-09-21: whether any pixels of the current frame have reached the screen yet.
+   * Until they do the image is plain black, which is what the middle-of-the-image notice is for
+   * (#RenderResult::falcon_notice).
+   */
+  bool falcon_got_pixels = false;
+  /** The frame #falcon_got_pixels belongs to, so a new frame starts black again. */
+  int falcon_pixels_cfra = -1234567;
+  /**
+   * Falcon: whether the frame being rendered is one of the DLSS warm-up frames. Those do produce
+   * pixels, but the pixels are thrown away, so the notice has to stay up for them.
+   */
+  bool falcon_warmup_now = false;
 };
 
 /**
@@ -376,6 +390,9 @@ static void render_freejob(void *rjv)
 {
   RenderJob *rj = static_cast<RenderJob *>(rjv);
 
+  /* Falcon 2026-09-26: job が途中で消えても VSE 側の止めを外す(#render_exclusive_begin)。 */
+  seq::render_exclusive_end();
+
   BKE_color_managed_view_settings_free(&rj->view_settings);
   MEM_delete(rj);
 }
@@ -393,6 +410,9 @@ static void make_renderinfo_string(const RenderStats *rs,
     char time_elapsed[32];
     char frame[16];
     char statistics[64];
+    /* Falcon 2026-09-21. */
+    char warmup[32];
+    char time_total[64];
   } info_buffers;
 
   const char *ret_array[32];
@@ -414,10 +434,22 @@ static void make_renderinfo_string(const RenderStats *rs,
     ret_array[i++] = info_sep;
   }
 
-  /* frame number */
-  SNPRINTF_UTF8(info_buffers.frame, "%d ", scene->r.cfra);
-  ret_array[i++] = RPT_("Frame:");
-  ret_array[i++] = info_buffers.frame;
+  /* Falcon: the frames rendered before the first one to fill the DLSS history. Their frame
+   * numbers are below the start of the range, so printing them as "Frame:-1" only confused;
+   * say what they are instead (2026-09-21). */
+  const bool falcon_warmup = (rs->falcon_warmup_total > 0 && rs->falcon_warmup_index > 0);
+  if (falcon_warmup) {
+    SNPRINTF_UTF8(
+        info_buffers.warmup, "%d/%d ", rs->falcon_warmup_index, rs->falcon_warmup_total);
+    ret_array[i++] = RPT_("DLSS Accumulating:");
+    ret_array[i++] = info_buffers.warmup;
+  }
+  else {
+    /* frame number */
+    SNPRINTF_UTF8(info_buffers.frame, "%d ", scene->r.cfra);
+    ret_array[i++] = RPT_("Frame:");
+    ret_array[i++] = info_buffers.frame;
+  }
 
   /* Previous and elapsed time. */
   const char *info_time = info_buffers.time_last;
@@ -441,6 +473,34 @@ static void make_renderinfo_string(const RenderStats *rs,
   ret_array[i++] = RPT_("Time:");
   ret_array[i++] = info_time;
   ret_array[i++] = info_space;
+
+  /* Falcon: the whole job, not just this frame. "Time:" restarts on every frame, so an animation
+   * never showed how long it had been going, and a still lost the number as soon as the next
+   * render started -- 作者 2026-09-21「レンダリングし切るのにかかった時間がわかるようにはできるかな」。 */
+  if (rs->falcon_job_starttime > 0.0) {
+    char total[32];
+    BLI_timecode_string_from_time_simple(
+        total, sizeof(total), BLI_time_now_seconds() - rs->falcon_job_starttime);
+    if (rs->falcon_job_frames > 1) {
+      char per_frame[32];
+      BLI_timecode_string_from_time_simple(
+          per_frame,
+          sizeof(per_frame),
+          (BLI_time_now_seconds() - rs->falcon_job_starttime) / double(rs->falcon_job_frames));
+      SNPRINTF_UTF8(info_buffers.time_total,
+                    "%s%s (%d %s %s) ",
+                    RPT_("Total:"),
+                    total,
+                    rs->falcon_job_frames,
+                    RPT_("frames,"),
+                    per_frame);
+    }
+    else {
+      SNPRINTF_UTF8(info_buffers.time_total, "%s%s ", RPT_("Total:"), total);
+    }
+    ret_array[i++] = info_sep;
+    ret_array[i++] = info_buffers.time_total;
+  }
 
   /* Statistics. */
   {
@@ -498,6 +558,61 @@ static void make_renderinfo_string(const RenderStats *rs,
   BLI_string_join_array(ret, IMA_MAX_RENDER_TEXT_SIZE, ret_array, i);
 }
 
+/**
+ * Falcon 2026-09-21: the words drawn large in the middle of the image while what is on screen is
+ * not the picture yet. Empty means "draw nothing" -- the picture is there, or is on its way and
+ * the ordinary info line says enough.
+ *
+ * Two cases are black and need a name:
+ *  - the frames rendered and thrown away to fill the DLSS history (`falcon_warmup_*`);
+ *  - the stretch before the first tile of a frame arrives, which on a heavy scene is the scene
+ *    upload plus the acceleration structure and can run for a minute with nothing on screen.
+ */
+static void falcon_make_render_notice(const RenderStats *rs,
+                                      const bool got_pixels,
+                                      char r_notice[256])
+{
+  r_notice[0] = '\0';
+
+  /* 戻す口: `FALCON_RENDER_NOTICE=0` で真ん中の案内を出さない(情報行はそのまま)。 */
+  static const bool enabled = []() {
+    const char *env = getenv("FALCON_RENDER_NOTICE");
+    return !(env && env[0] == '0');
+  }();
+  if (!enabled) {
+    return;
+  }
+
+  const bool warmup = (rs->falcon_warmup_total > 0 && rs->falcon_warmup_index > 0);
+  if (!warmup && got_pixels) {
+    return;
+  }
+
+  char elapsed[32] = "";
+  if (rs->falcon_job_starttime > 0.0) {
+    BLI_timecode_string_from_time_simple(
+        elapsed, sizeof(elapsed), BLI_time_now_seconds() - rs->falcon_job_starttime);
+  }
+
+  if (warmup) {
+    BLI_snprintf_utf8(r_notice,
+                      256,
+                      "%s %d/%d\n%s\n%s%s",
+                      RPT_("DLSS Accumulating"),
+                      rs->falcon_warmup_index,
+                      rs->falcon_warmup_total,
+                      RPT_("This frame is rendered to fill the history and then discarded"),
+                      RPT_("Total:"),
+                      elapsed);
+    return;
+  }
+
+  /* No pixels yet. Say what the engine says it is doing, so the wait has a reason. */
+  const char *phase = (rs->statstr && rs->statstr[0]) ? rs->statstr :
+                                                        RPT_("Preparing the scene");
+  BLI_snprintf_utf8(r_notice, 256, "%s\n%s%s", phase, RPT_("Total:"), elapsed);
+}
+
 static void image_renderinfo_cb(void *rjv, RenderStats *rs)
 {
   RenderJob *rj = static_cast<RenderJob *>(rjv);
@@ -518,6 +633,17 @@ static void image_renderinfo_cb(void *rjv, RenderStats *rs)
     }
 
     make_renderinfo_string(rs, rj->scene, rj->v3d_override, rr->error, rr->text);
+
+    /* Falcon: a new frame starts black again, so the notice comes back with it. */
+    rj->falcon_warmup_now = (rs->falcon_warmup_total > 0 && rs->falcon_warmup_index > 0);
+    if (rs->cfra != rj->falcon_pixels_cfra) {
+      rj->falcon_pixels_cfra = rs->cfra;
+      rj->falcon_got_pixels = false;
+    }
+    if (rr->falcon_notice == nullptr) {
+      rr->falcon_notice = MEM_new_array_zeroed<char>(256, "render notice");
+    }
+    falcon_make_render_notice(rs, rj->falcon_got_pixels, rr->falcon_notice);
   }
 
   RE_ReleaseResult(rj->re);
@@ -648,6 +774,15 @@ static void image_rect_update(void *rjv, RenderResult *rr, rcti *renrect)
     return;
   }
 
+  /* Falcon: the first tile of this frame reached the screen, so the black-screen notice goes --
+   * right here, not at the next stats callback, which can be a second away. 作者 2026-09-21
+   * 「蓄積おわったら通常に戻して欲しい、見れるようにしたい」. The warm-up frames are the one
+   * case where pixels arrive and the notice still has to stay: they are thrown away. */
+  rj->falcon_got_pixels = true;
+  if (!rj->falcon_warmup_now && rr->falcon_notice != nullptr) {
+    rr->falcon_notice[0] = '\0';
+  }
+
   /* update part of render */
   render_image_update_pass_and_layer(rj, rr, &rj->iuser);
   rcti tile_rect;
@@ -766,6 +901,29 @@ static void render_endjob(void *rjv)
 {
   RenderJob *rj = static_cast<RenderJob *>(rjv);
 
+  /* Falcon 2026-09-26: レンダーが終わったら VSE の先読み・GPU プレビューを戻す。 */
+  seq::render_exclusive_end();
+
+  /* Falcon 2026-09-21: no stats callback comes after the job stops, so the total time the user is
+   * left looking at is the one from a little before the end. Write it once more with the real
+   * end, and take the black-screen notice down. */
+  {
+    RenderStats *rs = RE_GetStats(rj->re);
+    if (rs != nullptr && rs->falcon_job_starttime > 0.0) {
+      rs->falcon_warmup_index = 0;
+      RenderResult *rr = RE_AcquireResultRead(rj->re);
+      if (rr != nullptr) {
+        if (rr->text != nullptr) {
+          make_renderinfo_string(rs, rj->scene, rj->v3d_override, rr->error, rr->text);
+        }
+        if (rr->falcon_notice != nullptr) {
+          rr->falcon_notice[0] = '\0';
+        }
+      }
+      RE_ReleaseResult(rj->re);
+    }
+  }
+
   /* Clear display GPU context and callbacks since this may be used again
    * by e.g. the sequencer (#24508). */
   RE_display_free(rj->re);
@@ -785,11 +943,11 @@ static void render_endjob(void *rjv)
         Depsgraph *depsgraph = BKE_scene_get_depsgraph(rj->scene, rj->view_layer);
         if (depsgraph) {
           /* Falcon 2026-09-21: 集光(LT)は 1 パスごとに `scene.copy()` を作って
-           * `bpy.data.scenes.remove()` で消します。アニメを焼き終えてここへ来る時点で
+           * `bpy.data.scenes.remove()` で消す。アニメを焼いた後にここへ来る時点で、
            * 依存グラフが既に無い Base を抱えていることがあり、そのまま評価すると
-           * `deg_check_base_in_depsgraph` で落ちます(GUI のアニメだけで起き、
-           * 同じ場面を `blender -b -a` で焼いても出ません)。評価の前に関係を
-           * 作り直させます。費用は 1 回ぶんで、落ちるよりは安く済みます。 */
+           * `deg_check_base_in_depsgraph` で落ちる(作者の実測・GUI のアニメだけ・
+           * 同じ場面を `blender -b -a` で焼いても出ない)。評価の前に関係を
+           * 作り直させる。costs は 1 回ぶんで、落ちるよりは安い。 */
           DEG_graph_tag_relations_update(depsgraph);
           ED_update_for_newframe(G_MAIN, depsgraph);
         }
@@ -1166,6 +1324,10 @@ static wmOperatorStatus screen_render_invoke(bContext *C, wmOperator *op, const 
    * the reason of this is that active scene could change when rendering
    * several layers from compositor #31800. */
   op->customdata = scene;
+
+  /* Falcon 2026-09-26: VSE の先読み・GPU プレビューを止め、動画の読み手を閉じてからレンダーの糸を起こす
+   * (GUI の動画書き出しで読み手の取り合いになり NVDEC の後始末で落ちた)。戻すのは #render_endjob。 */
+  seq::render_exclusive_begin(bmain);
 
   WM_jobs_start(CTX_wm_manager(C), wm_job);
 

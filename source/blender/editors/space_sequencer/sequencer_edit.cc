@@ -2215,6 +2215,12 @@ static wmOperatorStatus sequencer_box_blade_exec(bContext *C, wmOperator *op)
 
     const VectorSet<Strip *> strips = ignore_selection ? all_strips_from_context(C) :
                                                          selected_strips_from_context(C);
+    /* With the channel flip, ymax maps to the lower channel number, so order the two ends
+     * explicitly (comparing against ymax/ymin directly gave an empty range when flipped). */
+    const int box_channel_lo = std::min(seq::y_to_channel(box_rect.ymin),
+                                        seq::y_to_channel(box_rect.ymax));
+    const int box_channel_hi = std::max(seq::y_to_channel(box_rect.ymin),
+                                        seq::y_to_channel(box_rect.ymax));
     VectorSet<Strip *> to_offset;
     for (Strip *strip : strips) {
       if (seq::transform_is_locked(channels, strip)) {
@@ -2223,8 +2229,7 @@ static wmOperatorStatus sequencer_box_blade_exec(bContext *C, wmOperator *op)
 
       /* Ripple strips for all channels that the blade box extends to, so that the user can
        * optionally affect other channels than those with strips to cut. */
-      if (strip->channel <= seq::y_to_channel(box_rect.ymax) &&
-          strip->channel >= seq::y_to_channel(box_rect.ymin) &&
+      if (strip->channel >= box_channel_lo && strip->channel <= box_channel_hi &&
           (strip->left_handle() > rect_frames[0]))
       {
         if (ignore_connections) {

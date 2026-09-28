@@ -50,13 +50,27 @@ _addons_hidden_core = {
     # Falcon Engine: VSE の代役(プロキシ)をボタン 1 つで用意する(既定で有効)。
     "falcon_vse_proxy",
     # サードパーティ(usrname0・GPL-3.0-or-later・github.com/usrname0/BL_EasyCrop)。
-    # VSE プレビューでハンドルを掴んでクロップできる操作(Shift+C)。本人の要望で追加。
+    # VSE プレビューでハンドルを掴んでクロップできる操作(Shift+C)。作者の要望で追加。
     "bl_easycrop",
     "io_anim_bvh",
     "io_curve_svg",
     "io_mesh_uv_layout",
     "io_scene_fbx",
 }
+
+
+def _falcon_is_crop_extension(module_name):
+    return module_name.startswith("bl_ext.") and module_name.rsplit(".", 1)[-1] == "BL_EasyCrop"
+
+
+def _falcon_crop_extension_selected():
+    # The bundled legacy copy and the extension register the same RNA classes and tool.
+    # Prefer the user's extension, including during startup before it is registered.
+    import sys
+    return any(_falcon_is_crop_extension(addon.module) for addon in _preferences.addons) or any(
+        _falcon_is_crop_extension(name) and mod.__dict__.get("__addon_enabled__", False)
+        for name, mod in tuple(sys.modules.items()) if mod is not None
+    )
 
 
 def _falcon_dlss_listed():
@@ -409,6 +423,9 @@ def enable(module_name, *, default_set=False, persistent=False, refresh_handled=
             import traceback
             traceback.print_exc()
 
+    if module_name == "bl_easycrop" and _falcon_crop_extension_selected():
+        return None  # The extension owns these operators, gizmos and toolbar entry.
+
     if (is_extension := module_name.startswith(_ext_base_pkg_idname_with_dot)):
         if not refresh_handled:
             extensions_refresh(
@@ -566,6 +583,14 @@ def enable(module_name, *, default_set=False, persistent=False, refresh_handled=
                 # Always remove as this is not expected to exist and will be lazily initialized.
                 del mod.bl_info
 
+        # An extension can be enabled interactively after the bundled copy was loaded.
+        # Remove that copy before registering any of the extension's RNA classes:
+        # registering first replaces classes and leaves the old tool/cleanup broken.
+        if _falcon_is_crop_extension(module_name):
+            bundled = sys.modules.get("bl_easycrop")
+            if bundled is not None and bundled.__dict__.get("__addon_enabled__", False):
+                disable("bl_easycrop", refresh_handled=True, handle_error=handle_error)
+
         # 2) Try register collected modules.
         # Removed register_module, addons need to handle their own registration now.
 
@@ -649,6 +674,11 @@ def disable(module_name, *, default_set=False, refresh_handled=False, handle_err
 
     if not refresh_handled:
         extensions_refresh(handle_error=handle_error)
+
+    # Switching off the optional extension restores the bundled tool. Do not do this
+    # during disable_all(), script reloads, or an application-template transition.
+    if default_set and _falcon_is_crop_extension(module_name) and not _falcon_crop_extension_selected():
+        enable("bl_easycrop", persistent=True, refresh_handled=True, handle_error=handle_error)
 
     if _bpy.app.debug_python:
         print("\taddon_utils.disable", module_name)
