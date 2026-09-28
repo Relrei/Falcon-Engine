@@ -137,7 +137,14 @@ REFLECT = {"mirror_mat", "gold"}
 ALBEDO = 0.65  # checker floor mean
 
 
+# (材質名, session_uid) -> 分類。名前だけで引くと、別のファイルの同名の材質や、
+# 材質を作り替えた後にも古い分類を返してしまう。ファイルを開き直した時と、
+# 光子の計算・半径の推定を始める時に clear_classify_cache() で捨てる。
 _classify_cache = {}
+
+
+def clear_classify_cache():
+    _classify_cache.clear()
 
 
 def classify(obj):
@@ -147,7 +154,8 @@ def classify(obj):
     if not obj.data.materials:
         return 'DIFFUSE', 0.0
     mat = obj.data.materials[0]
-    hit = _classify_cache.get(mat.name)
+    key = (mat.name, getattr(mat, "session_uid", 0))
+    hit = _classify_cache.get(key)
     if hit is not None:
         return hit
     result = ('DIFFUSE', 0.0)
@@ -181,7 +189,7 @@ def classify(obj):
                         break
             except Exception:
                 pass
-    _classify_cache[mat.name] = result
+    _classify_cache[key] = result
     return result
 
 
@@ -305,6 +313,7 @@ def main(argv):
                     help="dev: save raw photon points to an .npz for offline KDE")
     args = ap.parse_args(argv)
 
+    clear_classify_cache()
     global CELL_SIZE, SPLAT_SIGMA
     CELL_SIZE = args.cell
     SPLAT_SIGMA = args.smooth

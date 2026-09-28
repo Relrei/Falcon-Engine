@@ -44,7 +44,10 @@ def _apply():
 
 
 def register():
-    bpy.app.timers.register(_apply, first_interval=0.0)
+    # persistent: `blender file.blend` (or opening a .blend by double-click) loads the
+    # file right after startup, and wm_file_read_pre drops every non-persistent timer,
+    # which would silently lose the first-run preferences on that launch.
+    bpy.app.timers.register(_apply, first_interval=0.0, persistent=True)
 
 
 def unregister():

@@ -42,6 +42,10 @@ from . import (
 )
 
 
+# _falcon_sharc_env_sync が最後に FALCON_SHARC_CACHE へ入れた値(入れていなければ None)。
+_falcon_sharc_cache_set = None
+
+
 class CyclesRender(bpy.types.RenderEngine):
     bl_idname = 'CYCLES'
     bl_label = "F-Cycles"
@@ -61,6 +65,7 @@ class CyclesRender(bpy.types.RenderEngine):
     # untouched. Must run before engine.create/reset/render so the sync and
     # integrator device_update see the values.
     def _falcon_sharc_env_sync(self, scene):
+        global _falcon_sharc_cache_set
         if bpy.app.background:
             return
         cscene = getattr(scene, "cycles", None)
@@ -76,7 +81,17 @@ class CyclesRender(bpy.types.RenderEngine):
         os.environ["FALCON_SHARC_GATE"] = "1" if getattr(cscene, "falcon_sharc_gate", True) else "0"
         cache = getattr(cscene, "falcon_sharc_cache", "")
         if cache:
-            os.environ["FALCON_SHARC_CACHE"] = bpy.path.abspath(cache)
+            path = bpy.path.abspath(cache)
+            os.environ["FALCON_SHARC_CACHE"] = path
+            _falcon_sharc_cache_set = path
+        elif _falcon_sharc_cache_set is not None:
+            # 欄を空にしたら、ここで設定した値を外す(C++ は環境変数をシーンの値より
+            # 優先するので、残ると再起動まで古いパスを使い続ける)。この変数は光子ベイク
+            # (operators.py)も自分の passes で使うため、値がまだ自分の設定したものの
+            # ときだけ外し、ベイクが書き換えた値には触らない。
+            if os.environ.get("FALCON_SHARC_CACHE") == _falcon_sharc_cache_set:
+                os.environ.pop("FALCON_SHARC_CACHE", None)
+            _falcon_sharc_cache_set = None
 
     def __del__(self):
         engine.free(self)

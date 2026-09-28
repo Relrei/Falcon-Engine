@@ -38,6 +38,14 @@ def _falcon_reset_photon_state(*_args):
     _falcon_restore_pt_caustics()
     # 開き直した後は、前のファイルの「写しの場面」を指す物が残っていても意味が無い
     _falcon_lt_scrap.clear()
+    # 前のファイルの場面を指す「終わったら戻す」処理も同じ(次の LT が再生してしまう)
+    _falcon_lt_pending_restore.clear()
+    # 材質の分類キャッシュ(falcon_photon)も前のファイルの物。numpy を読み込んで
+    # しまわないよう、すでに読み込み済みの時だけ捨てる。
+    import sys
+    _fp = sys.modules.get(__package__ + ".falcon_photon")
+    if _fp is not None:
+        _fp.clear_classify_cache()
 
 
 def _falcon_flatten_name(name):
@@ -697,6 +705,9 @@ def _falcon_photon_auto_radius(context, pixels=1.0, samples=512):
     """
     from . import falcon_photon
 
+    # 材質を作り替えた後の古い分類を使わない(ベイクのたびに測り直す)
+    falcon_photon.clear_classify_cache()
+
     scene = context.scene
     cam = scene.camera
     if cam is None or cam.type != 'CAMERA':
@@ -904,6 +915,21 @@ class CYCLES_OT_falcon_photon_bake(Operator):
             # Cell size / deposit radius / dispersion ride on the scene
             # properties now (integrator sockets), so nothing to export here.
             # Only the per-pass state below still travels by environment.
+            # 失敗した時に元へ戻せるよう、書き換える前の値を控えておく(前回の
+            # "add" の状態を失わず、mode="bake" を残して以後のレンダーが全部
+            # 光子ベイクのパスになることも防ぐ)。成功した時は下で "add" 等を入れ直す。
+            prev_env = {k: os.environ.get(k) for k in (
+                "FALCON_PHOTON_MODE", "FALCON_SHARC_CACHE",
+                "FALCON_PHOTON_POINTS", "FALCON_PHOTON_WORLD")}
+
+            def restore_prev_env():
+                for k, v in prev_env.items():
+                    if v is None:
+                        os.environ.pop(k, None)
+                    else:
+                        os.environ[k] = v
+
+            passes_done = False
             os.environ["FALCON_PHOTON_MODE"] = "bake"
 
             per_light_cache = []
@@ -1020,10 +1046,13 @@ class CYCLES_OT_falcon_photon_bake(Operator):
                         # the point map still merges files, so the merge has to
                         # run even when there was only one lamp
                         single = False
+                passes_done = True
             except Exception as e:
                 self.report({'ERROR'}, rpt_("GPU photon bake failed: %s") % e)
                 return {'CANCELLED'}
             finally:
+                if not passes_done:
+                    restore_prev_env()
                 for li in lights:
                     li.hide_render = saved_hide[li.name]
                 (r.resolution_x, r.resolution_y, r.resolution_percentage,
@@ -1041,6 +1070,7 @@ class CYCLES_OT_falcon_photon_bake(Operator):
                 try:
                     _falcon_merge_points(per_light_pts, points_path)
                 except Exception as e:
+                    restore_prev_env()
                     self.report({'ERROR'}, rpt_("Photon merge failed: %s") % e)
                     return {'CANCELLED'}
                 for fp in per_light_cache + per_light_pts:
@@ -1173,13 +1203,24 @@ class CYCLES_OT_falcon_bake_and_render_range(Operator):
         if not r.filepath:
             self.report({'ERROR'}, "No animation output path is set (Output Properties)")
             return {'CANCELLED'}
+        if self.per_frame and r.is_movie_format:
+            # 1 コマずつ write_still で書くので、動画形式ではレンダー自体が失敗する
+            self.report({'ERROR'}, "Rebake Every Frame needs an image output format "
+                                   "(a movie format cannot be written frame by frame)")
+            return {'CANCELLED'}
 
         # Snapshot the current session (unsaved edits included) to a temp
         # copy; the background process renders the copy so the user can keep
         # editing — and a crash there can never take the GUI down with it.
+        # The copy and the log are named per launch: a second launch (same
+        # file) must not overwrite the copy, the log or the photon cache of
+        # the job that is still running.
+        import time
+        import uuid
         stem = bpy.path.display_name_from_filepath(bpy.data.filepath) or "scene"
+        launch_id = "%s_%s" % (time.strftime("%Y%m%d_%H%M%S"), uuid.uuid4().hex[:6])
         tmp_blend = os.path.join(tempfile.gettempdir(),
-                                 "falcon_range_%s.blend" % stem)
+                                 "falcon_range_%s_%s.blend" % (stem, launch_id))
         try:
             bpy.ops.wm.save_as_mainfile(filepath=tmp_blend, copy=True)
         except RuntimeError as e:
@@ -1187,26 +1228,53 @@ class CYCLES_OT_falcon_bake_and_render_range(Operator):
             return {'CANCELLED'}
 
         runner = os.path.join(os.path.dirname(__file__), "falcon_range.py")
-        out_dir = os.path.dirname(bpy.path.abspath(r.filepath)) or tempfile.gettempdir()
+        # The copy lives in the temp dir, so a relative ("//...") output path
+        # would resolve there. Hand the child the absolute path derived from
+        # the original file (a trailing separator -- "directory" output -- is
+        # kept as it is).
+        out_path = bpy.path.abspath(r.filepath)
+        if not os.path.isabs(out_path):
+            out_path = os.path.join(os.getcwd(), out_path)
+        out_dir = os.path.dirname(out_path) or tempfile.gettempdir()
         os.makedirs(out_dir, exist_ok=True)
-        log_path = os.path.join(out_dir, "falcon_range_%s.log" % stem)
+        log_path = os.path.join(out_dir, "falcon_range_%s_%s.log" % (stem, launch_id))
 
         # The bake in the child re-derives every FALCON_* env from the scene
         # properties; scrub inherited ones so a live GUI add-mode/knob can't
-        # leak a stale map path or gain into the final render.
+        # leak a stale map path or gain into the final render. The variables
+        # that only say where things are (nothing in the GUI writes them) stay:
+        # without FALCON_RIFE_DIR the child cannot find RIFE and turns frame
+        # interpolation off, FALCON_PLUGINS* configure the plugin folder.
+        # FALCON_FRAME_INTERP is written by the GUI's own renders, so it goes
+        # too -- unless the user had exported it before starting Blender.
+        keep_env = ("FALCON_RIFE_DIR", "FALCON_PLUGINS", "FALCON_PLUGINS_DIR",
+                    "FALCON_PLUGINS_WATCH")
         env = {k: v for k, v in os.environ.items()
-               if not k.startswith("FALCON_")}
+               if not k.startswith("FALCON_") or k in keep_env}
+        from . import falcon_interp
+        if falcon_interp._ENV_AT_START is not None:
+            env[falcon_interp.MODE_ENV] = falcon_interp._ENV_AT_START
         mode = "perframe" if self.per_frame else "once"
+        log_f = None
         try:
             log_f = open(log_path, "w")
             proc = subprocess.Popen(
                 [bpy.app.binary_path, "-b", tmp_blend,
-                 "--python", runner, "--", "--mode", mode],
+                 "--python", runner, "--", "--mode", mode,
+                 "--out", out_path, "--cleanup"],
                 stdout=log_f, stderr=subprocess.STDOUT,
                 start_new_session=True, env=env)
         except OSError as e:
+            try:
+                os.remove(tmp_blend)
+            except OSError:
+                pass
             self.report({'ERROR'}, rpt_("Could not start the render process: %s") % e)
             return {'CANCELLED'}
+        finally:
+            # the child holds its own copy of the descriptor
+            if log_f is not None:
+                log_f.close()
 
         self.report({'INFO'},
                     rpt_("Range render started (%s, PID %d) — progress: %s")
@@ -1389,6 +1457,19 @@ def _falcon_media_restore(img_set, before):
         img_set.media_type = before
 
 
+def _falcon_lt_set(target, attr, value):
+    """LT が一時的に書き換える物(キャスタの印・灯の hide_render)の代入。
+
+    リンクしたライブラリの物などは RNA が読み取り専用で、代入が AttributeError に
+    なる。ここで止めると場面を書き換えかけたまま戻す処理も走らない(setup の途中・
+    _lt_restore_scene の途中)ので、書けない物は飛ばす。書けたら True。"""
+    try:
+        setattr(target, attr, value)
+        return True
+    except (AttributeError, RuntimeError, TypeError, ReferenceError):
+        return False
+
+
 def _falcon_lt_publish(context, scene, stem, comp, w, h, report, display=True):
     """Composite array -> "Falcon LT Composite" EXR datablock + color-managed 8-bit
     display PNG pushed into every open image editor. Shared tail of the LT
@@ -1463,6 +1544,15 @@ _falcon_lt_rr = {"overlay": None, "beauty": None, "size": None}
 # サンプル数など)。モーダルだと呼び出し側の finally はレンダーが
 # 始まる前に走ってしまうので、終わりの合図をここで受ける。
 _falcon_lt_pending_restore = []
+
+
+def _falcon_lt_pending_restore_drop(fn):
+    """待たせてあった戻し処理を、走らせずにキューから外す(既に無ければ何もしない)。"""
+    try:
+        _falcon_lt_pending_restore.remove(fn)
+    except ValueError:
+        pass
+
 
 # LT の段(光子のパス)を回している間だけ >0。光子のパスそのものが
 # bpy.ops.render.render() なので、F12 の自動呼び出し(_falcon_lt_f12_pre)が
@@ -1692,6 +1782,21 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
         return iface_("Beauty Pass")
 
     def _lt_setup(self, context):
+        """_lt_setup_impl を、途中で例外が出ても場面を書き換えたままにしない形で呼ぶ。
+
+        impl は検証の後、合成/シーケンサーを切る・キャスタに印を付ける・環境変数と
+        サンプル数を差し替える、と場面を書き換える。その途中で落ちると teardown が
+        走らず、合成とシーケンサーが切れたまま残っていた。"""
+        try:
+            return self._lt_setup_impl(context)
+        except Exception as e:
+            if getattr(self, "_st", None) is None:
+                raise       # まだ何も書き換えていない
+            self._lt_teardown(context)
+            self.report({'ERROR'}, rpt_("LT render failed: %s") % e)
+            return None
+
+    def _lt_setup_impl(self, context):
         """検証と保存。戻り値 None = 中止(呼び手が CANCELLED を返す)。
         飛ばした時(投射体も灯も無い)は self._lt_skipped を立てて None を返す
         ―― 呼び手はそこで素のレンダーを 1 回だけ焼く。"""
@@ -1879,7 +1984,7 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
         # line-through-specular, LuxCore's own approximation). Tag every
         # transmissive object for the LT pass only; beauty gets them back.
         for ob in caster_objs:
-            ob.cycles.is_caustics_caster = True
+            _falcon_lt_set(ob.cycles, "is_caustics_caster", True)
         os.environ["FALCON_PHOTON_MODE"] = "bake"
         os.environ["FALCON_LIGHTTRACE"] = "1"
         # The save hook cannot be told "do not save" from here, so it is
@@ -1943,6 +2048,7 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
                             % "/".join(unguided))
         global _falcon_lt_running
         _falcon_lt_running += 1
+        st["counted"] = True
         return st
 
     def _lt_render(self, write_still=True):
@@ -2004,7 +2110,7 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
             lights = st["lights"]
             light = lights[idx]
             for other in lights:
-                other.hide_render = (other is not light)
+                _falcon_lt_set(other, "hide_render", other is not light)
             os.environ.pop("FALCON_PHOTON_TARGET", None)
             if light.data.type == 'SUN':
                 tgt = _falcon_sun_target(scene)
@@ -2030,7 +2136,7 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
         elif kind == "lights":
             # ★S4: 灯を隠さない。カーネルが出力に比例して灯を選ぶ。
             for other in st["lights"]:
-                other.hide_render = st["saved_hide"][other.name]
+                _falcon_lt_set(other, "hide_render", st["saved_hide"][other.name])
             tgt = _falcon_sun_target(scene)
             if tgt and any(li.data.type == 'SUN' for li in st["lights"]):
                 os.environ["FALCON_PHOTON_TARGET"] = tgt
@@ -2049,7 +2155,7 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
             # shadow embedded caustics; beauty runs caustics-off, so no lamp
             # LT pass nor beauty carries this component otherwise) ---
             for other in st["lights"]:
-                other.hide_render = True
+                _falcon_lt_set(other, "hide_render", True)
             tgt = _falcon_sun_target(scene)
             if tgt:
                 os.environ["FALCON_PHOTON_TARGET"] = tgt
@@ -2093,6 +2199,13 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
         w, h = st["w"], st["h"]
         # --- beauty pass with the user's own settings/envs restored ---
         self._lt_restore_scene()
+        # ただし焼いてある光子(FALCON_PHOTON_MODE=add・「Make Caustics」の状態)は
+        # このビューティでは足さない。集光はこの LT の層が受け持つので、足すと
+        # 点マップの集光が層の上にもう一度乗って二重になる(下の PT の集光を
+        # 切るのと同じ理由)。env は teardown の _lt_restore_scene が元へ戻す。
+        import os
+        if os.environ.get("FALCON_PHOTON_MODE") == "add":
+            os.environ.pop("FALCON_PHOTON_MODE", None)
         # The LT layer carries the caustic paths exclusively; PT finds the
         # same light itself under soft/large lights, so beauty must not
         # (audit 2026-07-05: the layer was a pure second copy otherwise).
@@ -2129,9 +2242,9 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
         st = self._st
         cscene, r, img_set = st["cscene"], st["r"], st["img_set"]
         for ob in st["caster_objs"]:
-            ob.cycles.is_caustics_caster = st["saved_caster"][ob.name]
+            _falcon_lt_set(ob.cycles, "is_caustics_caster", st["saved_caster"][ob.name])
         for li in st["lights"]:
-            li.hide_render = st["saved_hide"][li.name]
+            _falcon_lt_set(li, "hide_render", st["saved_hide"][li.name])
         for k, v in st["saved_env"].items():
             if v is None:
                 os.environ.pop(k, None)
@@ -2211,7 +2324,10 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
         st = getattr(self, "_st", None)
         if st is None:
             return
-        _falcon_lt_running = max(0, _falcon_lt_running - 1)
+        # setup が数える所まで行かずに落ちた時は、他の走りの分を減らさない
+        if st.get("counted"):
+            st["counted"] = False
+            _falcon_lt_running = max(0, _falcon_lt_running - 1)
         if not keep_arm:
             _falcon_lt_disarm_render_result()
         self._lt_restore_scene()
@@ -2252,6 +2368,11 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
 
     def execute(self, context):
         """headless(-b)と EXEC 呼び出しの道。段は同じ物を続けて回す。"""
+        if _falcon_lt_running:
+            # 走っている最中の 2 本目の setup は、LT が書き換えた場面を「ユーザーの物」
+            # として控えてしまい、その teardown が LT の値を永久に残す。
+            self.report({'ERROR'}, "Light-traced render is already running")
+            return {'CANCELLED'}
         self._lt_skipped = False
         if self._lt_setup(context) is None:
             if self._lt_skipped and not self.defer_beauty:
@@ -2280,13 +2401,24 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
     def invoke(self, context, event):
         if bpy.app.background or self.defer_beauty:
             return self.execute(context)
+        if _falcon_lt_running:
+            self.report({'ERROR'}, "Light-traced render is already running")
+            return {'CANCELLED'}
+        # タイマーには窓が要る。スクリプト(bpy.app.timers)から呼ばれると
+        # context.window が None のことがあるので、その時は最初の窓を使う。
+        # 窓が全く無ければ execute の道へ ―― setup の前に決める(setup 済みで
+        # execute へ回すと、execute がもう一度 setup して 2 回目が LT の書き換えた
+        # 場面を控えてしまう)。
+        wm = context.window_manager
+        win = context.window or (wm.windows[0] if len(wm.windows) else None)
+        if win is None:
+            return self.execute(context)
         self._lt_skipped = False
         if self._lt_setup(context) is None:
             if self._lt_skipped:
                 return self._lt_plain_render(context)
             return {'CANCELLED'}
         st = self._st
-        wm = context.window_manager
         try:
             wm.progress_begin(0.0, 1.0)
             st["wm_progress"] = True
@@ -2297,13 +2429,14 @@ class CYCLES_OT_falcon_lighttrace_render(Operator):
                      % self._lt_step_label(st))
         # 0.01 秒のタイマー: 1 イベント = 1 レンダー。レンダーの間だけ UI が
         # 止まり、段の切れ目で表示が進む。
-        # タイマーには窓が要る。スクリプト(bpy.app.timers)から呼ばれると
-        # context.window が None のことがあるので、その時は最初の窓を使う。
-        win = context.window or (wm.windows[0] if len(wm.windows) else None)
-        if win is None:
-            return self.execute(context)
-        st["timer"] = wm.event_timer_add(0.01, window=win)
-        wm.modal_handler_add(self)
+        try:
+            st["timer"] = wm.event_timer_add(0.01, window=win)
+            wm.modal_handler_add(self)
+        except Exception as e:
+            # setup 済みなので、ここで落ちたら戻さないと場面が LT のまま残る
+            self._lt_teardown(context)
+            self.report({'ERROR'}, rpt_("LT render failed: %s") % e)
+            return {'CANCELLED'}
         return {'RUNNING_MODAL'}
 
     def modal(self, context, event):
@@ -2486,6 +2619,11 @@ class CYCLES_OT_falcon_lt_clean_caustics(Operator):
     def execute(self, context):
         scene = context.scene
         cscene = scene.cycles
+        if _falcon_lt_running:
+            # 走っている LT の最中にサンプル数などを控え直すと、LT が書き換えた値を
+            # 「元の値」として戻す羽目になる。
+            self.report({'ERROR'}, "Light-traced render is already running")
+            return {'CANCELLED'}
         if not getattr(cscene, "falcon_caustics_photon", False):
             self.report({'ERROR'},
                         "Caustics (photons) are not enabled "
@@ -2527,10 +2665,17 @@ class CYCLES_OT_falcon_lt_clean_caustics(Operator):
         # 戻ってしまう。終わりの合図で戻す(_lt_teardown が呼ぶ)。
         _falcon_lt_pending_restore.append(_restore)
         try:
-            return bpy.ops.cycles.falcon_lighttrace_render('INVOKE_DEFAULT')
+            result = bpy.ops.cycles.falcon_lighttrace_render('INVOKE_DEFAULT')
         except Exception:
+            _falcon_lt_pending_restore_drop(_restore)
             _restore()
             raise
+        if 'RUNNING_MODAL' not in result:
+            # モーダルが始まらなかった(中止・素のレンダーだけ)= teardown が来ないので、
+            # 待たせずここで戻す。キューに残すと次の LT の teardown が古い値で再生する。
+            _falcon_lt_pending_restore_drop(_restore)
+            _restore()
+        return result
 
 
 class CYCLES_OT_falcon_lt_recomposite(Operator):
@@ -2987,12 +3132,19 @@ class CYCLES_OT_falcon_auto_cull_verify(Operator):
         path = os.path.join(tempfile.gettempdir(),
                             "falcon_cull_verify_%d.png" % os.getpid())
         scene.render.filepath = path
-        bpy.ops.render.render(write_still=True)
-        img = bpy.data.images.load(path)
         try:
-            px = np.array(img.pixels[:], dtype=np.float32)
+            bpy.ops.render.render(write_still=True)
+            img = bpy.data.images.load(path)
+            try:
+                px = np.array(img.pixels[:], dtype=np.float32)
+            finally:
+                bpy.data.images.remove(img)
         finally:
-            bpy.data.images.remove(img)
+            # 使い捨て。毎回 pid 名で 1 枚ずつ /tmp に溜めない。
+            try:
+                os.remove(path)
+            except OSError:
+                pass
         return px
 
     def _diff(self, a, b):
@@ -3012,6 +3164,11 @@ class CYCLES_OT_falcon_auto_cull_verify(Operator):
         saved = (r.resolution_percentage, c.samples, c.use_adaptive_sampling,
                  c.use_denoising, r.filepath, r.use_simplify,
                  scene.cycles.use_camera_cull, r.use_persistent_data)
+        # 検証レンダーは PNG で書いて読み戻す。利用者の出力が EXR/JPEG だと拡張子が
+        # 変わって読めず、動画形式だと write_still 自体が失敗する。
+        im = r.image_settings
+        saved_fmt = (im.file_format, im.color_mode, im.color_depth)
+        im.file_format = 'PNG'
         r.resolution_percentage = 25
         c.samples = 8
         c.use_adaptive_sampling = False
@@ -3027,6 +3184,7 @@ class CYCLES_OT_falcon_auto_cull_verify(Operator):
                     ob.update_tag()
 
         offenders = []
+        done = False
         try:
             # 基準=カリング全OFF
             set_culled([])
@@ -3040,6 +3198,7 @@ class CYCLES_OT_falcon_auto_cull_verify(Operator):
                 self.report({'INFO'}, rpt_("No side effects (difference at most %.4f) — %d kept as is")
                             % (self.threshold, len(culled)))
                 set_culled(culled)
+                done = True
                 return {'FINISHED'}
 
             # 二分探索: 差を生むオブジェクトを特定
@@ -3068,10 +3227,15 @@ class CYCLES_OT_falcon_auto_cull_verify(Operator):
                            ", ".join(offenders[:5]),
                            "…" if len(offenders) > 5 else "",
                            len(keep), final_diff))
+            done = True
         finally:
             (r.resolution_percentage, c.samples, c.use_adaptive_sampling,
              c.use_denoising, r.filepath, r.use_simplify,
              scene.cycles.use_camera_cull, r.use_persistent_data) = saved
+            im.file_format, im.color_mode, im.color_depth = saved_fmt
+            if not done:
+                # 途中で失敗した時は、基準の撮影で全部外した利用者のカリング指定を戻す
+                set_culled(culled)
         return {'FINISHED'}
 
 
