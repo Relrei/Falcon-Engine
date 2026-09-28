@@ -518,9 +518,18 @@ static void sequencer_main_region_flip_view_init(const bContext *C, ARegion *reg
 
   const float range = BLI_rctf_size_y(&v2d->cur);
   if (seq::channel_flip_enabled()) {
-    /* 反転ではチャンネル 1 がいちばん大きい Y。上端を合わせる。 */
-    v2d->cur.ymax = box.ymax;
-    v2d->cur.ymin = box.ymax - range;
+    /* 反転ではチャンネル 1 がいちばん大きい Y。上端を合わせる。時間目盛りの帯の下にチャンネル 1 が
+     * 潜らないよう、`sequencer_main_clamp_view` と同じだけ上に余白を足す(v2d の mask がまだ
+     * 無い時は足さない)。 */
+    float pad_view_y = 0.0f;
+    const int mask_height = BLI_rcti_size_y(&v2d->mask);
+    if (mask_height > 0) {
+      float pad_top, pad_bottom;
+      SEQ_get_timeline_region_padding(C, &pad_top, &pad_bottom);
+      pad_view_y = pad_top * range / float(mask_height + 1);
+    }
+    v2d->cur.ymax = box.ymax + pad_view_y;
+    v2d->cur.ymin = v2d->cur.ymax - range;
   }
   else {
     v2d->cur.ymin = box.ymin;

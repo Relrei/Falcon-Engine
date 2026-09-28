@@ -15,10 +15,14 @@
 #include "DNA_workspace_types.h"
 
 #include "BLI_listbase.h"
+#include "BLI_rect.h"
 
 #include "BKE_context.hh"
 #include "BKE_lib_id.hh"
+#include "BKE_report.hh"
 #include "BKE_screen.hh"
+
+#include "DEG_depsgraph.hh"
 
 #include "ED_screen.hh"
 
@@ -29,6 +33,7 @@
 
 #include "WM_api.hh"
 
+#include "SEQ_channels.hh"
 #include "SEQ_relations.hh"
 #include "SEQ_sequencer.hh"
 #include "SEQ_time.hh"
@@ -106,6 +111,11 @@ static void sequencer_channel_count_follow_views(bContext *C,
    * 反転していない時は段が上へ伸び、view も上(+)へ動く(本家と同じ)。 */
   const bool flip = seq::channel_flip_enabled();
   const float view_delta = flip ? -delta : delta;
+  /* 反転の行き止まりに足す、時間目盛りの帯のぶんの余白(`sequencer_main_clamp_view` と同じ)。 */
+  float pad_top = 0.0f, pad_bottom = 0.0f;
+  if (flip && CTX_wm_space_seq(C) != nullptr) {
+    SEQ_get_timeline_region_padding(C, &pad_top, &pad_bottom);
+  }
   wmWindowManager *wm = CTX_wm_manager(C);
   for (wmWindow &win : wm->windows) {
     bScreen *screen = WM_window_get_active_screen(&win);
@@ -132,8 +142,13 @@ static void sequencer_channel_count_follow_views(bContext *C,
         v2d->cur.ymin += view_delta;
         v2d->cur.ymax += view_delta;
         if (flip) {
-          /* 反転の行き止まりはチャンネル 1 の上端(`channel_to_y(1) + 1`)。 */
-          const float top_limit = seq::channel_to_y(1) + 1.0f;
+          /* 反転の行き止まりはチャンネル 1 の上端(`channel_to_y(1) + 1`)に、時間目盛りの帯の
+           * ぶんの余白を足した所(帯の下にチャンネル 1 が潜らないように)。 */
+          float top_limit = seq::channel_to_y(1) + 1.0f;
+          const int mask_height = BLI_rcti_size_y(&v2d->mask);
+          if (mask_height > 0) {
+            top_limit += pad_top * BLI_rctf_size_y(&v2d->cur) / float(mask_height + 1);
+          }
           if (v2d->cur.ymax > top_limit) {
             v2d->cur.ymin -= v2d->cur.ymax - top_limit;
             v2d->cur.ymax = top_limit;
@@ -270,6 +285,25 @@ static wmOperatorStatus sequencer_channel_move_exec(bContext *C, wmOperator *op)
     return OPERATOR_CANCELLED;
   }
 
+  /* 施錠されたチャンネル・Strip は動かさない(トランスフォーム・Swap Strip と同じ)。
+   * 施錠・ミュートはチャンネル番号側の状態で Strip と一緒には動かないので、施錠された
+   * チャンネルへ Strip を入れると黙って施錠されてしまう。1 つでもあれば全体を断る。 */
+  const ListBaseT<SeqTimelineChannel> *channels = seq::channels_displayed_get(ed);
+  bool locked = seq::channel_get_by_index(channels, channel)->is_locked() ||
+                seq::channel_get_by_index(channels, other)->is_locked();
+  for (const Strip &strip : *seqbase) {
+    if ((strip.channel == channel || strip.channel == other) &&
+        seq::transform_is_locked(channels, &strip))
+    {
+      locked = true;
+      break;
+    }
+  }
+  if (locked) {
+    BKE_report(op->reports, RPT_WARNING, "Cannot swap channels: a channel or strip is locked");
+    return OPERATOR_CANCELLED;
+  }
+
   bool changed = false;
   for (Strip &strip : *seqbase) {
     if (strip.channel == channel) {
@@ -289,6 +323,8 @@ static wmOperatorStatus sequencer_channel_move_exec(bContext *C, wmOperator *op)
     return OPERATOR_CANCELLED;
   }
 
+  /* ミュート状態は seq::eval_strips(edit_update_muting)で更新されるので、音も含めて再評価させる。 */
+  DEG_id_tag_update(&scene->id, ID_RECALC_SEQUENCER_STRIPS | ID_RECALC_AUDIO);
   WM_event_add_notifier(C, NC_SCENE | ND_SEQUENCER, scene);
   return OPERATOR_FINISHED;
 }
