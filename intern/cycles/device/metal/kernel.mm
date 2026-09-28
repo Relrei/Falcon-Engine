@@ -255,6 +255,11 @@ bool ShaderCache::should_load_kernel(DeviceKernel device_kernel,
     return false;
   }
 
+  if (device_kernel_is_cuda_only(device_kernel)) {
+    /* Skip the Falcon DLSS-RR kernels, they only exist in the CUDA kernel. */
+    return false;
+  }
+
   if (device_kernel == DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_RAYTRACE) {
     if ((device->kernel_features & KERNEL_FEATURE_NODE_RAYTRACE) == 0) {
       /* Skip shade_surface_raytrace kernel if the scene doesn't require it. */

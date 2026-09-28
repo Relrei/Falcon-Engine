@@ -193,6 +193,12 @@ if(WITH_CYCLES_DEVICE_ONEAPI)
     list(APPEND sycl_compiler_flags -DWITH_CYCLES_DEBUG)
   endif()
 
+  # Falcon SHARC changes the KernelIntegrator layout, so the build-time kernel must be
+  # compiled with the same define as the host or KernelParams sizes mismatch.
+  if(WITH_FALCON_SHARC)
+    list(APPEND sycl_compiler_flags -DWITH_FALCON_SHARC)
+  endif()
+
   get_filename_component(sycl_compiler_root ${SYCL_COMPILER} DIRECTORY)
 
   if(WIN32) # Add Windows specific compiler flags.

@@ -181,6 +181,8 @@ ccl_device_inline float falcon_bsdf_adjoint_normal_correction(
     const ccl_private ShaderClosure *sc,
     const float3 wo)
 {
+#ifdef WITH_FALCON_SHARC
+  /* The falcon_* KernelIntegrator members only exist with WITH_FALCON_SHARC. */
   if (!(kernel_data.integrator.falcon_lighttrace ||
         kernel_data.integrator.falcon_photon_pass) ||
       (sd->type & PRIMITIVE_CURVE) ||
@@ -193,6 +195,9 @@ ccl_device_inline float falcon_bsdf_adjoint_normal_correction(
   const float numerator = fabsf(dot(sc->N, sd->wi) * dot(sd->Ng, wo));
   const float denominator = fabsf(dot(sd->Ng, sd->wi) * dot(sc->N, wo));
   return safe_divide(numerator, denominator);
+#else
+  return 1.0f;
+#endif
 }
 
 ccl_device_inline int bsdf_sample(KernelGlobals kg,

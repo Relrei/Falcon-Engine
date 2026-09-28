@@ -44,6 +44,15 @@ bool device_kernel_has_gpu_function(DeviceKernel kernel)
            kernel == DEVICE_KERNEL_INTEGRATOR_SHADOW_PATH_MNEE_PENDING);
 }
 
+bool device_kernel_is_cuda_only(DeviceKernel kernel)
+{
+  /* Falcon DLSS-RR conversion kernels. They are only built into the CUDA kernel
+   * (kernel/device/cuda/kernel.cu), so the HIP, HIP-RT, Metal and oneAPI loaders skip them. */
+  return (kernel == DEVICE_KERNEL_FILTER_GUIDING_PREPROCESS_TO_SURFACE ||
+          kernel == DEVICE_KERNEL_FILTER_COLOR_PREPROCESS_TO_SURFACE ||
+          kernel == DEVICE_KERNEL_FILTER_COLOR_POSTPROCESS_FROM_SURFACE);
+}
+
 const char *device_kernel_as_string(DeviceKernel kernel)
 {
   switch (kernel) {

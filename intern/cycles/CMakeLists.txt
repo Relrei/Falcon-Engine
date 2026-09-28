@@ -311,6 +311,20 @@ if(WITH_OPENIMAGEDENOISE)
   add_definitions(-DWITH_OPENIMAGEDENOISE)
 endif()
 
+# The DLSS denoiser drives NGX through CUDADevice (denoiser_dlss.cpp), which only exists together
+# with the CUDA / OptiX device support (-DWITH_CUDA above).
+if(WITH_DLSS AND NOT (WITH_CYCLES_DEVICE_CUDA OR WITH_CYCLES_DEVICE_OPTIX))
+  if(WITH_STRICT_BUILD_OPTIONS)
+    message(SEND_ERROR
+      "WITH_DLSS requires CUDA support (WITH_CYCLES_DEVICE_CUDA or WITH_CYCLES_DEVICE_OPTIX)")
+  else()
+    message(WARNING
+      "WITH_DLSS requires CUDA support (WITH_CYCLES_DEVICE_CUDA or WITH_CYCLES_DEVICE_OPTIX), "
+      "disabling WITH_DLSS")
+  endif()
+  set(WITH_DLSS OFF)
+endif()
+
 if(WITH_DLSS)
   find_package(DLSS)
   if(DLSS_FOUND)
