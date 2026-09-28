@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <climits>
 #include <tuple>
 
 #include "device/device.h"
@@ -135,12 +136,20 @@ class BlenderSession {
    * film (603/812/966) were never detected in the final render, so the history
    * was neither dropped nor warmed there and those frames came out at twice the
    * high-frequency residual of their neighbours. Reset at the start frame of a
-   * job (see clear_denoiser_history_on_cut). */
+   * job (see clear_denoiser_history_on_cut).
+   *
+   * Only the final animation render may use them: they are shared by the whole process, so the
+   * viewport (UI thread, one long-lived session per 3D view), stills and material previews would
+   * otherwise race on the string and read each other's camera and frame as a "cut". Those keep
+   * their own copy below, which is all they need -- their BlenderSession lives as long as the
+   * history it guards. */
   /* ★カメラの「名前」で覚える。評価済みの Object * は使えない — 背景のアニメ書き出しでは
    * 評価のたびに新しい複製ができ、8 コマの書き出しで 36 種類の番地が出た(2026-09-20 実測)。
    * ポインタで比べると毎コマ「カメラが変わった」= 偽の当たりになり、履歴を 1 コマ 5 回捨てる。 */
   static string last_cut_camera_;
   static int last_cut_frame_;
+  string session_cut_camera_;
+  int session_cut_frame_ = INT_MIN;
 
   /* Viewport: drop the carried history when the camera jumped too far for the motion vectors to
    * explain (see clear_denoiser_history_on_jump). */
@@ -178,7 +187,9 @@ class BlenderSession {
    * previous frame's state; this has to be process-global. Set once a frame
    * has completed with DLSS-RR history established, so a freshly constructed
    * BlenderSession/Session for the next frame is told the history is already
-   * warm instead of re-running the first-frame pre-roll on every frame. */
+   * warm instead of re-running the first-frame pre-roll on every frame.
+   * Only the frames of an animation render read or set it (stills and material previews are
+   * jobs of their own, see BlenderSession::render). */
   static bool dlss_history_warmed_this_job;
 
  protected:
