@@ -2763,10 +2763,24 @@ endif()
 # Falcon: ビルド名の札。配布の手順がこれと `blender --version` の両方を見て、
 # debug 版のビルド物が配布物に混ざるのを止める。
 # CMAKE_INSTALL_PREFIX が確定した後でないと書けないので、木の一番下に置く。
+#
+# ★札の置き場所は install 先(prefix の直下)。ただし configure 時に prefix へ直接
+#   書いてはいけない: WITH_INSTALL_PORTABLE=OFF の Linux では prefix が /usr/local で
+#   一般ユーザだと configure が落ちるし、Windows / macOS では prefix が文字どおり
+#   `<bin>/${BUILD_TYPE}`(install 時に展開される)なので、`${BUILD_TYPE}` という名前の
+#   フォルダに札が入ってしまう。そのため
+#     - 札は build ディレクトリに作り、install() で prefix の直下へ置く(全プラットフォーム)
+#     - 従来どおり configure 直後から見える必要がある、木の中の portable 既定
+#       (prefix == bin)の時だけ、configure 時にも直接書く
 # ---------------------------------------------------------------------------
 # 2行目の gpu-features は「このビルドに入っている GPU 処理の一覧」。
 # release 版では**必ず空**になる。配布の手順がそこを見て門にする。
 string(REPLACE ";" " " _falcon_gpu_list "${FALCON_GPU_FEATURES_ON}")
-file(WRITE "${CMAKE_INSTALL_PREFIX}/FALCON_FLAVOR"
-  "${FALCON_BUILD_FLAVOR}\ngpu-features: ${_falcon_gpu_list}\n")
+set(_falcon_flavor_text "${FALCON_BUILD_FLAVOR}\ngpu-features: ${_falcon_gpu_list}\n")
+file(WRITE "${CMAKE_BINARY_DIR}/FALCON_FLAVOR" "${_falcon_flavor_text}")
+install(FILES "${CMAKE_BINARY_DIR}/FALCON_FLAVOR" DESTINATION ".")
+if(CMAKE_INSTALL_PREFIX STREQUAL EXECUTABLE_OUTPUT_PATH)
+  file(WRITE "${CMAKE_INSTALL_PREFIX}/FALCON_FLAVOR" "${_falcon_flavor_text}")
+endif()
+unset(_falcon_flavor_text)
 unset(_falcon_gpu_list)

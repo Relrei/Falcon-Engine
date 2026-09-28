@@ -1069,7 +1069,8 @@ static AVStream *alloc_video_stream(MovieWriter *context,
                                     int rectx,
                                     int recty,
                                     char *error,
-                                    int error_size)
+                                    int error_size,
+                                    AVStream *retry_stream = nullptr)
 {
   AVStream *st;
   const AVCodec *codec;
@@ -1078,16 +1079,37 @@ static AVStream *alloc_video_stream(MovieWriter *context,
 
   error[0] = '\0';
 
-  st = avformat_new_stream(of, nullptr);
-  if (!st) {
-    return nullptr;
+  /* ★`retry_stream` は「GPU の符号化器が実際の open で落ちたので、同じ stream を
+   * 使って CPU の符号化器で最初からやり直す」時だけ渡される(下の `avcodec_open2`
+   * の失敗側を参照)。stream を作り直すと出力に空の stream が1本残るため。 */
+  if (retry_stream != nullptr) {
+    st = retry_stream;
   }
-  st->id = 0;
+  else {
+    st = avformat_new_stream(of, nullptr);
+    if (!st) {
+      return nullptr;
+    }
+    st->id = 0;
+  }
 
   /* Set up the codec context */
 
   codec = nullptr;
-  if ((rd->ffcodecdata.flags & FFMPEG_NO_HARDWARE_ENCODER) == 0) {
+  /* ★GPU の符号化器は **CRF が 1 以上の時だけ**使う。
+   *
+   *   Lossless (crf 0) -- 下で 4:4:4 (`yuv444p` / `yuv444p10le`) に差し替えるが、ここの
+   *     `encoder_opens` の確認は 4:2:0 / p010 でしかしない。H.265 10bit は NVENC に
+   *     `yuv444p10le` が無く `avcodec_open2` で落ちる。8bit は開けてしまい、可逆の
+   *     はずが cq 4-5 の VBR になる。⇒ 可逆は stock と同じく CPU (libx264/libx265)。
+   *   CBR (crf < 0) -- `get_hardware_encoder` が入れる `b:v 0` が指定のビットレートを
+   *     上書きし、cq だけで符号化される。⇒ CBR も CPU。
+   *
+   * やり直し (`retry_stream` あり) の時も GPU は試さない。 */
+  const bool hw_quality_ok = context->ffmpeg_crf > FFM_CRF_LOSSLESS;
+  if ((rd->ffcodecdata.flags & FFMPEG_NO_HARDWARE_ENCODER) == 0 && hw_quality_ok &&
+      retry_stream == nullptr)
+  {
     /* Put the CRF on the codec's own scale first, exactly the way the CPU path
      * does further down. Without this H.265 handed the GPU the raw UI value
      * while the CPU got the remapped one, so the two encoders were asked for
@@ -1442,6 +1464,13 @@ static AVStream *alloc_video_stream(MovieWriter *context,
     av_dict_free(&opts);
     avcodec_free_context(&c);
     context->video_codec = nullptr;
+    if (is_hardware_encoder && retry_stream == nullptr) {
+      /* ★`encoder_opens` の確認は通ったが、本当の設定(B フレーム・GOP など)では開けなかった。
+       * 書き出しを丸ごと諦めず、同じ stream を使って CPU の符号化器でやり直す。 */
+      CLOG_INFO(&LOG, "GPU encoder failed to open, retrying with the CPU one");
+      return alloc_video_stream(
+          context, scene, imf, codec_id, of, rectx, recty, error, error_size, st);
+    }
     return nullptr;
   }
   av_dict_free(&opts);

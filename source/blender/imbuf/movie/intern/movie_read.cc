@@ -438,6 +438,42 @@ static bool falcon_nvdec_codec_ok(const AVCodecID id)
 }
 
 /**
+ * 選んだ復号器・この映像で、NVDEC が**使われ得るか**。使われ得ない映像で糸を 1 本に絞ると、
+ * CPU で復号するのに標準の並列(`startffmpeg` が先に決めたフレーム / スライス糸)を捨てるだけになる。
+ *
+ * - 復号器が CUDA の `hw_device_ctx` を受け付けるか。libdav1d(AV1 の既定)・アルファ付き VP9 で
+ *   強制する libvpx-vp9 などは受け付けず、渡しても黙って CPU で復号する。
+ * - H.264 は NVDEC が 8bit 4:2:0 だけ(10bit・4:2:2・4:4:4 は復号できず CPU に落ちる)。
+ *   他の符号化は GPU の世代・FFmpeg の版で対応が変わるので、ここでは落とさない
+ *   (実際に使えるかは `falcon_nvdec_get_format` に任せる)。
+ */
+static bool falcon_nvdec_decoder_may_apply(const AVCodec *codec, const AVCodecContext *ctx)
+{
+  bool has_cuda_config = false;
+  for (int i = 0;; i++) {
+    const AVCodecHWConfig *config = avcodec_get_hw_config(codec, i);
+    if (config == nullptr) {
+      break;
+    }
+    if ((config->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX) &&
+        config->device_type == AV_HWDEVICE_TYPE_CUDA)
+    {
+      has_cuda_config = true;
+      break;
+    }
+  }
+  if (!has_cuda_config) {
+    return false;
+  }
+  if (ctx->codec_id == AV_CODEC_ID_H264 && ctx->pix_fmt != AV_PIX_FMT_NONE &&
+      !ELEM(ctx->pix_fmt, AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUVJ420P))
+  {
+    return false;
+  }
+  return true;
+}
+
+/**
  * GPU 上の絵(AV_PIX_FMT_CUDA)なら、メインメモリへ写した物を返す(元の絵はそのまま)。
  * CPU の道(RGBA への変換)に渡す直前だけ呼ぶ。GPU 再生の道(`MOV_decode_frame_yuv` の
  * 装置の面)では降ろさずに使う = 段 G2。
@@ -645,9 +681,11 @@ static int startffmpeg(MovieReader *anim)
 
   /* Falcon: GPU 復号(上の「GPU 復号(NVDEC)」)。インターレース解除は CPU 側の形式を前提に
    * しているので、その時は使わない。GPU で復号する時は糸を 1 本にする(復号は GPU がやり、
-   * 糸ごとに GPU 上の面を抱えると VRAM だけ増える)。 */
+   * 糸ごとに GPU 上の面を抱えると VRAM だけ増える)。GPU で復号し得ない映像は
+   * 糸の数も標準のまま(`falcon_nvdec_decoder_may_apply`)。 */
   anim->hw_decode = false;
   if (falcon_nvdec_wanted() && falcon_nvdec_codec_ok(pCodecCtx->codec_id) &&
+      falcon_nvdec_decoder_may_apply(pCodec, pCodecCtx) &&
       !flag_is_set(anim->ib_flags, ImBufFlags::Deinterlace))
   {
     if (AVBufferRef *device = falcon_nvdec_device()) {

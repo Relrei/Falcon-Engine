@@ -198,7 +198,13 @@ void RE_engine_free(RenderEngine *engine)
 {
 #ifdef WITH_PYTHON
   if (engine->py_instance) {
-    if (falcon_free_engine_python_enabled()) {
+    /* Only for Cycles: its `__del__` is `engine.free()`, which is idempotent (it checks
+     * for the session and deletes the attribute), so the real `__del__` Python runs later
+     * is a no-op. Other engines' `__del__` are not known to tolerate a second call, so
+     * they keep the stock behaviour (called once, by Python). */
+    if (falcon_free_engine_python_enabled() && engine->type != nullptr &&
+        STREQ(engine->type->idname, "CYCLES"))
+    {
       /* Drop the engine's own resources (the Cycles session) while the RNA is
        * still valid. Calling it again later from a real `__del__` is a no-op. */
       BPY_call_method_no_args(engine->py_instance, "__del__");
