@@ -38,7 +38,7 @@ struct Ctx {
   ShaderData *sd;
 };
 
-static void setup(Ctx &c, bool gtg, bool follow = false)
+static void setup(Ctx &c, bool gtg, bool follow = false, bool matte = false)
 {
   KernelGlobalsCPU *kg = c.kg;
   memset((void *)&kg->data.film, 0, sizeof(KernelFilm));
@@ -53,6 +53,7 @@ static void setup(Ctx &c, bool gtg, bool follow = false)
   f.pass_denoising_specular_hit_distance = P_HITDIST;
   f.specular_hit_distance_far = 1e4f;
   f.denoising_pass_options_flag = (gtg ? DENOISING_PASS_GLASS_THROUGH : 0) |
+                                  (matte ? DENOISING_PASS_GLASS_MATTE : 0) |
                                   (follow ? DENOISING_PASS_FOLLOW_REFLECTIONS : 0);
   kg->data.cam.type = CAMERA_PERSPECTIVE;
   kg->data.cam.worldtocamera = transform_identity();
@@ -282,6 +283,57 @@ int main()
   film_write_denoising_features_surface(c.kg, c.state, c.sd, px(c), false);
   dump(c);
   CHECK(!(c.state->path.flag & PATH_RAY_GLASS_PENDING) && fabsf(c.buf[P_DEPTH] - 5.0f) < 1e-3f, "written as usual");
+
+  printf("== T10 matte only (mode 2): the glass's own guides become constant and diffuse-like ==\n");
+  setup(c, false, false, true);
+  set_glass(c.sd, 5.0f, 0.0f);
+  film_write_denoising_features_surface(c.kg, c.state, c.sd, px(c), false);
+  dump(c);
+  CHECK(!(c.state->path.flag & PATH_RAY_GLASS_PENDING), "not held back (through is off)");
+  CHECK(fabsf(c.buf[P_ALBEDO] - 0.5f) < 1e-3f && fabsf(c.buf[P_ALBEDO + 2] - 0.5f) < 1e-3f, "diffuse albedo constant 0.5");
+  CHECK(c.buf[P_SPEC_ALBEDO] == 0.0f && c.buf[P_SPEC_ALBEDO + 1] == 0.0f, "no specular albedo");
+  CHECK(fabsf(c.buf[P_ROUGH] - 1.0f) < 1e-3f, "roughness 1 (got %.3f)", c.buf[P_ROUGH]);
+  CHECK(fabsf(c.buf[P_DEPTH] - 5.0f) < 1e-3f && fabsf(c.buf[P_NORMAL + 2] + 1.0f) < 1e-3f, "depth and normal are still the glass's own");
+  CHECK(c.state->path.flag & PATH_RAY_GLASS_SEEN, "SEEN: no hit distance for matte glass either");
+  c.state->path.bounce = 1;
+  c.state->path.glossy_bounce = 1;
+  film_write_denoising_specular_hit_distance(c.kg, c.state, 3.0f, px(c));
+  CHECK(c.buf[P_HITDIST] == 0.0f, "no hit distance");
+
+  printf("== T11 both (mode 3): reflecting samples write the MATTE glass, refracting ones the background ==\n");
+  setup(c, true, false, true);
+  set_glass(c.sd, 5.0f, 0.0f);
+  film_write_denoising_features_surface(c.kg, c.state, c.sd, px(c), false);
+  CHECK(all_zero(c) && (c.state->path.flag & PATH_RAY_GLASS_PENDING), "held back");
+  film_write_denoising_glass_resolve(c.kg, c.state, c.sd, &c.sd->closure[0], LABEL_REFLECT | LABEL_SINGULAR, px(c));
+  dump(c);
+  CHECK(fabsf(c.buf[P_ALBEDO] - 0.5f) < 1e-3f && c.buf[P_SPEC_ALBEDO] == 0.0f && fabsf(c.buf[P_ROUGH] - 1.0f) < 1e-3f, "reflecting sample: matte glass guides");
+  setup(c, true, false, true);
+  set_glass(c.sd, 5.0f, 0.0f);
+  film_write_denoising_features_surface(c.kg, c.state, c.sd, px(c), false);
+  film_write_denoising_glass_resolve(c.kg, c.state, c.sd, &c.sd->closure[0], LABEL_TRANSMIT | LABEL_SINGULAR, px(c));
+  c.state->path.bounce = 1;
+  set_diffuse(wall, 9.0f, make_float3(0.2f, 0.3f, 0.4f));
+  film_write_denoising_features_surface(c.kg, c.state, wall, px(c), false);
+  dump(c);
+  CHECK(fabsf(c.buf[P_ALBEDO] - 0.2f) < 1e-3f && fabsf(c.buf[P_ALBEDO + 2] - 0.4f) < 1e-3f, "refracting sample: the wall's own albedo, not the matte constant");
+  CHECK(fabsf(c.buf[P_DEPTH] - 9.0f) < 1e-3f, "wall depth 9");
+
+  printf("== T12 matte leaves a diffuse surface and rough glass alone ==\n");
+  setup(c, false, false, true);
+  set_diffuse(c.sd, 5.0f, make_float3(0.7f, 0.6f, 0.5f));
+  film_write_denoising_features_surface(c.kg, c.state, c.sd, px(c), false);
+  CHECK(fabsf(c.buf[P_ALBEDO] - 0.7f) < 1e-3f, "diffuse albedo untouched (%.3f)", c.buf[P_ALBEDO]);
+  setup(c, false, false, true);
+  set_glass(c.sd, 5.0f, 0.5f);
+  film_write_denoising_features_surface(c.kg, c.state, c.sd, px(c), false);
+  CHECK(c.buf[P_SPEC_ALBEDO] > 0.5f && !(c.state->path.flag & PATH_RAY_GLASS_SEEN), "rough glass keeps the stock guides");
+
+  printf("== T13 matte with follow_reflections on: off ==\n");
+  setup(c, false, true, true);
+  set_glass(c.sd, 5.0f, 0.0f);
+  film_write_denoising_features_surface(c.kg, c.state, c.sd, px(c), false);
+  CHECK(c.buf[P_SPEC_ALBEDO] == 1.0f, "stock guides with following reflections");
 
   printf("\n%s (%d failed)\n", g_fail ? "FAILED" : "ALL PASSED", g_fail);
   return g_fail ? 1 : 0;

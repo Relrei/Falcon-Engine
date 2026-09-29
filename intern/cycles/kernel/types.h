@@ -494,6 +494,8 @@ enum DenoisingPassFlag {
   /* Falcon glass through-guides: guides of what a sample sees THROUGH smooth glass (see
    * PATH_RAY_GLASS_PENDING), instead of the glass surface for every sample. */
   DENOISING_PASS_GLASS_THROUGH = (1 << 3),
+  /* Falcon glass matte guides: constant, diffuse-like guides for smooth glass (RR guide 3.5). */
+  DENOISING_PASS_GLASS_MATTE = (1 << 4),
 };
 
 /* Closure Filter */

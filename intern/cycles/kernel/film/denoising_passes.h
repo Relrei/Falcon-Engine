@@ -17,6 +17,12 @@ CCL_NAMESPACE_BEGIN
 #  define FALCON_GLASS_SMOOTH_ROUGHNESS_SQ 2e-10f
 #endif
 
+/* Diffuse albedo the glass matte guides describe the glass surface with (the same value the RR
+ * guide suggests for pixels with nothing to tell, such as sky). */
+#ifndef FALCON_GLASS_MATTE_ALBEDO
+#  define FALCON_GLASS_MATTE_ALBEDO 0.5f
+#endif
+
 #ifdef __DENOISING_FEATURES__
 ccl_device_forceinline float denoising_depth_compute(KernelGlobals kg,
                                                      IntegratorState state,
@@ -237,8 +243,11 @@ ccl_device_forceinline void film_write_denoising_features_surface(KernelGlobals 
     return;
   }
 
-  if (glass_through_enabled && !force_first && sum_weight > 0.0f && transparent_weight < 1e-4f &&
-      smooth_glass_weight >= 0.5f * sum_weight &&
+  /* Smooth glass (and nothing much else) is what this surface is. */
+  const bool glass_dominant = sum_weight > 0.0f && transparent_weight < 1e-4f &&
+                              smooth_glass_weight >= 0.5f * sum_weight;
+
+  if (glass_through_enabled && !force_first && glass_dominant &&
       ((is_first_bounce && !(path_flag & (PATH_RAY_GLASS_SEEN | PATH_RAY_PSR))) ||
        glass_through_now))
   {
@@ -250,6 +259,26 @@ ccl_device_forceinline void film_write_denoising_features_surface(KernelGlobals 
   /* Every guide is written as for a first surface hit at the surface behind smooth glass, and at
    * a glass surface whose lobe has been resolved. */
   const bool write_as_first = is_first_bounce || glass_through_now || force_first;
+
+  /* Falcon glass matte guides. RR Integration Guide 3.5: where the guides of a refracting surface
+   * cannot be made noise-free, constant values let RR converge to a smooth result. The glass
+   * surface's own guides (a mirror to RR: roughness 0, specular albedo ~1, no diffuse albedo) make
+   * it keep the noise of what is seen through the glass as if it were a sharp reflection, so
+   * describe the glass as a plain rough diffuse surface instead. Applies wherever the glass
+   * surface's own guides are written (a first hit, or a resolved reflecting sample); the surface
+   * behind the glass keeps its own. Its specular hit distance goes with it (a matte surface has
+   * no reflection to track). */
+  const bool glass_matte_enabled = (kernel_data.film.denoising_pass_options_flag &
+                                    DENOISING_PASS_GLASS_MATTE) != 0 &&
+                                   !follow_reflections;
+  if (glass_matte_enabled && glass_dominant && !glass_through_now &&
+      (is_first_bounce || force_first))
+  {
+    diffuse_albedo = one_spectrum() * FALCON_GLASS_MATTE_ALBEDO;
+    specular_albedo = zero_spectrum();
+    specular_roughness = 1.0f;
+    INTEGRATOR_STATE_WRITE(state, path, flag) |= PATH_RAY_GLASS_SEEN;
+  }
 
   /* Primary surface replacement.
    *

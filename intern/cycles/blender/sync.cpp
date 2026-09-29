@@ -754,13 +754,28 @@ void BlenderSync::sync_film(blender::ViewLayer &b_view_layer,
    * same temporal flicker. FALCON_DLSS_PSR=1 turns it on to keep investigating. */
   film->set_denoising_pass_psr(active_dlss && getenv("FALCON_DLSS_PSR") != nullptr);
 
-  /* Glass through-guides: describe what a sample sees THROUGH smooth glass, and the glass
-   * surface only for the samples that reflect (the Fresnel blend of RR Integration Guide 3.4.1),
-   * instead of the glass surface as a mirror for every sample. The glass pixels' specular hit
-   * distance is dropped with it. Off by default until measured on the glass scenes:
-   * FALCON_DLSS_GLASS_THROUGH=1 turns it on. Not together with FALCON_DLSS_FOLLOW_REFLECTIONS. */
-  film->set_denoising_pass_glass_through(active_dlss &&
-                                         getenv("FALCON_DLSS_GLASS_THROUGH") != nullptr);
+  /* Glass guides for DLSS-RR (docs/dlss-glass-guides.md). FALCON_DLSS_GLASS_THROUGH is a bit mask;
+   * off by default until measured on the glass scenes:
+   *   1  through-guides: a sample that refracts through smooth glass writes the guides of what it
+   *      sees, one that reflects writes the glass surface's (the Fresnel blend of RR Integration
+   *      Guide 3.4.1), instead of the glass surface as a mirror for every sample. The glass
+   *      pixels' specular hit distance is dropped with it.
+   *   2  matte guides: the glass surface's own guides become constant and diffuse-like, so RR
+   *      denoises glass like any rough surface instead of keeping its noise as mirror detail
+   *      (RR Integration Guide 3.5).
+   *   3  both.
+   * Not together with FALCON_DLSS_FOLLOW_REFLECTIONS. */
+  int glass_mode = 0;
+  if (active_dlss) {
+    if (const char *value = getenv("FALCON_DLSS_GLASS_THROUGH")) {
+      glass_mode = atoi(value);
+      if (glass_mode == 0 && value[0] != '0') {
+        glass_mode = 1; /* Set but not a number ("true", ""): the through-guides. */
+      }
+    }
+  }
+  film->set_denoising_pass_glass_through((glass_mode & 1) != 0);
+  film->set_denoising_pass_glass_matte((glass_mode & 2) != 0);
 }
 
 /* Render Layer */
