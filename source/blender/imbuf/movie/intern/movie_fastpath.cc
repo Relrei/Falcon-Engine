@@ -19,6 +19,8 @@
 #ifdef WITH_FFMPEG
 
 #  include <algorithm>
+#  include <cfloat>
+#  include <climits>
 #  include <cmath>
 
 #  include "BLI_fileops.h"
@@ -48,6 +50,53 @@ static const double FPS_TOLERANCE = 1e-3;
 
 /** 焼き直す区間の復号を、頭より何コマ手前から始めるか(上の理由)。 */
 static const int FASTPATH_SEEK_MARGIN = 64;
+
+/** 出力の time base(= 1コマの長さ)。通常の書き出し(`movie_write.cc` の `ffmpeg_start`)と
+ * **同じ結果**になるように決める。
+ *
+ * ★`AVRational{int(frs_sec_base), frs_sec}` では 1.001 の小数が切り捨てられ、29.97 / 23.976 /
+ * 59.94 fps が 30 / 24 / 60 fps と名乗ってしまう(1.001 → 1)。通常の書き出しは小数を整数へ
+ * 寄せる `calc_time_base()`(`movie_write.cc` の static なので、ここへ写してある)を通す。
+ * 手順は `ffmpeg_start` の time_base の決め方そのまま:
+ *   1. `frs_sec_base` が整数ならそのまま、そうでなければ `calc_time_base`
+ *   2. 分子が 1 でなければ、割り切れる範囲で約分 */
+static AVRational output_time_base(const RenderData *rd, AVCodecID codec_id)
+{
+  AVRational time_base;
+  if (float(int(rd->frs_sec_base)) == rd->frs_sec_base) {
+    time_base.den = rd->frs_sec;
+    time_base.num = int(rd->frs_sec_base);
+  }
+  else {
+    /* `calc_time_base()` の写し。 */
+    double num = rd->frs_sec_base;
+    unsigned int den = rd->frs_sec;
+    float eps = FLT_EPSILON;
+    const unsigned int DENUM_MAX = (codec_id == AV_CODEC_ID_MPEG4) ? (1UL << 16) - 1 :
+                                                                     (1UL << 31) - 1;
+    if (num > 1.0) {
+      const unsigned int num_integer_bits = log2_floor_u(unsigned(num));
+      eps = float(1 << num_integer_bits) * FLT_EPSILON;
+    }
+    const int max_num_shift = fabsf(log10f(eps));
+    const int max_den_shift = log10f(DENUM_MAX) - log10f(den);
+    const int max_iter = min_ii(max_num_shift, max_den_shift);
+    for (int i = 0; i < max_iter && fabs(num - round(num)) > eps; i++) {
+      num *= 10;
+      den *= 10;
+      eps *= 10;
+    }
+    time_base.den = den;
+    time_base.num = int(num);
+  }
+  if (time_base.num != 1) {
+    AVRational reduced;
+    if (av_reduce(&reduced.num, &reduced.den, time_base.num, time_base.den, INT_MAX)) {
+      time_base = reduced;
+    }
+  }
+  return time_base;
+}
 
 #  define FAIL(...) \
     do { \
@@ -385,6 +434,7 @@ struct Reencoder {
 static bool reencoder_open_encoder(const SourceInfo &src,
                                    int source_index,
                                    const RenderData *rd,
+                                   const AVRational time_base,
                                    Reencoder *re,
                                    char *r_reason,
                                    int reason_maxncpy)
@@ -443,8 +493,8 @@ static bool reencoder_open_encoder(const SourceInfo &src,
     re->enc->width = par->width;
     re->enc->height = par->height;
     re->enc->pix_fmt = AVPixelFormat(par->format);
-    re->enc->time_base = AVRational{int(rd->frs_sec_base), rd->frs_sec};
-    re->enc->framerate = AVRational{rd->frs_sec, int(rd->frs_sec_base)};
+    re->enc->time_base = time_base;
+    re->enc->framerate = av_inv_q(time_base);
     re->enc->sample_aspect_ratio = par->sample_aspect_ratio;
     re->enc->color_range = AVColorRange(par->color_range);
     re->enc->colorspace = AVColorSpace(par->color_space);
@@ -455,6 +505,12 @@ static bool reencoder_open_encoder(const SourceInfo &src,
     re->enc->max_b_frames = 0;
     /* 焼き直すのは常に区間の頭からなので、毎コマがキーフレームでなくてよい。 */
     re->enc->gop_size = 12;
+    /* ★ビットレートは 0(= 品質指定の crf / cq に任せる)。立てないと `AVCodecContext` の
+     * 既定 200kbit/s のままになり、NVENC・libvpx・mpeg4 の焼き直しは crf/cq が効かず
+     * 200kbit/s に固定される。通常の書き出しも品質指定の時は `c->bit_rate = 0`
+     * (`set_quality_rate_options`)。辞書へ "b:v" を入れても効かない("b:v" は ffmpeg コマンドの
+     * 書き方で、`AVCodecContext` の option 名は "b")。 */
+    re->enc->bit_rate = 0;
     /* ★これを立てないと符号化器は Annex-B(開始符号つき)で出す。mp4 は
      * 「長さ + NAL」なので、そのまま入れると復号側が長さとして開始符号を読み、
      * `Invalid NAL unit size 17039362` になる(実測。焼き直した区間だけ壊れた)。
@@ -479,8 +535,8 @@ static bool reencoder_open_encoder(const SourceInfo &src,
       av_dict_set(&opts, "preset", "p5", 0);
       av_dict_set(&opts, "rc", "vbr", 0);
       av_dict_set_int(&opts, "cq", std::min(base_crf + cq_offset, 51), 0);
-      /* ⚠ これが無いと cq は一切効かず、既定のビットレートで黙って符号化される。 */
-      av_dict_set(&opts, "b:v", "0", 0);
+      /* ⚠ `bit_rate = 0` が無いと cq は一切効かず、既定のビットレートで黙って符号化される
+       * (上の `re->enc->bit_rate = 0`)。 */
     }
     else {
       av_dict_set_int(&opts, "crf", base_crf, 0);
@@ -926,6 +982,63 @@ static bool write_reencode_piece(SourceInfo &src,
   return true;
 }
 
+/** 音の符号化器に残っているぶんを出し切って書く。
+ *
+ * ★AAC などの符号化器は、内部に数コマぶん(先頭の 1024 標本の遅れなど)を抱えたまま
+ * 止まる。空送り(`nullptr`)で吐き出させないと、**最後の音のコマが落ちる**。
+ * 通常の書き出しは `flush_delayed_frames()` でやっているが、`movie_write.cc` の static
+ * なので、ここへ同じ手順を置く。書き終えてから `av_write_trailer` を呼ぶこと。 */
+static void audio_flush_delayed(MovieWriter *audio_ctx)
+{
+  AVCodecContext *c = audio_ctx->audio_codec;
+  AVStream *stream = audio_ctx->audio_stream;
+  if (c == nullptr || stream == nullptr) {
+    return;
+  }
+
+  AVPacket *packet = av_packet_alloc();
+  avcodec_send_frame(c, nullptr);
+  while (true) {
+    const int ret = avcodec_receive_packet(c, packet);
+    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+      /* 出し切った。 */
+      break;
+    }
+    if (ret < 0) {
+      char error_str[AV_ERROR_MAX_STRING_SIZE];
+      av_make_error_string(error_str, AV_ERROR_MAX_STRING_SIZE, ret);
+      CLOG_ERROR(&LOG, "Error encoding delayed audio frame: %s", error_str);
+      break;
+    }
+
+    packet->stream_index = stream->index;
+    av_packet_rescale_ts(packet, c->time_base, stream->time_base);
+#  ifdef FFMPEG_USE_DURATION_WORKAROUND
+    my_guess_pkt_duration(audio_ctx->outfile, stream, packet);
+#  endif
+    if (av_interleaved_write_frame(audio_ctx->outfile, packet) != 0) {
+      CLOG_ERROR(&LOG, "Error writing delayed audio frame");
+      break;
+    }
+  }
+  av_packet_free(&packet);
+}
+
+/** `alloc_audio_stream` が確保した符号化器と入力の緩衝を解放する
+ * (通常の書き出しは `end_ffmpeg_impl` で解放している)。ストリームは出力側が持つ。 */
+static void audio_free(MovieWriter *audio_ctx)
+{
+  avcodec_free_context(&audio_ctx->audio_codec);
+  if (audio_ctx->audio_input_buffer != nullptr) {
+    av_free(audio_ctx->audio_input_buffer);
+    audio_ctx->audio_input_buffer = nullptr;
+  }
+  if (audio_ctx->audio_deinterleave_buffer != nullptr) {
+    av_free(audio_ctx->audio_deinterleave_buffer);
+    audio_ctx->audio_deinterleave_buffer = nullptr;
+  }
+}
+
 /** \} */
 
 /* -------------------------------------------------------------------- */
@@ -983,10 +1096,20 @@ bool MOV_fastpath_write(const Scene *scene,
   }
 
   if (rd->xsch != first->width || rd->ysch != first->height) {
+    /* ★`first` は素材の `codecpar` を指していて、`close_all()` で解放される。閉じる前に控える。 */
+    const int src_width = first->width;
+    const int src_height = first->height;
     close_all();
-    FAIL("Output is %dx%d but the source is %dx%d", rd->xsch, rd->ysch, first->width, first->height);
+    FAIL("Output is %dx%d but the source is %dx%d", rd->xsch, rd->ysch, src_width, src_height);
   }
-  const double scene_fps = double(rd->frs_sec) / double(rd->frs_sec_base);
+  /* ★出力の time base は通常の書き出しと同じ決め方(`output_time_base`)。fps の突き合わせも
+   * その time base から出して、タグに書く値と食い違わないようにする。 */
+  const AVRational out_time_base = output_time_base(rd, first->codec_id);
+  if (out_time_base.num <= 0 || out_time_base.den <= 0) {
+    close_all();
+    FAIL("The frame rate cannot be expressed as a time base");
+  }
+  const double scene_fps = 1.0 / av_q2d(out_time_base);
   if (fabs(scene_fps - sources[0].fps) > FPS_TOLERANCE) {
     close_all();
     FAIL("Output is %.4f fps but the source is %.4f fps", scene_fps, sources[0].fps);
@@ -1034,14 +1157,16 @@ bool MOV_fastpath_write(const Scene *scene,
   for (const Piece &p : pieces) {
     need_reencode |= (p.kind == PieceKind::Reencode);
   }
-  if (need_reencode && !reencoder_open_encoder(sources[0], 0, rd, &re, r_reason, reason_maxncpy)) {
+  if (need_reencode &&
+      !reencoder_open_encoder(sources[0], 0, rd, out_time_base, &re, r_reason, reason_maxncpy))
+  {
     close_all();
     return false;
   }
 
   /* 段3: 1本の muxer へ流す。 */
   OutputStream out;
-  out.frame_tb = AVRational{int(rd->frs_sec_base), rd->frs_sec};
+  out.frame_tb = out_time_base;
   if (avformat_alloc_output_context2(&out.fmt, nullptr, nullptr, out_path) < 0 ||
       out.fmt == nullptr)
   {
@@ -1073,7 +1198,7 @@ bool MOV_fastpath_write(const Scene *scene,
   out.stream->codecpar->color_trc = AVCOL_TRC_BT709;
   out.stream->codecpar->color_space = AVCOL_SPC_BT709;
   out.stream->time_base = out.frame_tb;
-  out.stream->avg_frame_rate = AVRational{rd->frs_sec, int(rd->frs_sec_base)};
+  out.stream->avg_frame_rate = av_inv_q(out_time_base);
 
   /* ★パラメータ集合を区間の頭へ貼り直すのが要るのは H.264/H.265 だけ。
    * VP9 と AV1 はキーフレームが自分で完結しているので、貼る物が無くても
@@ -1160,7 +1285,9 @@ bool MOV_fastpath_write(const Scene *scene,
     SourceInfo &src = sources[piece.cut_index];
     Vector<uint8_t> enc_param_sets;
     if (piece.kind == PieceKind::Reencode) {
-      if (!reencoder_open_encoder(src, piece.cut_index, rd, &re, r_reason, reason_maxncpy)) {
+      if (!reencoder_open_encoder(
+              src, piece.cut_index, rd, out_time_base, &re, r_reason, reason_maxncpy))
+      {
         ok = false;
         break;
       }
@@ -1201,6 +1328,10 @@ bool MOV_fastpath_write(const Scene *scene,
   if (want_audio) {
     movie_audio_close(&audio_ctx, false);
   }
+  if (ok && want_audio) {
+    /* ★符号化器に残った音を出し切る。順番は通常と同じで、trailer の前。 */
+    audio_flush_delayed(&audio_ctx);
+  }
   if (ok) {
     av_write_trailer(out.fmt);
   }
@@ -1208,6 +1339,9 @@ bool MOV_fastpath_write(const Scene *scene,
     avio_closep(&out.fmt->pb);
   }
   avformat_free_context(out.fmt);
+  if (want_audio) {
+    audio_free(&audio_ctx);
+  }
   close_all();
 
   if (!ok) {

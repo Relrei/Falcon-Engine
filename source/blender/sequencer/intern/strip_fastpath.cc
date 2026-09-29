@@ -10,6 +10,7 @@
 #include <cstdlib>
 
 #include "BLI_listbase.h"
+#include "BLI_math_base.h"
 #include "BLI_path_utils.hh"
 #include "BLI_string.h"
 
@@ -22,6 +23,7 @@
 #include "SEQ_channels.hh"
 #include "SEQ_fastpath.hh"
 #include "SEQ_sequencer.hh"
+#include "SEQ_time.hh"
 
 namespace blender::seq {
 
@@ -35,7 +37,10 @@ namespace blender::seq {
  *
  * 判定の順は「直しやすい物から」。最初に当たった1件だけを理由として返す。
  */
-static bool strip_is_plain_cut(const Strip *strip, char *r_reason, int reason_maxncpy)
+static bool strip_is_plain_cut(const Scene *scene,
+                               const Strip *strip,
+                               char *r_reason,
+                               int reason_maxncpy)
 {
   const char *n = strip->name + 2;
 
@@ -47,6 +52,21 @@ static bool strip_is_plain_cut(const Strip *strip, char *r_reason, int reason_ma
   }
   if (strip->data == nullptr || strip->data->stripdata == nullptr) {
     FAIL("Strip '%s' has no source file", n);
+  }
+  /* ★通常の描画は、この旗があると素材の絵を作り直す(飛び越し除去・浮動小数化)。
+   * パケットをそのまま流すと、その処理が丸ごと抜ける。 */
+  if (strip->flag & SEQ_DEINTERLACE) {
+    FAIL("Strip '%s' is deinterlaced", n);
+  }
+  if (strip->flag & SEQ_MAKE_FLOAT) {
+    FAIL("Strip '%s' is converted to float", n);
+  }
+  /* ★素材の色空間がシーケンサの作業空間と違うと、通常の描画は色空間を変換する。
+   * 同じ名前の時だけが「何もしない」変換なので、それ以外は通常の書き出しへ回す。 */
+  if (!STREQ(strip->data->colorspace_settings.name, scene->sequencer_colorspace_settings.name)) {
+    FAIL("Strip '%s' is in colour space '%s', which the normal render converts",
+         n,
+         strip->data->colorspace_settings.name);
   }
   if (const StripTransform *tr = strip->data->transform) {
     if (tr->xofs != 0.0f || tr->yofs != 0.0f) {
@@ -94,11 +114,18 @@ static bool strip_is_plain_cut(const Strip *strip, char *r_reason, int reason_ma
   if (strip->strobe != 0.0f && strip->strobe != 1.0f) {
     FAIL("Strip '%s' uses strobe", n);
   }
-  if (strip->retiming_keys_num > 2) {
+  /* ★2本でも止める。速度の変更(`strip_speed_set`)は**キー2本**で表され、その2本目の
+   * 係数が速度になる。`> 2` で通すと、速度を変えた素の1本が「切っただけ」に見える。 */
+  if (strip->retiming_keys_num > 0) {
     FAIL("Strip '%s' is retimed", n);
   }
   if (strip->speed_factor != 0.0f && strip->speed_factor != 1.0f) {
     FAIL("Strip '%s' plays at a changed speed", n);
+  }
+  /* ★ハンドルを素材の外へ引くと、通常の描画は端のコマを止めて見せる(ホールド)。
+   * こちらはパケットを進めるだけなので、別のコマ・ファイルの終わりに当たる。 */
+  if (strip->startofs < 0.0f || strip->endofs < 0.0f) {
+    FAIL("Strip '%s' holds its first or last frame past the source", n);
   }
   return true;
 }
@@ -121,6 +148,9 @@ static bool fastpath_enabled()
 
 bool fastpath_cuts_get(const Scene *scene,
                        const RenderData *rd,
+                       const int frame_start,
+                       const int frame_end,
+                       const int frame_step,
                        Vector<FastPathCut> &r_cuts,
                        char *r_reason,
                        int reason_maxncpy)
@@ -144,7 +174,8 @@ bool fastpath_cuts_get(const Scene *scene,
   if (rd->scemode & R_MULTIVIEW) {
     FAIL("Multi-view output cannot be copied straight through");
   }
-  if (rd->frame_step != 1) {
+  /* ★刻みは `rd` でなく、**実際に描く刻み**(`RE_RenderAnim` の引数)で見る。 */
+  if (frame_step != 1) {
     FAIL("Frame stepping needs the normal render");
   }
   /* Copying compressed packets cannot apply display transforms or animated edits.
@@ -165,6 +196,11 @@ bool fastpath_cuts_get(const Scene *scene,
   if ((rd->scemode & R_DOCOMP) && scene->compositing_node_group != nullptr) {
     FAIL("Scene compositing needs the normal render");
   }
+  /* ★通常の書き出しは、この条件で絵に文字(スタンプ)を焼き込む(`do_render_full_pipeline`)。
+   * パケットをそのまま流すと、その焼き込みが丸ごと抜ける。 */
+  if ((scene->r.stamp & R_STAMP_ALL) && (scene->r.stamp & R_STAMP_DRAW)) {
+    FAIL("Burning the stamp into the picture needs the normal render");
+  }
 
   Vector<const Strip *> strips;
   for (const Strip &strip : ed->seqbase) {
@@ -182,7 +218,7 @@ bool fastpath_cuts_get(const Scene *scene,
     if (ELEM(strip.type, STRIP_TYPE_SOUND, STRIP_TYPE_SOUND_HD)) {
       continue;
     }
-    if (!strip_is_plain_cut(&strip, r_reason, reason_maxncpy)) {
+    if (!strip_is_plain_cut(scene, &strip, r_reason, reason_maxncpy)) {
       return false;
     }
     strips.append(&strip);
@@ -207,11 +243,22 @@ bool fastpath_cuts_get(const Scene *scene,
   /* ★書くのは**レンダー範囲**であって、タイムライン全体ではない。
    *
    * ここを見ていないと、開始/終了を絞って書き出したのに**タイムラインの全部**が
-   * 出る。しかも本数が違うだけで絵は正しいので、書き出しが終わるまで気づけない。 */
-  const int range_start = rd->sfra;
-  const int range_end = rd->efra + 1; /* 終端は開いた区間で持つ。 */
+   * 出る。しかも本数が違うだけで絵は正しいので、書き出しが終わるまで気づけない。
+   *
+   * ★範囲は `rd->sfra/efra` でなく、**呼び出し側が実際に描く範囲**(`RE_RenderAnim` の
+   * `sfra/efra`)で取る。`blender -f N` や、操作の開始/終了フレームの指定は
+   * シーンの範囲と違う。 */
+  const int range_start = frame_start;
+  const int range_end = frame_end + 1; /* 終端は開いた区間で持つ。 */
   if (range_end <= range_start) {
     FAIL("The render range is empty");
+  }
+  /* ★通常の書き出しは、音を**シーンの開始から**混ぜて `(コマ - sfra + 1)` 秒ぶんまで
+   * 書く(`ffmpeg_movie_append`)。範囲の頭がシーンの開始と違う時は、こちらの音の長さが
+   * 通常と食い違うので、通常の書き出しへ回す。 */
+  if (frame_start != rd->sfra && rd->ffcodecdata.audio_codec_id_get() != FFMPEG_CODEC_ID_NONE) {
+    FAIL("The render range does not start at the scene start; the audio timing needs the "
+         "normal render");
   }
 
   const char *blendfile_path = BKE_main_blendfile_path_from_global();
@@ -235,8 +282,26 @@ bool fastpath_cuts_get(const Scene *scene,
     }
     covered_until = to;
 
+    /* ★素材のどのコマを取るかは、通常の描画(`seq_render_movie_strip_view`)と**同じ式**で決める。
+     * 素材のコマ = `give_frame_index()` を丸めた値 + `anim_startofs`。
+     * `anim_startofs` は「素材の頭から捨てるコマ数」で、ハード分割(`SPLIT_HARD`)は
+     * 右側のストリップの `start` を分割位置へ動かして、そのぶんをここへ積む。
+     * これを足さないと、分割した右側が**素材の頭から**再生される(絵は出るのでずれに
+     * 気づけない)。再生速度の倍率(`media_playback_rate_factor`)やホールドも
+     * `give_frame_index()` が面倒を見るので、頭と尻の両方を突き合わせ、1コマずつ
+     * 進まない(= 通常の描画と同じにならない)区間は通さない。 */
+    const int src_first = round_fl_to_int(give_frame_index(scene, strip, float(from))) +
+                          strip->anim_startofs;
+    const int src_last = round_fl_to_int(give_frame_index(scene, strip, float(to - 1))) +
+                         strip->anim_startofs;
+    if (src_first < 0 || src_last - src_first != to - from - 1) {
+      FAIL("Strip '%s' does not map one timeline frame to one source frame "
+           "(playback rate, hold frames or offsets)",
+           strip->name + 2);
+    }
+
     FastPathCut cut;
-    cut.in_frame = std::max(0, int(lround(from - strip->start)));
+    cut.in_frame = src_first;
     cut.n_frames = to - from;
     BLI_path_join(
         cut.path, sizeof(cut.path), strip->data->dirpath, strip->data->stripdata->filename);

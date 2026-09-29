@@ -15,6 +15,7 @@
 #include <atomic>
 #include <forward_list>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -230,9 +231,11 @@ static bool falcon_async_save_enabled()
 struct FalconPendingSave {
   std::thread thread;
   std::atomic<bool> ok{true};
+  /* 失敗した時の errno。`errno` はスレッドごとなので、作業スレッドで控えて回収時に読む。 */
+  std::atomic<int> err{0};
   std::string filepath;
   bool active = false;
-  /* EXR 経路かどうか(報告の文面と、回収時に出す保存メッセージが違う)。 */
+  /* EXR 経路かどうか。 */
   bool is_exr = false;
 };
 static FalconPendingSave g_falcon_pending_save;
@@ -254,23 +257,18 @@ static bool falcon_async_save_wait(ReportList *reports)
   g_falcon_pending_save.active = false;
 
   const bool ok = g_falcon_pending_save.ok.load();
-  if (g_falcon_pending_save.is_exr) {
-    /* EXR は書き手へ reports を渡していない(作業スレッドから触らせない)ので、
-     * 成否の報告はここ=本体スレッドで出す。 */
-    if (ok) {
-      CLOG_INFO_NOCHECK(&LOG, "Saved: '%s'", g_falcon_pending_save.filepath.c_str());
-    }
-    else {
-      BKE_reportf(reports,
-                  RPT_ERROR,
-                  "Render error: cannot save image, path \"%s\"",
-                  g_falcon_pending_save.filepath.c_str());
-    }
+  /* 書き手へは reports を渡していない(作業スレッドから触らせない)ので、成否の報告は
+   * ここ=本体スレッドで出す。文面は通常の経路(`image_render_print_save_message`)と同じ:
+   * 成功は `Saved: '<path>'`(レンダーファームのスクリプトがこの行を読む)、
+   * 失敗は errno つきのエラー。画像も EXR も同じ。 */
+  if (ok) {
+    CLOG_INFO_NOCHECK(&LOG, "Saved: '%s'", g_falcon_pending_save.filepath.c_str());
   }
-  else if (!ok) {
+  else {
     BKE_reportf(reports,
                 RPT_ERROR,
-                "Render error: cannot save image, path \"%s\"",
+                "Render error (%s) cannot save: '%s'",
+                std::strerror(g_falcon_pending_save.err.load()),
                 g_falcon_pending_save.filepath.c_str());
   }
   return ok;
@@ -291,11 +289,14 @@ static void falcon_async_save_submit(ImBuf *ibuf,
   std::string path = filepath;
   g_falcon_pending_save.filepath = path;
   g_falcon_pending_save.ok.store(true);
+  g_falcon_pending_save.err.store(0);
   g_falcon_pending_save.active = true;
   g_falcon_pending_save.is_exr = false;
   g_falcon_pending_save.thread = std::thread([ibuf, path, format]() {
     const double t0 = BLI_time_now_seconds();
     const bool ok = BKE_imbuf_write(ibuf, path.c_str(), format);
+    /* 直後に控える(下のログが errno を書き換えうる)。 */
+    g_falcon_pending_save.err.store(ok ? 0 : errno);
     falcon_vse_log("async_save_worker", t0);
     g_falcon_pending_save.ok.store(ok);
     IMB_freeImBuf(ibuf);
@@ -441,6 +442,7 @@ static void falcon_async_save_submit_exr(RenderResult *rr_copy,
   std::string view_name = view ? view : "";
   g_falcon_pending_save.filepath = path;
   g_falcon_pending_save.ok.store(true);
+  g_falcon_pending_save.err.store(0);
   g_falcon_pending_save.active = true;
   g_falcon_pending_save.is_exr = true;
   g_falcon_pending_save.thread = std::thread(
@@ -448,6 +450,8 @@ static void falcon_async_save_submit_exr(RenderResult *rr_copy,
         const double t0 = BLI_time_now_seconds();
         const bool ok = BKE_image_render_write_exr(
             nullptr, rr_copy, path.c_str(), format, save_as_render, view_name.c_str(), -1);
+        /* 直後に控える(下のログが errno を書き換えうる)。 */
+        g_falcon_pending_save.err.store(ok ? 0 : errno);
         falcon_vse_log("async_save_worker_exr", t0);
         g_falcon_pending_save.ok.store(ok);
         falcon_render_result_snapshot_free(rr_copy);
@@ -2285,8 +2289,16 @@ void RE_RenderFrame(Render *re,
 {
   /* Falcon: give the allocator's buffers back to the OS when this render ends,
    * but only if it is the outermost one (Falcon LT renders extra passes from
-   * inside). `FALCON_MEM_RECLAIM=0` to skip. */
-  const blender::bke::MemReclaimScope falcon_mem_reclaim_scope("render");
+   * inside). `FALCON_MEM_RECLAIM=0` to skip.
+   *
+   * ★ユーザーが始めたレンダー(呼び出し側が `RE_SetReports` で報告先を渡している)だけを
+   * 数える。シーケンサーがシーンストリップを描く時の入れ子(`seq_render_scene_strip`)は
+   * 報告先を持たず、プレビュー・先読みのスレッドでは深さが 0 から始まるので、数えると
+   * **ストリップ1コマごとに**メモリを返して取り直すことになる。 */
+  std::optional<blender::bke::MemReclaimScope> falcon_mem_reclaim_scope;
+  if (re->reports != nullptr) {
+    falcon_mem_reclaim_scope.emplace("render");
+  }
 
   CLOG_INFO(&LOG, "Rendering frame %d", frame);
 
@@ -3000,8 +3012,12 @@ void RE_RenderAnim(Render *re,
 {
   /* Falcon: give the allocator's buffers back to the OS when this render ends,
    * but only if it is the outermost one (Falcon LT renders extra passes from
-   * inside). `FALCON_MEM_RECLAIM=0` to skip. */
-  const blender::bke::MemReclaimScope falcon_mem_reclaim_scope("render-anim");
+   * inside). `FALCON_MEM_RECLAIM=0` to skip.
+   * ユーザーが始めたレンダー(報告先あり)だけを数える。理由は `RE_RenderFrame` 側を参照。 */
+  std::optional<blender::bke::MemReclaimScope> falcon_mem_reclaim_scope;
+  if (re->reports != nullptr) {
+    falcon_mem_reclaim_scope.emplace("render-anim");
+  }
 
   FalconExportTimer falcon_export_timer(scene);
 
@@ -3073,6 +3089,17 @@ void RE_RenderAnim(Render *re,
 
   /* 非同期保存にしたコマの render_write を持ち越しているか。 */
   bool falcon_write_cb_pending = false;
+  /* 持ち越している render_write の**コマ番号**。呼ぶ時にはループがもう先へ進んでいる
+   * (次のコマ、最後のコマなら `efra + 1`)ので、ハンドラが `scene.frame_current` で
+   * 書き終わったコマを読めるよう、呼ぶ間だけ `scene->r.cfra` をこのコマへ戻す。 */
+  int falcon_write_cb_frame = 0;
+  auto falcon_exec_deferred_write_cb = [&]() {
+    falcon_write_cb_pending = false;
+    const int cfra_loop = scene->r.cfra;
+    scene->r.cfra = falcon_write_cb_frame;
+    render_callback_exec_id(re, re->main, &scene->id, BKE_CB_EVT_RENDER_WRITE);
+    scene->r.cfra = cfra_loop;
+  };
 
   render_init_depsgraph(re);
 
@@ -3083,7 +3110,9 @@ void RE_RenderAnim(Render *re,
     Vector<seq::FastPathCut> cuts;
     char reason[512];
     MovieFastPathReport fp_report;
-    if (seq::fastpath_cuts_get(scene, &rd, cuts, reason, sizeof(reason))) {
+    /* ★範囲と刻みは `rd` でなく、この関数が実際に回す `sfra/efra/tfra` を渡す
+     * (`blender -f N` や操作のフレーム範囲は、シーンの範囲と違う)。 */
+    if (seq::fastpath_cuts_get(scene, &rd, sfra, efra, tfra, cuts, reason, sizeof(reason))) {
       Vector<MovieFastPathCut> mov_cuts;
       for (const seq::FastPathCut &cut : cuts) {
         mov_cuts.append({cut.path, cut.in_frame, cut.n_frames});
@@ -3374,8 +3403,7 @@ void RE_RenderAnim(Render *re,
           G.is_break = true;
         }
         if (falcon_write_cb_pending) {
-          falcon_write_cb_pending = false;
-          render_callback_exec_id(re, re->main, &scene->id, BKE_CB_EVT_RENDER_WRITE);
+          falcon_exec_deferred_write_cb();
         }
 
         const double falcon_t_write = BLI_time_now_seconds();
@@ -3426,8 +3454,9 @@ void RE_RenderAnim(Render *re,
       render_callback_exec_id(re, re->main, &scene->id, BKE_CB_EVT_RENDER_POST);
       if (should_write) {
         if (falcon_async_save_pending()) {
-          /* まだ書き終わっていない。次の回収まで持ち越す。 */
+          /* まだ書き終わっていない。次の回収まで持ち越す(コマ番号も控える)。 */
           falcon_write_cb_pending = true;
+          falcon_write_cb_frame = scene->r.cfra;
         }
         else {
           render_callback_exec_id(re, re->main, &scene->id, BKE_CB_EVT_RENDER_WRITE);
@@ -3441,8 +3470,7 @@ void RE_RenderAnim(Render *re,
     G.is_break = true;
   }
   if (falcon_write_cb_pending) {
-    falcon_write_cb_pending = false;
-    render_callback_exec_id(re, re->main, &scene->id, BKE_CB_EVT_RENDER_WRITE);
+    falcon_exec_deferred_write_cb();
   }
 
   /* end movie */
