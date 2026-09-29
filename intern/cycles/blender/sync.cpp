@@ -776,6 +776,17 @@ void BlenderSync::sync_film(blender::ViewLayer &b_view_layer,
   }
   film->set_denoising_pass_glass_through((glass_mode & 1) != 0);
   film->set_denoising_pass_glass_matte((glass_mode & 2) != 0);
+
+  /* How rough a glass closure may be and still count as smooth glass (0 = only a perfectly sharp
+   * one, the default; 1 / 2 / 3 = shader roughness up to 0.05 / 0.1 / 0.2). A glass with even a
+   * little roughness is not smooth to the guides above, and then none of the modes applies. */
+  int glass_smooth_level = 0;
+  if (active_dlss && glass_mode != 0) {
+    if (const char *value = getenv("FALCON_DLSS_GLASS_ROUGH")) {
+      glass_smooth_level = clamp(atoi(value), 0, 3);
+    }
+  }
+  film->set_denoising_pass_glass_smooth_level(glass_smooth_level);
 }
 
 /* Render Layer */

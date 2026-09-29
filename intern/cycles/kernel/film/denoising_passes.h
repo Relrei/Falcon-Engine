@@ -17,6 +17,23 @@ CCL_NAMESPACE_BEGIN
 #  define FALCON_GLASS_SMOOTH_ROUGHNESS_SQ 2e-10f
 #endif
 
+/* Squared GGX roughness (alpha_x * alpha_y) up to which a glass closure counts as smooth, by the
+ * level in bits 5..7 of the denoising options (FALCON_DLSS_GLASS_ROUGH). The levels are given as
+ * the roughness of the shader node (alpha = roughness^2). */
+ccl_device_forceinline float falcon_glass_smooth_roughness_sq(const int options_flag)
+{
+  switch ((options_flag >> DENOISING_PASS_GLASS_SMOOTH_SHIFT) & 7) {
+    case 1:
+      return 6.25e-6f; /* roughness 0.05 */
+    case 2:
+      return 1e-4f; /* roughness 0.1 */
+    case 3:
+      return 1.6e-3f; /* roughness 0.2 */
+    default:
+      return FALCON_GLASS_SMOOTH_ROUGHNESS_SQ;
+  }
+}
+
 /* Diffuse albedo the glass matte guides describe the glass surface with (the same value the RR
  * guide suggests for pixels with nothing to tell, such as sky). */
 #ifndef FALCON_GLASS_MATTE_ALBEDO
@@ -127,6 +144,8 @@ ccl_device_forceinline void film_write_denoising_features_surface(KernelGlobals 
   float sum_nonspecular_weight = 0.0f;
   /* Weight of the smooth (delta) glass / refraction closures, for the glass through-guides. */
   float smooth_glass_weight = 0.0f;
+  const float glass_smooth_roughness_sq = falcon_glass_smooth_roughness_sq(
+      kernel_data.film.denoising_pass_options_flag);
   bool has_transmission = false;
 
   for (int i = 0; i < sd->num_closure; i++) {
@@ -161,7 +180,7 @@ ccl_device_forceinline void film_write_denoising_features_surface(KernelGlobals 
     const float roughness = sqrtf(bsdf_get_specular_roughness_squared(sc));
 
     if ((CLOSURE_IS_GLASS(sc->type) || CLOSURE_IS_REFRACTION(sc->type)) &&
-        bsdf_get_specular_roughness_squared(sc) <= FALCON_GLASS_SMOOTH_ROUGHNESS_SQ)
+        bsdf_get_specular_roughness_squared(sc) <= glass_smooth_roughness_sq)
     {
       smooth_glass_weight += closure_weight;
     }

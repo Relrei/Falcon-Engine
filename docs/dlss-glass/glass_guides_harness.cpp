@@ -26,6 +26,7 @@ void transform_inverse_cpu_avx2(const Transform &, Transform &) {}
 }  // namespace ccl
 
 static int g_fail = 0;
+static int g_level = 0; /* glass smooth level (bits 5..7 of the options) */
 #define CHECK(cond, ...) do { if (!(cond)) { g_fail++; printf("  FAIL: "); printf(__VA_ARGS__); printf("\n"); } else { printf("  ok:   "); printf(__VA_ARGS__); printf("\n"); } } while (0)
 
 static const int STRIDE = 32;
@@ -54,7 +55,8 @@ static void setup(Ctx &c, bool gtg, bool follow = false, bool matte = false)
   f.specular_hit_distance_far = 1e4f;
   f.denoising_pass_options_flag = (gtg ? DENOISING_PASS_GLASS_THROUGH : 0) |
                                   (matte ? DENOISING_PASS_GLASS_MATTE : 0) |
-                                  (follow ? DENOISING_PASS_FOLLOW_REFLECTIONS : 0);
+                                  (follow ? DENOISING_PASS_FOLLOW_REFLECTIONS : 0) |
+                                  (g_level << DENOISING_PASS_GLASS_SMOOTH_SHIFT);
   kg->data.cam.type = CAMERA_PERSPECTIVE;
   kg->data.cam.worldtocamera = transform_identity();
   memset(c.state, 0, sizeof(IntegratorStateCPU));
@@ -334,6 +336,33 @@ int main()
   set_glass(c.sd, 5.0f, 0.0f);
   film_write_denoising_features_surface(c.kg, c.state, c.sd, px(c), false);
   CHECK(c.buf[P_SPEC_ALBEDO] == 1.0f, "stock guides with following reflections");
+
+  printf("== T14 slightly rough glass (roughness 0.07, alpha 0.0049): smooth only with a level that allows it ==\n");
+  g_level = 0;
+  setup(c, true);
+  set_glass(c.sd, 5.0f, 0.0049f);
+  film_write_denoising_features_surface(c.kg, c.state, c.sd, px(c), false);
+  CHECK(!(c.state->path.flag & PATH_RAY_GLASS_PENDING) && !all_zero(c), "level 0: not smooth, stock guides");
+  g_level = 1; /* roughness up to 0.05: still not */
+  setup(c, true);
+  set_glass(c.sd, 5.0f, 0.0049f);
+  film_write_denoising_features_surface(c.kg, c.state, c.sd, px(c), false);
+  CHECK(!(c.state->path.flag & PATH_RAY_GLASS_PENDING), "level 1 (<= 0.05): still not smooth");
+  g_level = 2; /* roughness up to 0.1: yes */
+  setup(c, true);
+  set_glass(c.sd, 5.0f, 0.0049f);
+  film_write_denoising_features_surface(c.kg, c.state, c.sd, px(c), false);
+  CHECK(c.state->path.flag & PATH_RAY_GLASS_PENDING && all_zero(c), "level 2 (<= 0.1): smooth, held back");
+  g_level = 3; /* roughness up to 0.2 */
+  setup(c, false, false, true);
+  set_glass(c.sd, 5.0f, 0.0049f);
+  film_write_denoising_features_surface(c.kg, c.state, c.sd, px(c), false);
+  CHECK(fabsf(c.buf[P_ALBEDO] - 0.5f) < 1e-3f, "level 3 with the matte mode: matte guides");
+  setup(c, true);
+  set_glass(c.sd, 5.0f, 0.5f); /* roughness ~0.84 */
+  film_write_denoising_features_surface(c.kg, c.state, c.sd, px(c), false);
+  CHECK(!(c.state->path.flag & PATH_RAY_GLASS_PENDING), "level 3: a really rough glass is still not smooth");
+  g_level = 0;
 
   printf("\n%s (%d failed)\n", g_fail ? "FAILED" : "ALL PASSED", g_fail);
   return g_fail ? 1 : 0;

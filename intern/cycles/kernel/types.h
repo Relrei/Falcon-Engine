@@ -496,6 +496,9 @@ enum DenoisingPassFlag {
   DENOISING_PASS_GLASS_THROUGH = (1 << 3),
   /* Falcon glass matte guides: constant, diffuse-like guides for smooth glass (RR guide 3.5). */
   DENOISING_PASS_GLASS_MATTE = (1 << 4),
+  /* Bits 5..7 (shift, then a 3 bit level): how rough a glass closure may be and still count as
+   * smooth glass for the glass guides. 0 = only a perfectly sharp one. */
+  DENOISING_PASS_GLASS_SMOOTH_SHIFT = 5,
 };
 
 /* Closure Filter */

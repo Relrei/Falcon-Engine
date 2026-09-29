@@ -130,6 +130,7 @@ NODE_DEFINE(Film)
   SOCKET_BOOLEAN(denoising_pass_psr, "Denoising Pass Primary Surface Replacement", false);
   SOCKET_BOOLEAN(denoising_pass_glass_through, "Denoising Pass Glass Through", false);
   SOCKET_BOOLEAN(denoising_pass_glass_matte, "Denoising Pass Glass Matte", false);
+  SOCKET_INT(denoising_pass_glass_smooth_level, "Denoising Pass Glass Smooth Level", 0);
 
   return type;
 }
@@ -494,6 +495,8 @@ void Film::device_update(Device *device, DeviceScene *dscene, Scene *scene)
   if (denoising_pass_glass_matte) {
     kfilm->denoising_pass_options_flag |= DENOISING_PASS_GLASS_MATTE;
   }
+  kfilm->denoising_pass_options_flag |= (clamp(denoising_pass_glass_smooth_level, 0, 7)
+                                         << DENOISING_PASS_GLASS_SMOOTH_SHIFT);
 
   clear_modified();
 }
