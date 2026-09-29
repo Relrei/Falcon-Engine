@@ -100,11 +100,16 @@ ccl_device_inline float falcon_error_lookup(ccl_global const float *field,
  * flux (bright squares floating off-surface). A second, input-decorrelated
  * hash of the SAME grid coords is stored in the count field as
  * 1.0 + tag * 2^-20 (exactly representable; still >= 1.0 for the generic
- * validity test, and the SHARC mean-lookup's divide is off by at most 1e-6).
- * The photon lookup recomputes the expected tag and rejects mismatched cells,
- * turning collision false-positives into holes the gather fills from valid
- * neighbors. Same-cell rewrites are idempotent; a real collision leaves the
- * last writer's tag so at least one site rejects the mixed cell. */
+ * validity test). That count field is a TAG in [1, 2), not a sample count, so a
+ * photon-format cache must never be read through falcon_sharc_lookup: its mean
+ * divide would dim by up to 2x (and the addressing differs too -- photon cells
+ * use falcon_photon_slot probing). The two formats share one buffer and are not
+ * meant to run together (see scene/integrator.cpp: SHARC blend/warmup vs photon
+ * add/bake), so nothing distinguishes them at lookup time. The photon lookup
+ * recomputes the expected tag and rejects mismatched cells, turning collision
+ * false-positives into holes the gather fills from valid neighbors. Same-cell
+ * rewrites are idempotent; a real collision leaves the last writer's tag so at
+ * least one site rejects the mixed cell. */
 ccl_device_inline float falcon_photon_tag(const uint gx, const uint gy, const uint gz)
 {
   const uint t = hash_uint3(gx ^ 0x517cc1b7u, gy ^ 0x27220a95u, gz ^ 0xfe4db3afu) & 0xFFFFFu;
@@ -125,6 +130,10 @@ ccl_device_inline float falcon_photon_tag(const uint gx, const uint gy, const ui
  * that collide at i=0 do not walk the same chain afterwards. Making it odd
  * keeps the chain inside the whole table (the size is a power of two). */
 #define FALCON_PHOTON_PROBES 4
+
+/* Upper limit of the wide deposit radius, in cells. Same 8 as the RNA slider and
+ * the host clamp of FALCON_PHOTON_RADIUS (scene/integrator.cpp). */
+#define FALCON_PHOTON_RADIUS_MAX_CELLS 8.0f
 
 ccl_device_inline uint falcon_photon_slot(const uint gx, const uint gy, const uint gz, const int i)
 {
@@ -217,10 +226,16 @@ ccl_device_inline int falcon_photon_slot_read(ccl_global const float *cache,
 ccl_device_inline void falcon_photon_deposit_wide(ccl_global float *cache,
                                                   const float3 P,
                                                   const float cell_size,
-                                                  const float radius_cells,
+                                                  const float radius_cells_in,
                                                   const float3 flux_albedo,
                                                   const int normal_axis)
 {
+  /* The loop below walks (2*ceil(r)+1)^3 cells per photon, so the cost is
+   * cubic in r. The host clamps FALCON_PHOTON_RADIUS to 8, but
+   * FALCON_PHOTON_CONTACT_RADIUS reaches here unclamped, and a big value hangs
+   * the GPU until the watchdog fires. Same limit here, so it holds for either
+   * source; inside 0..8 this is a no-op. */
+  const float radius_cells = fminf(radius_cells_in, FALCON_PHOTON_RADIUS_MAX_CELLS);
   const float inv = 1.0f / cell_size;
   const float r = radius_cells * cell_size;
   /* Two divisions by pi, and they are not the same pi. The first normalizes the
@@ -607,12 +622,30 @@ ccl_device_inline bool falcon_photon_point_lookup(ccl_global const float *points
   const int bz = (int)floorf(P.z * inv);
   float3 acc = make_float3(0.0f, 0.0f, 0.0f);
   bool any = false;
+  /* Slots of the non-empty neighbour cells visited so far. Two of the 27 cells
+   * can hash to the same slot (~1e-4 of lookups); scanning that slot twice would
+   * count its photons twice, so a slot already gathered is skipped. Empty slots
+   * contribute nothing and are not recorded, so this costs nothing where the
+   * neighbourhood is empty. */
+  uint seen[27];
+  int num_seen = 0;
   for (int dx = -1; dx <= 1; dx++) {
     for (int dy = -1; dy <= 1; dy++) {
       for (int dz = -1; dz <= 1; dz++) {
         const uint key = falcon_photon_grid_key(bx + dx, by + dy, bz + dz);
-        const uint start = grid_start[key];
         const uint count = grid_count[key];
+        if (count == 0) {
+          continue;
+        }
+        bool duplicate = false;
+        for (int k = 0; k < num_seen; k++) {
+          duplicate |= (seen[k] == key);
+        }
+        if (duplicate) {
+          continue;
+        }
+        seen[num_seen++] = key;
+        const uint start = grid_start[key];
         for (uint i = 0; i < count; i++) {
           ccl_global const float *p = points +
                                       (size_t)grid_index[start + i] * FALCON_PHOTON_POINT_STRIDE;
