@@ -10,6 +10,13 @@
 
 CCL_NAMESPACE_BEGIN
 
+/* Squared GGX roughness (alpha_x * alpha_y) under which a glass / refraction closure counts as
+ * smooth for the glass through-guides. Same value as BSDF_ROUGHNESS_SQ_THRESH (removed from svm in
+ * Blender 5.2, kept for the dispersion gate in falcon_dispersion.h). */
+#ifndef FALCON_GLASS_SMOOTH_ROUGHNESS_SQ
+#  define FALCON_GLASS_SMOOTH_ROUGHNESS_SQ 2e-10f
+#endif
+
 #ifdef __DENOISING_FEATURES__
 ccl_device_forceinline float denoising_depth_compute(KernelGlobals kg,
                                                      IntegratorState state,
@@ -59,6 +66,14 @@ ccl_device_forceinline void film_write_denoising_specular_hit_distance(
     return;
   }
 
+  /* Falcon glass through-guides: the pixel's guides describe what is seen through the glass, and
+   * only some of the samples reflect. Their hit distance would flicker between 0 and a distance
+   * from frame to frame, and RR builds the reflection motion from it, so glass pixels get none
+   * (RR Integration Guide 3.4.1: keep depth, normal and specular hit distance consistent). */
+  if (path_flag & PATH_RAY_GLASS_SEEN) {
+    return;
+  }
+
   /* One bounce in, and that bounce was glossy: the ray that just ended started
    * on the primary surface and landed in the reflection. */
   if (INTEGRATOR_STATE(state, path, bounce) != 1 ||
@@ -72,11 +87,14 @@ ccl_device_forceinline void film_write_denoising_specular_hit_distance(
                          make_float3(ensure_finite(hit_distance), 1.0f, 0.0f));
 }
 
+/* `force_first`: write every guide as for a first surface hit even though this is not the first
+ * bounce. Only the glass through-guides ask for it (film_write_denoising_glass_resolve). */
 ccl_device_forceinline void film_write_denoising_features_surface(KernelGlobals kg,
                                                                   IntegratorState state,
                                                                   const ccl_private ShaderData *sd,
                                                                   ccl_global float *ccl_restrict
-                                                                      render_buffer)
+                                                                      render_buffer,
+                                                                  const bool force_first)
 {
   const uint32_t path_flag = INTEGRATOR_STATE(state, path, flag);
   if (!(path_flag & PATH_RAY_DENOISING_FEATURES)) {
@@ -101,6 +119,8 @@ ccl_device_forceinline void film_write_denoising_features_surface(KernelGlobals 
   float specular_roughness = 0.0f;
   float sum_weight = 0.0f;
   float sum_nonspecular_weight = 0.0f;
+  /* Weight of the smooth (delta) glass / refraction closures, for the glass through-guides. */
+  float smooth_glass_weight = 0.0f;
   bool has_transmission = false;
 
   for (int i = 0; i < sd->num_closure; i++) {
@@ -133,6 +153,12 @@ ccl_device_forceinline void film_write_denoising_features_surface(KernelGlobals 
     /* bsdf_get_specular_roughness_squared returns GGX alpha squared (alpha_x*alpha_y). Use sqrtf
      * to get GGX alpha. */
     const float roughness = sqrtf(bsdf_get_specular_roughness_squared(sc));
+
+    if ((CLOSURE_IS_GLASS(sc->type) || CLOSURE_IS_REFRACTION(sc->type)) &&
+        bsdf_get_specular_roughness_squared(sc) <= FALCON_GLASS_SMOOTH_ROUGHNESS_SQ)
+    {
+      smooth_glass_weight += closure_weight;
+    }
 
     /* Transition smoothly from specular to diffuse between 0.0 and 0.15 roughness. */
     const float diffuse_weight = (sc->type == CLOSURE_BSDF_HAIR_HUANG_ID) ?
@@ -181,6 +207,49 @@ ccl_device_forceinline void film_write_denoising_features_surface(KernelGlobals 
   const Spectrum denoising_feature_throughput = INTEGRATOR_STATE(
       state, path, denoising_feature_throughput);
   const bool is_first_bounce = INTEGRATOR_STATE(state, path, bounce) == 0;
+
+  /* Falcon glass through-guides.
+   *
+   * Clear glass gets the glass surface's own guides otherwise: roughness 0, specular albedo ~1,
+   * no diffuse albedo, the glass's normal, depth and motion. RR reads that as a mirror, while what
+   * the pixel shows is mostly the background refracted through it, so the background detail is
+   * treated as noise and smoothed. RR Integration Guide 3.4.1: where the see-through background
+   * dominates the guides should describe it, and the reflection-dominated part (Fresnel) the
+   * glass surface; it must not be noisy either (3.5).
+   *
+   * The lobe is only known after the BSDF is sampled, so the guides of a smooth glass hit are held
+   * back here (PATH_RAY_GLASS_PENDING) and film_write_denoising_glass_resolve() decides: a sample
+   * that refracts carries on and the next surface writes for it (PATH_RAY_GLASS_THROUGH), one
+   * that reflects writes the glass surface now. Lobes are chosen in proportion to Fresnel, so
+   * the pixel average is the Fresnel blend the guide asks for. A second smooth glass behind
+   * the first (the far wall of a bottle) is held back the same way.
+   *
+   * Not with following reflections on (that already defers the guides its own way), and not for
+   * mixtures that are mostly something else than smooth glass. */
+  const bool glass_through_enabled = (kernel_data.film.denoising_pass_options_flag &
+                                      DENOISING_PASS_GLASS_THROUGH) != 0 &&
+                                     !follow_reflections;
+  const bool glass_through_now = glass_through_enabled && (path_flag & PATH_RAY_GLASS_THROUGH) != 0;
+
+  if (glass_through_now && sum_weight == 0.0f && transparent_weight > 1e-4f) {
+    /* An alpha hole behind the glass: keep waiting for the surface behind it. */
+    INTEGRATOR_STATE_WRITE(state, path, denoising_feature_throughput) *= transparent_albedo;
+    return;
+  }
+
+  if (glass_through_enabled && !force_first && sum_weight > 0.0f && transparent_weight < 1e-4f &&
+      smooth_glass_weight >= 0.5f * sum_weight &&
+      ((is_first_bounce && !(path_flag & (PATH_RAY_GLASS_SEEN | PATH_RAY_PSR))) ||
+       glass_through_now))
+  {
+    INTEGRATOR_STATE_WRITE(state, path, flag) = (path_flag & ~PATH_RAY_GLASS_THROUGH) |
+                                                PATH_RAY_GLASS_PENDING;
+    return;
+  }
+
+  /* Every guide is written as for a first surface hit at the surface behind smooth glass, and at
+   * a glass surface whose lobe has been resolved. */
+  const bool write_as_first = is_first_bounce || glass_through_now || force_first;
 
   /* Primary surface replacement.
    *
@@ -275,15 +344,23 @@ ccl_device_forceinline void film_write_denoising_features_surface(KernelGlobals 
   }
 
   if (kernel_data.film.pass_denoising_depth != PASS_UNUSED &&
-      (is_first_bounce || follow_reflections))
+      (write_as_first || follow_reflections))
   {
-    const float denoising_depth = denoising_depth_compute(
-        kg, state, sd, denoising_feature_throughput, follow_reflections);
+    /* Behind smooth glass the depth is the surface's own camera depth (the guide throughput only
+     * tints the albedos, as in the primary surface replacement above); the running ray-length
+     * difference is for first hits and followed reflections. */
+    const float denoising_depth = (write_as_first && !is_first_bounce) ?
+                                      ensure_finite(camera_z_depth(kg, sd->P)) :
+                                      denoising_depth_compute(kg,
+                                                              state,
+                                                              sd,
+                                                              denoising_feature_throughput,
+                                                              follow_reflections);
     film_write_pass_float(buffer + kernel_data.film.pass_denoising_depth, denoising_depth);
   }
 
   if (kernel_data.film.pass_denoising_normal != PASS_UNUSED && feature_weight > 0.0f &&
-      (is_first_bounce || follow_reflections))
+      (write_as_first || follow_reflections))
   {
     /* Transform normal into camera space. */
     const Transform worldtocamera = kernel_data.cam.worldtocamera;
@@ -296,14 +373,14 @@ ccl_device_forceinline void film_write_denoising_features_surface(KernelGlobals 
   }
 
   if (kernel_data.film.pass_denoising_albedo != PASS_UNUSED && feature_weight > 0.0f &&
-      (is_first_bounce || follow_reflections))
+      (write_as_first || follow_reflections))
   {
     const Spectrum denoising_albedo = ensure_finite(diffuse_albedo * feature_weight *
                                                     denoising_feature_throughput);
     film_write_pass_spectrum(buffer + kernel_data.film.pass_denoising_albedo, denoising_albedo);
   }
 
-  if (is_first_bounce) {
+  if (write_as_first) {
     if (kernel_data.film.pass_denoising_roughness != PASS_UNUSED) {
       const float denoising_roughness = ensure_finite(specular_roughness *
                                                       average(denoising_feature_throughput));
@@ -325,6 +402,11 @@ ccl_device_forceinline void film_write_denoising_features_surface(KernelGlobals 
     }
   }
 
+  if (glass_through_now) {
+    /* The surface behind the glass has written; one replacement per path. */
+    INTEGRATOR_STATE_WRITE(state, path, flag) &= ~PATH_RAY_GLASS_THROUGH;
+  }
+
   /* Portion deferred to the next bounce. Specularity uses the feature weight, transparent
    * always passes through. */
   const Spectrum deferred_albedo = specular_albedo * (1.0f - feature_weight) + transparent_albedo;
@@ -334,6 +416,50 @@ ccl_device_forceinline void film_write_denoising_features_surface(KernelGlobals 
   }
   else {
     INTEGRATOR_STATE_WRITE(state, path, flag) &= ~PATH_RAY_DENOISING_FEATURES;
+  }
+}
+
+/* Falcon glass through-guides: called right after the BSDF lobe of a smooth glass hit has been
+ * sampled (and before the path state advances, so the bounce count is still that of the glass).
+ * A refracting sample carries on to the surface behind, which writes for it; anything else writes
+ * the glass surface's own guides now. */
+ccl_device_forceinline void film_write_denoising_glass_resolve(
+    KernelGlobals kg,
+    IntegratorState state,
+    const ccl_private ShaderData *sd,
+    const ccl_private ShaderClosure *sc,
+    const int label,
+    ccl_global float *ccl_restrict render_buffer)
+{
+  const uint32_t path_flag = INTEGRATOR_STATE(state, path, flag);
+  if (!(path_flag & PATH_RAY_GLASS_PENDING)) {
+    return;
+  }
+
+  const bool through = (label & LABEL_TRANSMIT) && !(label & LABEL_TRANSPARENT);
+  INTEGRATOR_STATE_WRITE(state, path, flag) = (path_flag & ~PATH_RAY_GLASS_PENDING) |
+                                              PATH_RAY_GLASS_SEEN |
+                                              (through ? PATH_RAY_GLASS_THROUGH : 0u);
+
+  if (through) {
+    /* The glass's colour tints what is seen through it. The closure's weight also carries its
+     * share of a mixture (glass next to a diffuse layer), and that share is already the
+     * probability with which this closure was picked, so it is divided out: for a lone glass
+     * closure the share is 1 and the tint is its colour. */
+    float sample_weight_sum = 0.0f;
+    for (int i = 0; i < sd->num_closure; i++) {
+      if (CLOSURE_IS_BSDF_OR_BSSRDF(sd->closure[i].type)) {
+        sample_weight_sum += sd->closure[i].sample_weight;
+      }
+    }
+    const float share = (sample_weight_sum > 0.0f) ? sc->sample_weight / sample_weight_sum : 1.0f;
+    if (share > 1e-4f) {
+      INTEGRATOR_STATE_WRITE(state, path, denoising_feature_throughput) *= sc->weight *
+                                                                          (1.0f / share);
+    }
+  }
+  else {
+    film_write_denoising_features_surface(kg, state, sd, render_buffer, true);
   }
 }
 
@@ -407,6 +533,20 @@ ccl_device_forceinline void film_write_denoising_features_background(
     }
 
     INTEGRATOR_STATE_WRITE(state, path, flag) &= ~(PATH_RAY_PSR | PATH_RAY_DENOISING_FEATURES);
+    return;
+  }
+
+  /* Falcon glass through-guides: a sample that refracted through smooth glass and left the scene
+   * sees the same sky a primary ray would, so it writes the same far depth. */
+  if (path_flag & PATH_RAY_GLASS_THROUGH) {
+    ccl_global float *buffer = film_pass_pixel_render_buffer(kg, state, render_buffer);
+
+    if (kernel_data.film.pass_denoising_depth != PASS_UNUSED) {
+      film_overwrite_pass_float(buffer + kernel_data.film.pass_denoising_depth, FLT_MAX);
+    }
+
+    /* The sky's albedo is written after this, and needs the flag; the path ends here. */
+    INTEGRATOR_STATE_WRITE(state, path, flag) &= ~PATH_RAY_GLASS_THROUGH;
     return;
   }
 

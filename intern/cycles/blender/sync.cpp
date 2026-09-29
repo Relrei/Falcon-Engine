@@ -753,6 +753,14 @@ void BlenderSync::sync_film(blender::ViewLayer &b_view_layer,
    * costs quality on the mirror test scene -- 0.5 to 1.4 dB against a 1024spp reference, with the
    * same temporal flicker. FALCON_DLSS_PSR=1 turns it on to keep investigating. */
   film->set_denoising_pass_psr(active_dlss && getenv("FALCON_DLSS_PSR") != nullptr);
+
+  /* Glass through-guides: describe what a sample sees THROUGH smooth glass, and the glass
+   * surface only for the samples that reflect (the Fresnel blend of RR Integration Guide 3.4.1),
+   * instead of the glass surface as a mirror for every sample. The glass pixels' specular hit
+   * distance is dropped with it. Off by default until measured on the glass scenes:
+   * FALCON_DLSS_GLASS_THROUGH=1 turns it on. Not together with FALCON_DLSS_FOLLOW_REFLECTIONS. */
+  film->set_denoising_pass_glass_through(active_dlss &&
+                                         getenv("FALCON_DLSS_GLASS_THROUGH") != nullptr);
 }
 
 /* Render Layer */

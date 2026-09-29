@@ -128,6 +128,7 @@ NODE_DEFINE(Film)
                  "Denoising Pass Albedo Roughness Weighting",
                  true);
   SOCKET_BOOLEAN(denoising_pass_psr, "Denoising Pass Primary Surface Replacement", false);
+  SOCKET_BOOLEAN(denoising_pass_glass_through, "Denoising Pass Glass Through", false);
 
   return type;
 }
@@ -485,6 +486,9 @@ void Film::device_update(Device *device, DeviceScene *dscene, Scene *scene)
   }
   if (denoising_pass_psr) {
     kfilm->denoising_pass_options_flag |= DENOISING_PASS_PSR;
+  }
+  if (denoising_pass_glass_through) {
+    kfilm->denoising_pass_options_flag |= DENOISING_PASS_GLASS_THROUGH;
   }
 
   clear_modified();

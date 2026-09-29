@@ -287,6 +287,16 @@ enum PathRayFlag : uint32_t {
   /* Falcon LT has sampled a specular reflection or a non-unit-IOR refraction.
    * Straight-through IOR=1 glass is direct illumination, not a caustic. */
   PATH_RAY_FALCON_CAUSTIC_EVENT = (1U << 27U),
+
+  /* Falcon glass through-guides (DENOISING_PASS_GLASS_THROUGH). The path stands on a smooth glass
+   * surface whose denoising guides were held back until the BSDF lobe is known: a sample that
+   * refracts writes the guides of what it sees through the glass, one that reflects writes the
+   * glass surface's own. PENDING is set on the glass hit and resolved right after the lobe
+   * is sampled; THROUGH is then set on a refracting sample until the next surface writes; SEEN
+   * remembers that the path started on such glass (its specular hit distance is not written). */
+  PATH_RAY_GLASS_PENDING = (1U << 28U),
+  PATH_RAY_GLASS_THROUGH = (1U << 29U),
+  PATH_RAY_GLASS_SEEN = (1U << 30U),
 };
 
 // 8bit enum, just in case we need to move more variables in it
@@ -481,6 +491,9 @@ enum DenoisingPassFlag {
   /* Primary surface replacement: describe the virtual image behind a delta mirror rather than the
    * mirror itself. */
   DENOISING_PASS_PSR = (1 << 2),
+  /* Falcon glass through-guides: guides of what a sample sees THROUGH smooth glass (see
+   * PATH_RAY_GLASS_PENDING), instead of the glass surface for every sample. */
+  DENOISING_PASS_GLASS_THROUGH = (1 << 3),
 };
 
 /* Closure Filter */

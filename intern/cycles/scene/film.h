@@ -55,6 +55,7 @@ class Film : public Node {
   NODE_SOCKET_API(bool, denoising_pass_follow_reflections);
   NODE_SOCKET_API(bool, denoising_pass_use_albedo_roughness_weighting);
   NODE_SOCKET_API(bool, denoising_pass_psr);
+  NODE_SOCKET_API(bool, denoising_pass_glass_through);
 
  private:
   size_t filter_table_offset_;
