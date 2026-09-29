@@ -1330,10 +1330,10 @@ bool MOV_fastpath_write(const Scene *scene,
     }
   }
 
-  if (ok && want_audio) {
-    /* ★最後のひと押し。ここを忘れると尻の音が落ちる。 */
-    write_audio_frames(&audio_ctx, double(out_frame + 1) * av_q2d(out.frame_tb));
-  }
+  /* ★通常の書き出しは、最後のコマまでの音(コマ数 / fps 秒)しか符号化器へ送らない
+   * (`ffmpeg_movie_append`)。ここで 1 コマぶん(out_frame + 1)を足すと、尻の音が
+   * 通常より 2 AAC フレーム(約 43 ms)長くなる(A/V の門: 通常経路との差 11 ms 以内)。
+   * 符号化器に残った音は、下の `audio_flush_delayed` が出し切る。 */
   if (want_audio) {
     movie_audio_close(&audio_ctx, false);
   }
