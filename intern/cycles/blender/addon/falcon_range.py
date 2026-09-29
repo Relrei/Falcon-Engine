@@ -13,8 +13,13 @@ display driver in the loop, which is also the documented-safe way to run
 final range bakes.
 
 Usage (what the operator spawns):
-    blender -b <copy.blend> --python falcon_range.py -- --mode once
-    blender -b <copy.blend> --python falcon_range.py -- --mode perframe
+    blender -b <copy.blend> --python falcon_range.py -- --mode once --out <abs path> --cleanup
+    blender -b <copy.blend> --python falcon_range.py -- --mode perframe --out <abs path> --cleanup
+
+    --out      absolute output path taken from the ORIGINAL file (the copy lives
+               in the temp dir, so its own "//..." path would resolve there).
+    --cleanup  <copy.blend> is a throwaway copy of this launch: delete it, and
+               the photon caches baked for it, when the job ends.
 
 Modes:
     once     bake the caustics once at the file's current frame, then
@@ -40,6 +45,26 @@ def _fail(msg):
     sys.exit(1)
 
 
+# Map files the bake wrote for this job (see _cleanup).
+_scratch = set()
+
+
+def _cleanup():
+    """Remove what only this job needs: the temp copy and its baked maps.
+
+    Both are named per launch, so nothing else ever reads them again; left in
+    place they pile up (the grid cache alone is 1 GB per launch).  Only files
+    whose name carries this copy's name are touched.
+    """
+    own = os.path.basename(bpy.data.filepath)
+    for path in list(_scratch) + [bpy.data.filepath]:
+        if path and own and own in os.path.basename(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
 def _bake_or_die(frame):
     """Run the photon bake op and verify the map really landed on disk.
 
@@ -58,6 +83,9 @@ def _bake_or_die(frame):
     pts = os.environ.get("FALCON_PHOTON_POINTS")
     grid = os.environ.get("FALCON_SHARC_CACHE")
     map_path = pts if pts else grid
+    for p in (pts, grid):
+        if p:
+            _scratch.add(p)
     if not map_path or not os.path.exists(map_path):
         _fail("frame %d: baked map missing on disk (%s)"
               % (frame, map_path or "no path set"))
@@ -70,11 +98,19 @@ def main():
         mode = argv[argv.index("--mode") + 1]
     if mode not in ("once", "perframe"):
         _fail("unknown --mode %r" % mode)
+    out = argv[argv.index("--out") + 1] if "--out" in argv else None
+    global _cleanup_on_exit
+    _cleanup_on_exit = "--cleanup" in argv
 
     scene = bpy.context.scene
     r = scene.render
+    if out:
+        r.filepath = out
     if r.engine != 'CYCLES':
         _fail("render engine is %s, not CYCLES" % r.engine)
+    if mode == "perframe" and r.is_movie_format:
+        _fail("perframe mode writes one still per frame; the output format is a "
+              "movie format (use an image format, or render with the bake-once mode)")
     f0, f1 = scene.frame_start, scene.frame_end
     step = scene.frame_step
     if f1 < f0:
@@ -112,4 +148,10 @@ def main():
     _log("done in %.0fs" % (time.time() - t0))
 
 
-main()
+_cleanup_on_exit = False
+
+try:
+    main()
+finally:
+    if _cleanup_on_exit:
+        _cleanup()

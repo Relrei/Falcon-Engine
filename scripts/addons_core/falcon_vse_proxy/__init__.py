@@ -49,6 +49,17 @@ def _enabled():
     return os.environ.get("FALCON_VSE_PROXY_HELPER", "1") not in {"0", "false", "False"}
 
 
+def _sequencer_scene(context):
+    """ストリップの在るシーン。
+
+    Falcon はストリップを専用の `VSE` シーンへ置き、窓のシーン(`context.scene`)はレンダー用の
+    まま残す。VSE が読むのはワークスペースの `sequencer_scene` なので、そちらを見る
+    (取れない時だけ `context.scene`)。
+    """
+    scene = getattr(context, "sequencer_scene", None)
+    return scene if scene is not None else context.scene
+
+
 def _proxy_strips(scene):
     """Strips a proxy can be built for (movies and image sequences)."""
     ed = scene.sequence_editor
@@ -93,11 +104,11 @@ class SEQUENCER_OT_falcon_proxy_setup(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context):
-        scene = context.scene
+        scene = _sequencer_scene(context)
         return scene is not None and scene.sequence_editor is not None
 
     def execute(self, context):
-        scene = context.scene
+        scene = _sequencer_scene(context)
         ed = scene.sequence_editor
         strips = _proxy_strips(scene)
         if not strips:
@@ -159,62 +170,97 @@ class SEQUENCER_OT_falcon_proxy_setup(bpy.types.Operator):
 # -------------------------------------------------------------------------------------------
 
 _auto_state = {"busy": False, "pending": False}
+#: 見終えたストリップ名(シーンの `session_uid` ごと)。
+#: ★「プロキシの印が無い」だけでは、後から足した物と区別が付かない。使う人が自分で
+#:   Strip Proxy を外した物や、一部だけ作った状態で開いた物まで毎回付け直してしまう。
+#:   そこで**この作業中に初めて見えた物だけ**を新しいストリップとして扱う
+#:   (最初に見た時点で在った物は基準として覚えるだけで、何もしない)。
+_auto_seen = {}
+#: タイマー待ちのストリップ名(シーン名ごと)。
+_auto_queue = {}
 
 
 def _auto_enabled():
     return os.environ.get("FALCON_VSE_PROXY_AUTO", "1") not in {"0", "false", "False"}
 
 
-def _unmarked_strips(scene):
+def _new_unmarked_strips(scene):
+    """この作業中に初めて見えた、まだプロキシの印が無いストリップ。"""
     ed = scene.sequence_editor
     if ed is None:
         return []
-    return [strip for strip in ed.strips_all
-            if strip.type in {'MOVIE', 'IMAGE'} and not strip.use_proxy]
+    strips = [strip for strip in ed.strips_all if strip.type in {'MOVIE', 'IMAGE'}]
+    key = scene.session_uid
+    seen = _auto_seen.get(key)
+    # 消えた名前は忘れる(消して同じ名前で足し直した物は、新しい物として扱う)。
+    _auto_seen[key] = {strip.name for strip in strips}
+    if seen is None:
+        return []
+    return [strip for strip in strips if strip.name not in seen and not strip.use_proxy]
 
 
 def _auto_apply():
     """タイマーから 1 回だけ走る。重い処理はここでだけ行う。"""
     _auto_state["pending"] = False
-    scene = bpy.context.scene
-    if scene is None or not _project_uses_proxies(scene):
-        return None
-    strips = _unmarked_strips(scene)
-    if not strips:
-        return None
-
-    _auto_state["busy"] = True
-    try:
+    queue = dict(_auto_queue)
+    _auto_queue.clear()
+    for scene_name, names in queue.items():
+        # シーンはポインタではなく名前で持ち越す(待つ間に消えているかもしれない)。
+        scene = bpy.data.scenes.get(scene_name)
+        if scene is None or not _project_uses_proxies(scene):
+            continue
         ed = scene.sequence_editor
-        selection = {strip.name: strip.select for strip in ed.strips_all}
-        targets = {strip.name for strip in strips}
-        for strip in strips:
-            _mark_strip(strip)
-        for strip in ed.strips_all:
-            strip.select = strip.name in targets
+        strips = [strip for strip in ed.strips_all
+                  if strip.name in names and strip.type in {'MOVIE', 'IMAGE'} and not strip.use_proxy]
+        if not strips:
+            continue
+
+        _auto_state["busy"] = True
         try:
-            if not bpy.app.background:
-                bpy.ops.sequencer.rebuild_proxy('INVOKE_DEFAULT')
-        finally:
+            selection = {strip.name: strip.select for strip in ed.strips_all}
+            targets = {strip.name for strip in strips}
+            for strip in strips:
+                _mark_strip(strip)
             for strip in ed.strips_all:
-                strip.select = selection.get(strip.name, False)
-        print("falcon_vse_proxy: %d 本に後から印を付けて作成を始めました" % len(targets))
-    finally:
-        _auto_state["busy"] = False
+                strip.select = strip.name in targets
+            try:
+                if not bpy.app.background:
+                    # 作成の操作が見るのはワークスペースの `sequencer_scene`。
+                    # このシーンがそれでない場合に備えて、明示して呼ぶ。
+                    with bpy.context.temp_override(sequencer_scene=scene):
+                        bpy.ops.sequencer.rebuild_proxy('INVOKE_DEFAULT')
+            finally:
+                for strip in ed.strips_all:
+                    strip.select = selection.get(strip.name, False)
+            print("falcon_vse_proxy: %d 本に後から印を付けて作成を始めました" % len(targets))
+        finally:
+            _auto_state["busy"] = False
     return None
 
 
 @bpy.app.handlers.persistent
 def _on_depsgraph_update(scene, depsgraph=None):
     # 毎回の更新で走るので、ここでは**数えるだけ**にしてタイマーへ逃がす。
-    if _auto_state["busy"] or _auto_state["pending"] or not _auto_enabled():
+    if _auto_state["busy"] or not _auto_enabled():
         return
     if scene is None or scene.sequence_editor is None:
         return
-    if not _unmarked_strips(scene) or not _project_uses_proxies(scene):
+    new = _new_unmarked_strips(scene)
+    if not new or not _project_uses_proxies(scene):
         return
-    _auto_state["pending"] = True
-    bpy.app.timers.register(_auto_apply, first_interval=1.0)
+    _auto_queue.setdefault(scene.name, set()).update(strip.name for strip in new)
+    if not _auto_state["pending"]:
+        _auto_state["pending"] = True
+        # ★persistent: 既定のままだとファイルを開いた時にタイマーだけ消され、
+        #   `pending` が立ちっぱなしになって、以後の自動付けが止まる。
+        bpy.app.timers.register(_auto_apply, first_interval=1.0, persistent=True)
+
+
+@bpy.app.handlers.persistent
+def _on_load_post(*_args):
+    # 名前の一覧は開いたファイルのもの。持ち越すと別のファイルの同名のストリップを取り違える。
+    _auto_seen.clear()
+    _auto_queue.clear()
 
 
 def _draw_proxy_panel(self, context):
@@ -239,12 +285,21 @@ def register():
         _panel.append(_draw_proxy_panel)
     if _on_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph_update)
+    if _on_load_post not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_on_load_post)
 
 
 def unregister():
     global _panel
     if _on_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(_on_depsgraph_update)
+    if _on_load_post in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_on_load_post)
+    if bpy.app.timers.is_registered(_auto_apply):
+        bpy.app.timers.unregister(_auto_apply)
+    _auto_state["pending"] = False
+    _auto_seen.clear()
+    _auto_queue.clear()
     if _panel is not None:
         _panel.remove(_draw_proxy_panel)
         _panel = None

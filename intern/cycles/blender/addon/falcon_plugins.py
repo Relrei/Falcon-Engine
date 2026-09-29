@@ -164,7 +164,9 @@ def check_plugin(folder, plat=None, blender_version=None):
     try:
         with open(manifest, "rb") as f:
             m = tomllib.load(f)
-    except (OSError, tomllib.TOMLDecodeError) as ex:
+    except (OSError, ValueError, RecursionError) as ex:
+        # ValueError: TOMLDecodeError, and UnicodeDecodeError for a manifest that is not UTF-8
+        # (e.g. UTF-16 from Notepad, Shift-JIS).
         rec["errors"].append("manifest cannot be read: %s" % ex)
         return rec
 
@@ -172,12 +174,18 @@ def check_plugin(folder, plat=None, blender_version=None):
     if not schema.split(".")[0].isdigit() or int(schema.split(".")[0]) != SCHEMA_MAJOR:
         rec["errors"].append("unsupported schema_version %r" % schema)
         return rec
-    rec["id"] = m.get("id")
+    plugin_id = m.get("id")
     rec["name"] = str(m.get("name") or rec["name"])
     rec["version"] = str(m.get("version", ""))
-    kind = KINDS.get(rec["id"])
+    if not isinstance(plugin_id, str):
+        # A list or table would not even be hashable; keep `rec["id"]` None so it never reaches the
+        # id lookups below and in scan().
+        rec["errors"].append("unsupported id %r" % (plugin_id,))
+        return rec
+    rec["id"] = plugin_id
+    kind = KINDS.get(plugin_id)
     if kind is None:
-        rec["errors"].append("unsupported id %r" % rec["id"])
+        rec["errors"].append("unsupported id %r" % plugin_id)
         return rec
 
     platforms = m.get("platforms", [])
@@ -215,7 +223,12 @@ def check_plugin(folder, plat=None, blender_version=None):
         elif not os.path.isfile(os.path.join(folder, fn)):
             rec["errors"].append("missing: %s" % fn)
     listed = set(rec["files"]) | {MANIFEST}
-    for fn in sorted(os.listdir(folder)):
+    try:
+        names = sorted(os.listdir(folder))
+    except OSError as ex:
+        rec["errors"].append("folder cannot be read: %s" % ex)
+        return rec
+    for fn in names:
         if fn not in listed:
             rec["errors"].append("unexpected file: %s" % fn)
     return rec
@@ -230,16 +243,31 @@ def scan(context=None):
     for where, root in place_list:
         if not os.path.isdir(root):
             continue
-        for fn in sorted(os.listdir(root)):
+        try:
+            names = sorted(os.listdir(root))
+        except OSError as ex:
+            # One unreadable place must not hide the others (`path` is joined so that its dirname is the place).
+            loose.append({"where": where, "path": os.path.join(root, os.curdir),
+                          "error": "folder cannot be read: %s" % ex})
+            continue
+        for fn in names:
             p = os.path.join(root, fn)
             if not os.path.isdir(p):
                 loose.append({"where": where, "path": p, "error": "unexpected file: %s" % fn})
                 continue
-            if not os.listdir(p):
+            try:
+                empty = not os.listdir(p)
+            except OSError:
+                empty = False  # check_plugin() reports what is wrong with it
+            if empty:
                 # Empty placeholder folder (e.g. created up front by _ensure_folders): not an
                 # error, just nothing dropped in yet. Treat it as if it did not exist.
                 continue
-            rec = check_plugin(p, plat)
+            try:
+                rec = check_plugin(p, plat)
+            except Exception as ex:  # one broken plugin folder must not stop the scan of the others
+                rec = {"dir": p, "name": fn, "id": None, "version": "", "files": [],
+                       "errors": ["cannot be checked: %r" % ex], "info": []}
             rec["where"] = where
             if rec["id"] and not rec["errors"] and not rec["info"]:
                 if rec["id"] in seen:
@@ -306,10 +334,18 @@ def rescan(context=None):
         except ImportError:
             pass
         return _state
-    state = scan(context)
+    # Take the fingerprint before looking, so a change made while scanning is seen by the next check.
+    sig = _signature()
+    try:
+        state = scan(context)
+    except Exception:
+        # Whatever went wrong, DLSS must still follow its add-on (`set_dlss_enabled`, whose C++ default
+        # is "on"): apply what was found last time, and let the caller see the failure.
+        apply(_state)
+        raise
     apply(state)
     _report(state)
-    _watch_sig[0] = _signature()
+    _watch_sig[0] = sig
     return state
 
 
@@ -370,6 +406,8 @@ def _load_post(*_args):
 # ---------------------------------------------------------------- watch the plugin folders
 
 _watch_sig = [None]
+# Failed rescans in a row for the fingerprint being watched.
+_watch_failures = [0]
 
 
 def _mtime(path):
@@ -410,8 +448,17 @@ def _watch():
     try:
         sig = _signature()
         if sig != _watch_sig[0]:
-            _watch_sig[0] = sig  # also when the scan below fails, so it is not retried every tick
-            rescan()
+            try:
+                rescan()  # records the fingerprint it scanned
+            except Exception:
+                # The fingerprint stays unscanned, so the next tick tries again (a folder that is
+                # still being copied into can fail for a moment). After a few failures in a row wait
+                # for the folders to change instead of failing on every tick.
+                _watch_failures[0] += 1
+                if _watch_failures[0] >= 3:
+                    _watch_sig[0] = sig
+                raise
+            _watch_failures[0] = 0
             _tag_redraw()
     except Exception as ex:
         print("[Falcon plugins] ERROR: watch failed: %r" % ex)

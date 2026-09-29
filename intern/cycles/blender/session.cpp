@@ -450,13 +450,21 @@ void BlenderSession::clear_denoiser_history_on_cut()
   const string cut_camera = cut_camera_ob ? string(cut_camera_ob->id.name) : string();
   const int cut_frame = b_scene->r.cfra;
 
+  /* A final animation render rebuilds its BlenderSession every frame, so its cut state has to
+   * be process-global (see session.h). Everything else -- the viewport, stills, material
+   * previews -- keeps its own, so it can neither race with nor be mistaken for the animation. */
+  const bool final_animation = !b_v3d && (b_engine.flag & blender::RE_ENGINE_ANIMATION) != 0 &&
+                               (b_engine.flag & blender::RE_ENGINE_PREVIEW) == 0;
+  string &last_cut_camera = final_animation ? last_cut_camera_ : session_cut_camera_;
+  int &last_cut_frame = final_animation ? last_cut_frame_ : session_cut_frame_;
+
   /* The cut state is process-global (see session.h), so a new job has to clear
    * it or the first frame of this render would be compared against the last
    * camera of the previous one. The start frame of the range is the same signal
    * render() uses for dlss_history_warmed_this_job. */
-  if (background && cut_frame == b_scene->r.sfra) {
-    last_cut_camera_.clear();
-    last_cut_frame_ = INT_MIN;
+  if (final_animation && cut_frame == b_scene->r.sfra) {
+    last_cut_camera.clear();
+    last_cut_frame = INT_MIN;
   }
 
   /* The frame number is what tells DLSS-RR "new frame" from "more samples on
@@ -468,7 +476,7 @@ void BlenderSession::clear_denoiser_history_on_cut()
             "[cut] cfra=%d cam=%s last=%s\n",
             cut_frame,
             cut_camera.c_str(),
-            last_cut_camera_.c_str());
+            last_cut_camera.c_str());
   }
 
   /* How far the frame may move before it counts as a jump. A final render
@@ -485,8 +493,8 @@ void BlenderSession::clear_denoiser_history_on_cut()
                        (b_screen->animtimer != nullptr);
   static const bool cut_on_playback = getenv("FALCON_DLSS_CUT_ON_PLAYBACK") != nullptr;
   const int frame_tolerance = (b_v3d == nullptr) ? max(1, b_scene->r.frame_step) : 1;
-  const bool frame_jump = (last_cut_frame_ != INT_MIN) &&
-                          (std::abs(cut_frame - last_cut_frame_) > frame_tolerance) &&
+  const bool frame_jump = (last_cut_frame != INT_MIN) &&
+                          (std::abs(cut_frame - last_cut_frame) > frame_tolerance) &&
                           (!playing || cut_on_playback);
 
   /* A camera-bound marker switching cameras is the cut we can name exactly, and
@@ -510,7 +518,7 @@ void BlenderSession::clear_denoiser_history_on_cut()
   static const int cut_warmup_env = getenv("FALCON_DLSS_CUT_WARMUP") ?
                                         atoi(getenv("FALCON_DLSS_CUT_WARMUP")) :
                                         1;
-  const bool camera_switch = (!last_cut_camera_.empty() && cut_camera != last_cut_camera_) &&
+  const bool camera_switch = (!last_cut_camera.empty() && cut_camera != last_cut_camera) &&
                              cut_warmup_env != 0 && get_boolean(cscene, "denoising_cut_warmup");
 
   if (camera_switch || frame_jump) {
@@ -521,8 +529,8 @@ void BlenderSession::clear_denoiser_history_on_cut()
     session->clear_denoiser_temporal_history();
   }
 
-  last_cut_camera_ = cut_camera;
-  last_cut_frame_ = cut_frame;
+  last_cut_camera = cut_camera;
+  last_cut_frame = cut_frame;
 }
 
 void BlenderSession::clear_denoiser_history_on_jump()
@@ -632,6 +640,13 @@ void BlenderSession::render(blender::Depsgraph &b_depsgraph_)
 
   session->set_is_animation((b_engine.flag & blender::RE_ENGINE_ANIMATION) != 0);
 
+  /* Only the frames of one animation render belong to a job: a still (F12), a material preview
+   * or a nested render is a job of its own, starts cold and must neither read nor leave the flag
+   * behind -- otherwise the still after an animation is told its history is warm and skips the
+   * "Accumulation Renders" pre-roll. */
+  const bool tracks_warm_job = (b_engine.flag & blender::RE_ENGINE_ANIMATION) != 0 &&
+                               (b_engine.flag & blender::RE_ENGINE_PREVIEW) == 0;
+
   /* dlss_history_warmed_this_job is process-global (BlenderSession itself is
    * rebuilt every frame, see its declaration), so it never sees a *job*
    * boundary on its own -- once set, it would otherwise stay true for every
@@ -639,7 +654,7 @@ void BlenderSession::render(blender::Depsgraph &b_depsgraph_)
    * cold first frame of an unrelated job. The start frame of the current
    * range is the signal we actually have for "this is frame 1 of this job";
    * treat reaching it as a fresh start and force the pre-roll again. */
-  if (b_scene->r.cfra == b_scene->r.sfra) {
+  if (tracks_warm_job && b_scene->r.cfra == b_scene->r.sfra) {
     dlss_history_warmed_this_job = false;
   }
 
@@ -652,7 +667,7 @@ void BlenderSession::render(blender::Depsgraph &b_depsgraph_)
             b_scene->r.sfra,
             int(dlss_history_warmed_this_job));
   }
-  if (dlss_history_warmed_this_job) {
+  if (tracks_warm_job && dlss_history_warmed_this_job) {
     /* Session may have just been freshly rebuilt (Persistent Data off) --
      * tell it not to treat this frame as the cold first frame of the job. */
     session->set_dlss_history_warm();
@@ -793,7 +808,9 @@ void BlenderSession::render(blender::Depsgraph &b_depsgraph_)
   /* This frame is done: any later frame in this job (even one rendered by a
    * freshly rebuilt Session, see set_dlss_history_warm above) no longer
    * needs the cold-start DLSS-RR pre-roll. */
-  dlss_history_warmed_this_job = true;
+  if (tracks_warm_job) {
+    dlss_history_warmed_this_job = true;
+  }
 }
 
 void BlenderSession::render_frame_finish()

@@ -22,6 +22,11 @@ bool HIPDeviceKernels::load_kernel(HIPDevice *device,
     return false;
   }
 
+  /* Falcon DLSS-RR kernels only exist in the CUDA kernel; nothing to load (and not an error). */
+  if (device_kernel_is_cuda_only(kernel)) {
+    return false;
+  }
+
   HIPDeviceKernel &hip_kernel = kernels_[int(kernel)];
 
   const std::string function_name = std::string("kernel_gpu_") + device_kernel_as_string(kernel);

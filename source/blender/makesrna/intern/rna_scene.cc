@@ -1325,15 +1325,39 @@ static std::string rna_RenderSettings_falcon_export_info_string(const PointerRNA
   return blender::bke::falcon_export_info_get(scene);
 }
 
+/* ★RNA は `length` と `get` を別々に、続けて呼ぶ(`RNA_property_string_get_alloc`)。
+ * その間に書き出しの糸が文字列を変えると、`length` で確保した領域より長い文字列を
+ * `get` が書いて溢れる。`length` で取った1つを同じ糸の `get` へ渡す(使ったら捨てる)。 */
+struct FalconExportInfoSnapshot {
+  const Scene *scene = nullptr;
+  std::string line;
+  bool valid = false;
+};
+static thread_local FalconExportInfoSnapshot rna_falcon_export_info_snapshot;
+
 static void rna_RenderSettings_falcon_last_export_info_get(PointerRNA *ptr, char *value)
 {
-  const std::string info = rna_RenderSettings_falcon_export_info_string(ptr);
-  memcpy(value, info.c_str(), info.size() + 1);
+  FalconExportInfoSnapshot &snapshot = rna_falcon_export_info_snapshot;
+  const Scene *scene = reinterpret_cast<const Scene *>(ptr->owner_id);
+  if (snapshot.valid && snapshot.scene == scene) {
+    memcpy(value, snapshot.line.c_str(), snapshot.line.size() + 1);
+  }
+  else {
+    /* `length` を通らずに呼ばれた時。確保した大きさが分からないので、今の値をそのまま渡す。 */
+    const std::string info = rna_RenderSettings_falcon_export_info_string(ptr);
+    memcpy(value, info.c_str(), info.size() + 1);
+  }
+  snapshot.valid = false;
+  snapshot.line.clear();
 }
 
 static int rna_RenderSettings_falcon_last_export_info_length(PointerRNA *ptr)
 {
-  return int(rna_RenderSettings_falcon_export_info_string(ptr).size());
+  FalconExportInfoSnapshot &snapshot = rna_falcon_export_info_snapshot;
+  snapshot.scene = reinterpret_cast<const Scene *>(ptr->owner_id);
+  snapshot.line = rna_RenderSettings_falcon_export_info_string(ptr);
+  snapshot.valid = true;
+  return int(snapshot.line.size());
 }
 
 static std::optional<std::string> rna_BakeSettings_path(const PointerRNA * /*ptr*/)

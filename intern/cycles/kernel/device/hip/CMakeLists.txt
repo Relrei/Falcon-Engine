@@ -92,6 +92,12 @@ if(WITH_CYCLES_HIP_BINARIES AND WITH_CYCLES_DEVICE_HIP)
       set(hip_flags ${hip_flags} -D WITH_CYCLES_DEBUG)
     endif()
 
+    # Falcon SHARC changes the KernelIntegrator layout, so the build-time fatbin must be
+    # compiled with the same define as the host or KernelParams sizes mismatch.
+    if(WITH_FALCON_SHARC)
+      set(hip_flags ${hip_flags} -D WITH_FALCON_SHARC)
+    endif()
+
     add_custom_command(
       OUTPUT ${hip_file}
       COMMAND ${hip_command} ${hip_flags}

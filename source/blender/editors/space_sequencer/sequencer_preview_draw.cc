@@ -1959,7 +1959,13 @@ void sequencer_preview_region_draw(const bContext *C, ARegion *region)
   }
   const char *current_gpu_colorspace = nullptr;
   bool current_gpu_owned = false;
-  if (need_current_frame && use_gpu_texture) {
+  /* GPU 経路は CPU の ImBuf を作らない。スコープ(波形・パレード・ベクトルスコープ)・ゼブラ・
+   * メタデータは ImBuf が要る(空だと描かれない)ので、その間は今までの経路(ImBuf)に落とし、
+   * 普通の画像表示だけ GPU 経路を通す。 */
+  const bool overlay_needs_ibuf = !show_imbuf || (space_sequencer.zebra != 0) ||
+                                  (draw_overlay && (space_sequencer.preview_overlay.flag &
+                                                    SEQ_PREVIEW_SHOW_METADATA));
+  if (need_current_frame && use_gpu_texture && !overlay_needs_ibuf) {
     /* ★GPU 経路: 変形と重ねを GPU でやって、CPU に戻さずそのまま描く。
      * 通せない配置ならここは nullptr を返し、下の今までの経路に落ちる。 */
     current_texture = sequencer_gpu_preview_get(C,

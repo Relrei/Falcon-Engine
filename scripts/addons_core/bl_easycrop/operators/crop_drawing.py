@@ -12,7 +12,7 @@ import math
 from gpu_extras.batch import batch_for_shader
 
 from .crop_core import (
-    get_crop_state, get_draw_data, set_draw_data,
+    get_crop_state, get_draw_data, set_draw_data, get_scene,
     get_strip_geometry_with_flip_support, handle_screen_angle,
     HANDLE_COLOR, ACCENT_COLOR,
     get_edge_midpoints, is_strip_visible_at_frame,
@@ -146,7 +146,7 @@ def draw_crop_handles():
     if not context.area or context.area.type != 'SEQUENCE_EDITOR':
         return
 
-    scene = context.scene
+    scene = get_scene(context)
     if not scene.sequence_editor:
         return
 

@@ -3241,13 +3241,26 @@ static void file_rename_state_activate(SpaceFile *sfile, int file_idx, bool requ
   }
 }
 
-static wmOperatorStatus file_rename_exec(bContext *C, wmOperator * /*op*/)
+static wmOperatorStatus file_rename_exec(bContext *C, wmOperator *op)
 {
   ScrArea *area = CTX_wm_area(C);
   SpaceFile *sfile = reinterpret_cast<SpaceFile *>(CTX_wm_space_data(C));
   FileSelectParams *params = ED_fileselect_get_active_params(sfile);
 
   if (params) {
+    /* Falcon: a folded image sequence stands for many files, but a rename only renames the one
+     * behind its `relpath` (the first frame). Refuse instead of silently renaming one frame. */
+    const int numfiles = filelist_files_ensure(sfile->files);
+    if (params->active_file >= 0 && params->active_file < numfiles) {
+      const FileDirEntry *file = filelist_file(sfile->files, params->active_file);
+      if (file->typeflag & FILE_TYPE_IMAGE_SEQUENCE) {
+        BKE_report(op->reports,
+                   RPT_WARNING,
+                   "Cannot rename a grouped image sequence, turn off Group Image Sequences first");
+        return OPERATOR_CANCELLED;
+      }
+    }
+
     file_rename_state_activate(sfile, params->active_file, false);
     ED_area_tag_redraw(area);
   }
@@ -3306,13 +3319,17 @@ static bool file_delete_single(const FileList *files,
                                FileDirEntry *file,
                                const char **r_error_message)
 {
-  char filepath[FILE_MAX_LIBEXTRA];
-  filelist_file_get_full_path(files, file, filepath);
-  if (BLI_delete_soft(filepath, r_error_message) != 0 || BLI_exists(filepath)) {
-    return false;
+  /* Falcon: a folded image sequence stands for every one of its frames, delete all of them (same
+   * enumeration as the drag & drop and `ED_fileselect_selected_files_full_paths()`). For anything
+   * else this is just the one full path. */
+  bool success = true;
+  for (const std::string &filepath : filelist_file_expand_full_paths(files, file)) {
+    if (BLI_delete_soft(filepath.c_str(), r_error_message) != 0 || BLI_exists(filepath.c_str())) {
+      success = false;
+    }
   }
 
-  return true;
+  return success;
 }
 
 static wmOperatorStatus file_delete_exec(bContext *C, wmOperator *op)

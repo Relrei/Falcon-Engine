@@ -67,6 +67,12 @@ if(WITH_CYCLES_HIP_BINARIES AND WITH_CYCLES_DEVICE_HIPRT)
     set(hiprt_compile_flags ${hiprt_compile_flags} -D WITH_CYCLES_DEBUG)
   endif()
 
+  # Falcon SHARC changes the KernelIntegrator layout, so the build-time kernel must be
+  # compiled with the same define as the host or KernelParams sizes mismatch.
+  if(WITH_FALCON_SHARC)
+    set(hiprt_compile_flags ${hiprt_compile_flags} -D WITH_FALCON_SHARC)
+  endif()
+
   if(WIN32 AND (${HIP_VERSION} STREQUAL "6.1.40252"))
     message(WARNING "HIP SDK ${HIP_VERSION} has known rendering artifacts with HIPRT. 5.7 is recommended instead")
   endif()

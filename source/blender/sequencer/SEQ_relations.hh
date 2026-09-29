@@ -15,6 +15,7 @@
 #include <string>
 
 #include "BLI_enum_flags.hh"
+#include "BLI_map.hh"
 #include "BLI_set.hh"
 
 namespace blender {
@@ -173,8 +174,14 @@ size_t final_image_cache_calc_memory_size(const Scene *scene);
  * 2026-09-21 時点の upstream main にも同じ式が残っている。
  */
 size_t caches_calc_memory_size_unique(const Scene *scene);
-void source_image_cache_collect_images(const Scene *scene, Set<const ImBuf *> &r_images);
-void final_image_cache_collect_images(const Scene *scene, Set<const ImBuf *> &r_images);
+/**
+ * キャッシュが持つ絵を「実体(ポインタ)→ メモリ上の大きさ」で `r_images` へ足す。
+ * ★大きさは**それぞれのキャッシュの錠を持っている間に**測る。`ImBuf *` だけ集めて錠を放してから
+ * 読むと、その間に別のスレッド(先読みの側は `seq_render_mutex` を持たずに `is_cache_full()` を呼ぶ)が
+ * 追い出して解放した絵を読むことになる。ポインタは重複を消す印にだけ使い、指す先は読まない。
+ */
+void source_image_cache_collect_images(const Scene *scene, Map<const ImBuf *, size_t> &r_images);
+void final_image_cache_collect_images(const Scene *scene, Map<const ImBuf *, size_t> &r_images);
 
 bool exists_in_seqbase(const Strip *strip, const ListBaseT<Strip> *seqbase);
 

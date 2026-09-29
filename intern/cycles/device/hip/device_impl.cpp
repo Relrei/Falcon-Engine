@@ -231,6 +231,13 @@ string HIPDevice::compile_kernel_get_common_cflags(const uint kernel_features)
   cflags += " -DWITH_CYCLES_DEBUG";
 #  endif
 
+  /* Falcon SHARC changes the KernelIntegrator layout (and the integrator state layout), so the
+   * runtime-compiled kernel must use the same define as the host or the KernelParams sizes
+   * mismatch. Also covers HIP-RT, which builds on these flags. */
+#  ifdef WITH_FALCON_SHARC
+  cflags += " -DWITH_FALCON_SHARC";
+#  endif
+
   return cflags;
 }
 

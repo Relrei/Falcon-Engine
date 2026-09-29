@@ -189,11 +189,14 @@ DeviceInfo blender_device_info(blender::UserDef &b_preferences,
       preferences_device = Device::get_multi_device(used_devices, threads, background);
     }
 
-    /* Falcon safety net: a GPU compute device was requested, but device matching
-     * left us on the CPU (this is exactly how the OptiX->CUDA viewport downgrade
-     * used to run the viewport on the CPU). Never silently fall back to the CPU
-     * for interactive rendering -- bind every available OptiX GPU instead. */
-    if (preferences_device.type == DEVICE_CPU && !background) {
+    /* Falcon safety net: the OptiX->CUDA viewport downgrade found no device at all (this
+     * is exactly how it used to run the viewport on the CPU). Do not silently fall back to
+     * the CPU there -- bind every available OptiX GPU instead.
+     *
+     * Only for the downgrade and only when nothing matched: without the downgrade, or with the
+     * CPU ticked / every GPU unticked in Preferences, that is the user's own choice and stock
+     * Cycles honours it. */
+    if (falcon_viewport_downgrade && used_devices.empty()) {
       vector<DeviceInfo> gpu_devices;
       for (const DeviceInfo &info :
            Device::available_devices(DEVICE_MASK_CPU | DEVICE_MASK_OPTIX))

@@ -280,11 +280,12 @@ Vector<std::string> filelist_file_expand_full_paths(const FileList *filelist,
 
   Vector<std::string> paths;
   if (file->typeflag & FILE_TYPE_IMAGE_SEQUENCE) {
-    char dir[FILE_MAX_LIBEXTRA];
-    BLI_path_split_dir_part(full_path, dir, sizeof(dir));
+    /* The expanded names are relative to the list root and already carry the sub-directory of
+     * `relpath` (recursive listing), so join them with the root, not with the file's directory. */
+    const char *root = filelist_dir(filelist);
     for (const std::string &name : filelist_file_expand_names(file)) {
       char frame_path[FILE_MAX_LIBEXTRA];
-      BLI_path_join(frame_path, sizeof(frame_path), dir, name.c_str());
+      BLI_path_join(frame_path, sizeof(frame_path), root, name.c_str());
       paths.append(frame_path);
     }
   }

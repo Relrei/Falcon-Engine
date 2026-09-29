@@ -100,9 +100,9 @@ void filelist_file_get_full_path(const FileList *filelist,
  * for every frame in `seq_first..seq_last`. This returns one name per frame, in frame order. Any
  * other entry stands for itself and yields #FileDirEntry::relpath alone.
  *
- * Names are relative to the file list root, exactly like #FileDirEntry::relpath, so
- * #filelist_dir() (or the directory part of #filelist_file_get_full_path()) turns them into full
- * paths.
+ * Names are relative to the file list root, exactly like #FileDirEntry::relpath (so they already
+ * carry any sub-directory of it), so #filelist_dir() turns them into full paths. Do not join them
+ * with the directory part of #filelist_file_get_full_path(), that would double the sub-directory.
  */
 Vector<std::string> filelist_file_expand_names(const FileDirEntry *file);
 /**

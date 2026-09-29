@@ -16,7 +16,7 @@ from .crop_core import (
     get_crop_state, set_crop_active, get_draw_data, set_draw_data,
     get_draw_handle, set_draw_handle, clear_crop_state,
     get_strip_geometry_with_flip_support, is_strip_visible_at_frame, point_in_polygon,
-    get_strips, get_selected_strips,
+    get_strips, get_selected_strips, get_scene,
     get_strip_dimensions, get_edge_midpoints, get_strip_flip_state,
     res_to_screen, compute_crop_delta, apply_crop_changes, autokey_crop,
     handle_window_position, suppressed_handles_for_strip, SELECT_RADIUS
@@ -43,7 +43,7 @@ class EASYCROP_OT_crop(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context: bpy.types.Context):
-        scene = context.scene
+        scene = get_scene(context)
         if not scene.sequence_editor:
             return False
 
@@ -68,8 +68,8 @@ class EASYCROP_OT_crop(bpy.types.Operator):
             self.report({'WARNING'}, "Crop mode already active")
             return {'CANCELLED'}
 
-        strip = context.scene.sequence_editor.active_strip
-        current_frame = context.scene.frame_current
+        strip = get_scene(context).sequence_editor.active_strip
+        current_frame = get_scene(context).frame_current
 
         has_suitable_active = (strip and
                               hasattr(strip, 'crop') and
@@ -90,7 +90,7 @@ class EASYCROP_OT_crop(bpy.types.Operator):
                 if not event.shift:
                     bpy.ops.sequencer.select_all(action='DESELECT')
                 clicked_strip.select = True
-                context.scene.sequence_editor.active_strip = clicked_strip
+                get_scene(context).sequence_editor.active_strip = clicked_strip
                 strip = clicked_strip
                 has_suitable_active = True
             else:
@@ -150,6 +150,16 @@ class EASYCROP_OT_crop(bpy.types.Operator):
         return {'RUNNING_MODAL'}
 
     def modal(self, context: bpy.types.Context, event: bpy.types.Event):
+        # Blender does not call cancel() for a modal() that raises, so a failure
+        # here would leave the draw handler and timer running, the gizmo tool
+        # standing down and the pointer hidden. Take the session down first.
+        try:
+            return self._modal(context, event)
+        except Exception:
+            self.finish(context, cancelled=True)
+            raise
+
+    def _modal(self, context: bpy.types.Context, event: bpy.types.Event):
         draw_data = get_draw_data()
 
         if hasattr(event, 'mouse_region_x') and hasattr(event, 'mouse_region_y'):
@@ -163,7 +173,7 @@ class EASYCROP_OT_crop(bpy.types.Operator):
                     area.tag_redraw()
             return {'RUNNING_MODAL'}
 
-        strip = context.scene.sequence_editor.active_strip
+        strip = get_scene(context).sequence_editor.active_strip
         if not strip:
             return self.finish(context)
 
@@ -199,10 +209,10 @@ class EASYCROP_OT_crop(bpy.types.Operator):
                     if not event.shift:
                         bpy.ops.sequencer.select_all(action='DESELECT')
                     clicked_strip.select = True
-                    context.scene.sequence_editor.active_strip = clicked_strip
+                    get_scene(context).sequence_editor.active_strip = clicked_strip
                     # This addon's own operator, registered into Blender's
                     # own namespace, so no type stub knows about it.
-                    bpy.ops.sequencer.crop('INVOKE_DEFAULT')  # pyright: ignore[reportAttributeAccessIssue]
+                    bpy.ops.sequencer.easycrop_crop('INVOKE_DEFAULT')  # pyright: ignore[reportAttributeAccessIssue]
                     return {'FINISHED'}
                 else:
                     return self.finish(context)
@@ -342,8 +352,8 @@ class EASYCROP_OT_crop(bpy.types.Operator):
 
         if handle_index >= 0:
             position = handle_window_position(
-                context.scene.sequence_editor.active_strip,
-                context.scene, context.region, handle_index)
+                get_scene(context).sequence_editor.active_strip,
+                get_scene(context), context.region, handle_index)
             if position:
                 context.window.cursor_warp(*position)
 
@@ -382,8 +392,8 @@ class EASYCROP_OT_crop(bpy.types.Operator):
         set computed separately can disagree with the distances the hit test
         then measures.
         """
-        strip = context.scene.sequence_editor.active_strip
-        scene = context.scene
+        strip = get_scene(context).sequence_editor.active_strip
+        scene = get_scene(context)
         if not strip or not context.region:
             return [], [], frozenset()
 
@@ -438,7 +448,7 @@ class EASYCROP_OT_crop(bpy.types.Operator):
 
     def _update_crop(self, context, event):
         """Update crop values based on mouse drag with flip support."""
-        strip = context.scene.sequence_editor.active_strip
+        strip = get_scene(context).sequence_editor.active_strip
         if not strip or not hasattr(strip, 'crop') or not strip.crop:
             return
 
@@ -450,7 +460,7 @@ class EASYCROP_OT_crop(bpy.types.Operator):
 
         dx_res, dy_res, flip_x, flip_y = compute_crop_delta(
             dx, dy, context.region.view2d, strip)
-        strip_width, strip_height = get_strip_dimensions(strip, context.scene)
+        strip_width, strip_height = get_strip_dimensions(strip, get_scene(context))
         self.crop_current = apply_crop_changes(
             self.active_corner, strip, dx_res, dy_res,
             self.crop_current, strip_width, strip_height, flip_x, flip_y)
@@ -503,7 +513,7 @@ class EASYCROP_OT_crop(bpy.types.Operator):
         hands such a strip the whole render rectangle, and a sound strip on a
         higher channel then swallows every click-through test.
         """
-        scene = context.scene
+        scene = get_scene(context)
         if not scene.sequence_editor:
             return []
 
@@ -519,7 +529,7 @@ class EASYCROP_OT_crop(bpy.types.Operator):
 
     def _is_mouse_over_strip(self, context, strip, mouse_pos):
         """Check if mouse is over the given strip with flip support."""
-        scene = context.scene
+        scene = get_scene(context)
         corners, _, _ = get_strip_geometry_with_flip_support(strip, scene)
 
         view2d = context.region.view2d

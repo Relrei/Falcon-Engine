@@ -350,6 +350,26 @@ void PathTraceWorkGPU::render_samples(RenderStatistics &statistics,
                                       const int samples_num,
                                       const int sample_offset)
 {
+#ifdef WITH_FALCON_SHARC
+  /* Falcon light tracing splats at ABSOLUTE raster (x, y) of one full-frame
+   * buffer, addressed as offset 0 / stride = camera width (falcon_lt_splat_px):
+   * the kernel has no buffer extent to bound that against. A border render or a
+   * multi-device slice would therefore write into the wrong rows or past the end
+   * of the buffer, so refuse to trace instead of corrupting memory. */
+  if (device_scene_->data.integrator.falcon_lighttrace) {
+    const KernelCamera &lt_cam = device_scene_->data.cam;
+    if (effective_buffer_params_.offset != 0 ||
+        effective_buffer_params_.stride != (int)lt_cam.width ||
+        effective_buffer_params_.width != (int)lt_cam.width ||
+        effective_buffer_params_.height != (int)lt_cam.height)
+    {
+      LOG_WARNING << "Falcon light tracing needs a single full-frame render buffer "
+                     "(no border render, no multi-device split); skipping the light-trace pass.";
+      return;
+    }
+  }
+#endif
+
   /* Limit number of states for the tile and rely on a greedy scheduling of tiles. This allows to
    * add more work (because tiles are smaller, so there is higher chance that more paths will
    * become busy after adding new tiles). This is especially important for the shadow catcher which

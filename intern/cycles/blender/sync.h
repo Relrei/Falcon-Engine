@@ -155,6 +155,9 @@ class BlenderSync {
   void sync_film(blender::ViewLayer &b_view_layer,
                  blender::bScreen *b_screen,
                  blender::View3D *b_v3d);
+  /* Falcon: passes the SHARC warmup/live deposit needs in the viewport (which never runs
+   * sync_render_passes). */
+  void sync_falcon_viewport_passes();
   void sync_view();
 
   /* Shader */

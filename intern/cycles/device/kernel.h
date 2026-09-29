@@ -20,6 +20,7 @@ CCL_NAMESPACE_BEGIN
 bool device_kernel_has_shading(DeviceKernel kernel);
 bool device_kernel_has_intersection(DeviceKernel kernel);
 bool device_kernel_has_gpu_function(DeviceKernel kernel);
+bool device_kernel_is_cuda_only(DeviceKernel kernel);
 
 const char *device_kernel_as_string(DeviceKernel kernel);
 

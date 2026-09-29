@@ -198,6 +198,16 @@ ccl_device_inline float3 falcon_lt_connect(KernelGlobals kg,
 ccl_device_inline void falcon_lt_splat_px(
     KernelGlobals kg, ccl_global float *render_buffer, const int x, const int y, const float3 rgb)
 {
+  /* Combined disabled: pass_combined is PASS_UNUSED (-1) and the write below
+   * would land one float before the pixel. Nothing to splat into. */
+  if (kernel_data.film.pass_combined == PASS_UNUSED) {
+    return;
+  }
+  /* (x, y) are absolute raster coordinates, addressed as offset 0 / stride =
+   * camera width: valid only for the single full-frame buffer this pass is
+   * defined for. The host (PathTraceWork*::render_samples) refuses to run a
+   * light-trace pass on any other buffer geometry (border render, multi-device
+   * slice), because the kernel has no buffer extent to bound against. */
   const uint64_t idx = (uint64_t)(x + y * (int)kernel_data.cam.width);
   ccl_global float *buf = render_buffer + idx * kernel_data.film.pass_stride +
                           kernel_data.film.pass_combined;

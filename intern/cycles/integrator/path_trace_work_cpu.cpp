@@ -19,6 +19,7 @@
 #include "scene/scene.h"
 #include "session/buffers.h"
 
+#include "util/log.h"
 #include "util/tbb.h"
 #include "util/time.h"
 
@@ -71,6 +72,26 @@ void PathTraceWorkCPU::render_samples(RenderStatistics &statistics,
                                       const int samples_num,
                                       const int sample_offset)
 {
+#ifdef WITH_FALCON_SHARC
+  /* Falcon light tracing splats at ABSOLUTE raster (x, y) of one full-frame
+   * buffer, addressed as offset 0 / stride = camera width (falcon_lt_splat_px):
+   * the kernel has no buffer extent to bound that against. A border render or a
+   * multi-device slice would therefore write into the wrong rows or past the end
+   * of the buffer, so refuse to trace instead of corrupting memory. */
+  if (device_scene_->data.integrator.falcon_lighttrace) {
+    const KernelCamera &lt_cam = device_scene_->data.cam;
+    if (effective_buffer_params_.offset != 0 ||
+        effective_buffer_params_.stride != (int)lt_cam.width ||
+        effective_buffer_params_.width != (int)lt_cam.width ||
+        effective_buffer_params_.height != (int)lt_cam.height)
+    {
+      LOG_WARNING << "Falcon light tracing needs a single full-frame render buffer "
+                     "(no border render, no multi-device split); skipping the light-trace pass.";
+      return;
+    }
+  }
+#endif
+
   const int64_t image_width = effective_buffer_params_.width;
   const int64_t image_height = effective_buffer_params_.height;
   const int64_t total_pixels_num = image_width * image_height;
@@ -153,6 +174,16 @@ void PathTraceWorkCPU::render_samples_full_pipeline(ThreadKernelGlobalsCPU *kern
       if (!kernels_.integrator_init_from_camera(
               kernel_globals, state, &sample_work_tile, render_buffer))
       {
+#ifdef WITH_FALCON_SHARC
+        /* Falcon photon pass: false there means this ONE photon was dropped
+         * (no emitting light, spot rim, area spread) and the rest of the samples
+         * are still photons to trace, not a converged pixel. Breaking out
+         * under-counted the bake while the flux stays normalised by N. */
+        if (kernel_globals->data.integrator.falcon_photon_pass) {
+          ++sample_work_tile.start_sample;
+          continue;
+        }
+#endif
         break;
       }
     }

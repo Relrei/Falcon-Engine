@@ -1300,6 +1300,19 @@ static void camera_view_fixed_size(BufferParams &params,
   }
   const float aspect = aspect_x / aspect_y;
 
+  /* What is on screen is the whole camera frame -- unless the scene has a Render Region
+   * (R_BORDER), which the border above then follows: a rectangle of the frame whose aspect is the
+   * frame's scaled by the region's own proportions (blender_camera_border). Take the height from
+   * that one, or the buffer stops agreeing with border_height * scale. */
+  float region_aspect = aspect;
+  if (r.mode & blender::R_BORDER) {
+    const float region_w = r.border.xmax - r.border.xmin;
+    const float region_h = r.border.ymax - r.border.ymin;
+    if (region_w > 0.0f && region_h > 0.0f) {
+      region_aspect = aspect * region_w / region_h;
+    }
+  }
+
   /* The camera frame fitted into the region: the axis that runs out first is what limits it. */
   const int fit_width = max(1, min(width, (int)lroundf((float)height * aspect)));
 
@@ -1323,7 +1336,7 @@ static void camera_view_fixed_size(BufferParams &params,
     fixed_width = clamp((int)lroundf((float)fit_width * powf(size_step, (float)steps)), 1,
                         fit_width);
   }
-  const int fixed_height = max(1, (int)lroundf((float)fixed_width / aspect));
+  const int fixed_height = max(1, (int)lroundf((float)fixed_width / region_aspect));
   if (fixed_width == border_width && fixed_height == border_height) {
     FIXED_SIZE_BAIL("already the fixed size");
   }

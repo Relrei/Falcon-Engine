@@ -26,13 +26,18 @@ namespace blender::seq {
 struct FastPathCut {
   /** Absolute path of the movie the frames come from. */
   char path[1024] = "";
-  /** First frame used, counted from the start of the source. */
+  /** First source frame used, counted from the start of the file. Already includes the
+   * strip's `anim_startofs`, so it is the frame the normal render would decode. */
   int in_frame = 0;
   int n_frames = 0;
 };
 
 /**
  * Collect the cuts if this timeline is nothing but cuts of movie files.
+ *
+ * \a frame_start / \a frame_end / \a frame_step are the range that is really being
+ * rendered (the arguments of `RE_RenderAnim`), which is not always `rd->sfra` / `rd->efra`
+ * (`blender -f N`, the render operator's frame range). A step other than 1 is refused.
  *
  * Returns false when it is not, with one line in \a r_reason saying which condition
  * was not met. Being told "no" is the normal case, not an error: the caller renders
@@ -44,6 +49,9 @@ struct FastPathCut {
  */
 bool fastpath_cuts_get(const Scene *scene,
                        const RenderData *rd,
+                       int frame_start,
+                       int frame_end,
+                       int frame_step,
                        Vector<FastPathCut> &r_cuts,
                        char *r_reason,
                        int reason_maxncpy);

@@ -648,16 +648,21 @@ ccl_device_forceinline int integrate_surface_bsdf_bssrdf_bounce(
    * i.e. the excess tracked eta^2 and nothing else. The existing calibration
    * control (the E*albedo/pi direct floor, 0.158 vs 0.159 analytic) could not
    * see this because that path never refracts. */
-  if ((kernel_data.integrator.falcon_lighttrace || kernel_data.integrator.falcon_photon_pass) &&
-      (label & LABEL_TRANSMIT) && bsdf_eta != 1.0f)
-  {
+#ifdef __FALCON_SHARC__
+  /* The falcon_* KernelIntegrator members only exist with WITH_FALCON_SHARC. */
+  const bool falcon_adjoint_pass = kernel_data.integrator.falcon_lighttrace ||
+                                   kernel_data.integrator.falcon_photon_pass;
+#else
+  const bool falcon_adjoint_pass = false;
+#endif
+  if (falcon_adjoint_pass && (label & LABEL_TRANSMIT) && bsdf_eta != 1.0f) {
     bsdf_weight /= sqr(bsdf_eta);
   }
 
   /* A transmission through IOR=1 glass is a regular direct-light path. Bounce
    * count alone cannot distinguish it from a refractive caustic; remember only
    * genuine specular events until the first diffuse receiver. */
-  if ((kernel_data.integrator.falcon_lighttrace || kernel_data.integrator.falcon_photon_pass) &&
+  if (falcon_adjoint_pass &&
       !(label & LABEL_TRANSPARENT) &&
       (label & (LABEL_SINGULAR | LABEL_GLOSSY)) &&
       ((label & LABEL_REFLECT) ||
@@ -878,7 +883,28 @@ ccl_device int integrate_surface(KernelGlobals kg,
      * untouched, so the same build serves both warmup and blend. Unlike the
      * standalone 5.2 version there is no per-pixel cell buffer: the host warmup
      * deposits via the Position pass instead. */
-    if ((path_visibility & PATH_RAY_VISIBILITY_CAMERA) && kernel_data.integrator.falcon_sharc_active) {
+    bool falcon_sharc_terminate = false;
+    /* Where the blend does NOT apply:
+     *  - photon-bake / light-trace paths: they carry flux from the light, and
+     *    scaling that by (1 - alpha) of a lookup into the cache being filled
+     *    would dim the bake (FALCON_SHARC_MODE is set by the GUI env sync
+     *    during bakes as well);
+     *  - Holdout hits: the holdout keeps its stock semantics (no cached
+     *    radiance behind a holdout);
+     *  - pass-through hits (Transparent / ray portal below the film alpha
+     *    threshold): the host keys the cache on the Position pass, which skips
+     *    them the same way, and the path continues to the first real surface. */
+    const bool falcon_sharc_skip =
+        kernel_data.integrator.falcon_sharc_active &&
+        (kernel_data.integrator.falcon_photon_pass ||
+         (((sd.flag & SD_HOLDOUT) || (sd.object_flag & SD_OBJECT_HOLDOUT_MASK)) &&
+          (path_flag & PATH_RAY_TRANSPARENT_BACKGROUND)) ||
+         ((sd.flag & (SD_TRANSPARENT | SD_RAY_PORTAL)) &&
+          kernel_data.film.pass_alpha_threshold != 0.0f &&
+          average(surface_shader_alpha(&sd)) < kernel_data.film.pass_alpha_threshold));
+    if ((path_visibility & PATH_RAY_VISIBILITY_CAMERA) &&
+        kernel_data.integrator.falcon_sharc_active && !falcon_sharc_skip)
+    {
       const float cell_size = falcon_sharc_cell_size(kernel_data.integrator.falcon_sharc_cell_size);
       ccl_global const float *cache = kernel_data_array(falcon_sharc_cache);
       float3 cached;
@@ -927,13 +953,29 @@ ccl_device int integrate_surface(KernelGlobals kg,
           }
         }
 
+        /* Weighted by the path throughput like every other contribution: the
+         * camera-visibility bit survives transparent bounces (and the throughput
+         * carries e.g. a volume's transmittance), so this is not always 1. */
+        const Spectrum throughput = INTEGRATOR_STATE(state, path, throughput);
         ccl_global float *pixel = film_pass_pixel_render_buffer(kg, state, render_buffer);
         const int sample = INTEGRATOR_STATE(state, path, sample);
-        film_write_combined_pass(
-            kg, path_visibility, path_flag, sample, rgb_to_spectrum(alpha * cached), pixel);
-        INTEGRATOR_STATE_WRITE(state, path, throughput) *= (1.0f - alpha);
+        film_write_combined_pass(kg,
+                                 path_visibility,
+                                 path_flag,
+                                 sample,
+                                 throughput * rgb_to_spectrum(alpha * cached),
+                                 pixel);
         if (terminate) {
-          return LABEL_NONE;
+          /* The path is answered from the cache, but the pixel's data and
+           * denoising passes (Depth / Normal / Position, albedo / normal / depth
+           * guides) must still be written. So do not return here: emission and
+           * the photon layer are skipped (the cached value already holds them),
+           * the passes run as usual on the unscaled throughput, and the path
+           * stops just before the direct light (see below). */
+          falcon_sharc_terminate = true;
+        }
+        else {
+          INTEGRATOR_STATE_WRITE(state, path, throughput) *= (1.0f - alpha);
         }
       }
     }
@@ -948,7 +990,7 @@ ccl_device int integrate_surface(KernelGlobals kg,
      * false positives at shared cells are an accepted v1 approximation
      * (FALCON_PHOTON.md). Avoid combining with MNEE on the same lights:
      * refractive-direct caustics would be counted twice. */
-    if (kernel_data.integrator.falcon_photon_add) {
+    if (kernel_data.integrator.falcon_photon_add && !falcon_sharc_terminate) {
       /* Only ask the cache about surfaces it could have stored anything on. The
        * deposit below keeps photons on surfaces with a diffuse component; the
        * lookup used to run at every vertex regardless, so glass and mirrors --
@@ -1050,8 +1092,15 @@ ccl_device int integrate_surface(KernelGlobals kg,
        * (shallow exit rays, r > ~1.6 m on the ring scene = 25% of the flux) was
        * silently dropped -- the reason dark-floor hero bakes starved for
        * photons at ANY emission count. Pure speculars (d = 0, s > 0) still fall
-       * through to BSDF sampling; dead surfaces (d = 0, s = 0) terminate. */
-      if (d_avg > 0.0f || s_avg == 0.0f) {
+       * through to BSDF sampling; dead surfaces (d = 0, s = 0) terminate.
+       * Except Transparent / ray portal: surface_shader_diffuse/glossy/
+       * transmission do not count them, so a pure Transparent hit (alpha-cutout
+       * foliage, holes) also reads d = s = 0 and used to be "dead" -- it blocked
+       * the photon instead of letting it through. It falls through to BSDF
+       * sampling like a specular hit, which takes the LABEL_TRANSPARENT step as
+       * the camera path does. */
+      const bool pass_through = (sd.flag & (SD_TRANSPARENT | SD_RAY_PORTAL)) != 0;
+      if (d_avg > 0.0f || (s_avg == 0.0f && !pass_through)) {
         const int bounce = INTEGRATOR_STATE(state, path, bounce);
         /* World photons are emitted over the FULL sphere, so a single-sided
          * receiver (e.g. a floor plane) is hit from BELOW as well; those
@@ -1246,7 +1295,12 @@ ccl_device int integrate_surface(KernelGlobals kg,
       }
 
       /* Write emission. */
+#ifdef __FALCON_SHARC__
+      /* (SHARC terminate: the cached radiance already holds this cell's emission.) */
+      if ((sd.flag & SD_EMISSION) && !falcon_sharc_terminate) {
+#else
       if (sd.flag & SD_EMISSION) {
+#endif
         integrate_surface_emission(kg, state, &sd, render_buffer);
       }
 
@@ -1272,6 +1326,14 @@ ccl_device int integrate_surface(KernelGlobals kg,
       film_write_denoising_specular_hit_distance(kg, state, sd.ray_length, render_buffer);
 #endif
     }
+
+#ifdef __FALCON_SHARC__
+    /* SHARC path termination (deferred from the blend above so the data and
+     * denoising passes of the pixel were written first). */
+    if (falcon_sharc_terminate) {
+      return LABEL_NONE;
+    }
+#endif
 
     /* Load random number state. */
     RNGState rng_state;

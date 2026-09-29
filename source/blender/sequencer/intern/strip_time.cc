@@ -352,14 +352,18 @@ int falcon_timeline_channels_shown(const Scene *scene, const ListBaseT<Strip> *s
 
 void channel_flip_sync_from_scene(const Scene *scene)
 {
-  if (scene == nullptr || scene->id.system_properties == nullptr) {
+  if (scene == nullptr) {
     return;
   }
-  const IDProperty *prop = IDP_GetPropertyTypeFromGroup(
-      scene->id.system_properties, FALCON_CHANNEL_FLIP_PROP, IDP_INT);
-  if (prop != nullptr) {
-    channel_flip_set(IDP_int_get(prop) != 0);
+  const IDProperty *prop = nullptr;
+  if (scene->id.system_properties != nullptr) {
+    prop = IDP_GetPropertyTypeFromGroup(
+        scene->id.system_properties, FALCON_CHANNEL_FLIP_PROP, IDP_INT);
   }
+  /* A scene that has never been told falls back to the environment default, instead of keeping
+   * the value of the scene that was drawn before it. */
+  channel_flip_set(prop != nullptr ? (IDP_int_get(prop) != 0) :
+                                     falcon_flip_detail::channel_flip_env_default());
 }
 
 void channel_flip_store(Scene *scene, const bool enable)

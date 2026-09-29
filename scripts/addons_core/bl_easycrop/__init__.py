@@ -28,6 +28,7 @@ from .operators.crop_core import (
     get_crop_state,
     clear_crop_state,
     get_draw_handle,
+    get_scene,
     get_selected_strips
 )
 from .gizmos import (
@@ -45,7 +46,7 @@ class EASYCROP_OT_clear_crop(bpy.types.Operator):
 
     @classmethod
     def poll(cls, context: bpy.types.Context):
-        if not context.scene.sequence_editor:
+        if not get_scene(context).sequence_editor:
             return False
 
         for strip in get_selected_strips(context):
@@ -99,13 +100,14 @@ class EASYCROP_TOOL_crop_handles(WorkSpaceTool):
     @staticmethod
     def draw_settings(context, layout, tool):
         """Report in the tool header why handles are or are not showing."""
-        seq_editor = context.scene.sequence_editor
+        scene = get_scene(context)
+        seq_editor = scene.sequence_editor
         if not seq_editor:
             layout.label(text="No sequence editor")
             return
 
         active_strip = seq_editor.active_strip
-        current_frame = context.scene.frame_current
+        current_frame = scene.frame_current
 
         crop_state = get_crop_state()
         if crop_state['active']:

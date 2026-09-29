@@ -621,9 +621,12 @@ void BlenderSync::sync_integrator(blender::ViewLayer &b_view_layer,
     integrator->set_falcon_lt_splat_radius(get_float(cscene, "falcon_lt_blur"));
     integrator->set_falcon_lt_visibility(get_boolean(cscene, "falcon_lt_visibility"));
     integrator->set_falcon_lt_direct(get_boolean(cscene, "falcon_lt_direct"));
-    integrator->set_falcon_das_map(ustring(get_string(cscene, "falcon_das_map")));
+    /* FILE_PATH strings: a "//" path is relative to the .blend, integrator.cpp fopen()s it raw. */
+    integrator->set_falcon_das_map(
+        ustring(blender_absolute_path(*b_data, nullptr, get_string(cscene, "falcon_das_map"))));
     integrator->set_falcon_das_strength(get_float(cscene, "falcon_das_strength"));
-    integrator->set_falcon_error_map(ustring(get_string(cscene, "falcon_error_map")));
+    integrator->set_falcon_error_map(
+        ustring(blender_absolute_path(*b_data, nullptr, get_string(cscene, "falcon_error_map"))));
     integrator->set_falcon_error_cell(get_float(cscene, "falcon_error_cell"));
     integrator->set_falcon_error_threshold(get_float(cscene, "falcon_error_threshold"));
     integrator->set_falcon_error_raise_alpha(get_boolean(cscene, "falcon_error_raise_alpha"));
@@ -667,6 +670,7 @@ void BlenderSync::sync_film(blender::ViewLayer &b_view_layer,
     const BlenderViewportParameters new_viewport_parameters(b_screen, b_v3d, use_developer_ui);
     film->set_display_pass(new_viewport_parameters.display_pass);
     film->set_show_active_pixels(new_viewport_parameters.show_active_pixels);
+    sync_falcon_viewport_passes();
   }
 
   film->set_exposure(get_float(cscene, "film_exposure"));
@@ -715,13 +719,11 @@ void BlenderSync::sync_film(blender::ViewLayer &b_view_layer,
    * for polished metal too (classroom frame 20 vs a 1024spp reference: chrome
    * chair legs 29.59 -> 29.19 dB, whole frame 29.82 -> 29.71). The guide noise
    * costs more than the reflected detail buys. FALCON_DLSS_FOLLOW_REFLECTIONS
-   * re-enables them to re-run that comparison. */
-  const bool active_dlss = get_boolean(cscene,
-                                       preview ? "use_preview_denoising" : "use_denoising") &&
-                           get_enum(cscene,
-                                    preview ? "preview_denoiser" : "denoiser",
-                                    DENOISER_NUM,
-                                    DENOISER_NONE) == DENOISER_DLSS;
+   * re-enables them to re-run that comparison.
+   *
+   * Ask the integrator (synced just before this), not the RNA: "Automatic" is stored as
+   * DENOISER_NONE and only resolves to DLSS inside get_denoise_params (see sync.h). */
+  const bool active_dlss = is_dlss_denoise_active(scene);
   if (active_dlss && getenv("FALCON_DLSS_FOLLOW_REFLECTIONS") == nullptr) {
     follow_reflections = false;
   }
@@ -913,6 +915,72 @@ static Pass *pass_add(Scene *scene,
   return pass;
 }
 
+#ifdef WITH_FALCON_SHARC
+/* Falcon SHARC warmup/live deposit into the cache using the Position pass, so
+ * those modes force it on regardless of the view layer's pass settings
+ * (otherwise the deposit silently finds no Position pass and does nothing).
+ * The Diffuse Direct/Indirect passes are forced too so warmup can measure the
+ * scene's GI dominance (indirect / (direct + indirect)) and auto-gate the
+ * SHARC blend: SHARC helps GI-dominated scenes but hurts direct-lit ones. */
+static const struct {
+  PassType type;
+  const char *name;
+} falcon_sharc_forced_passes[] = {
+    {PASS_POSITION, "Position"},
+    {PASS_DIFFUSE_DIRECT, "Diffuse Direct"},
+    {PASS_DIFFUSE_INDIRECT, "Diffuse Indirect"},
+};
+
+static bool falcon_sharc_needs_forced_passes(blender::Scene &b_scene)
+{
+  /* The mode now normally comes from the scene (see sync_integrator); the
+   * environment variable still wins so the harnesses keep working. */
+  blender::PointerRNA sharc_scene_ptr = RNA_id_pointer_create(&b_scene.id);
+  blender::PointerRNA sharc_cscene = RNA_pointer_get(&sharc_scene_ptr, "cycles");
+  int sharc_mode = get_enum(sharc_cscene, "falcon_sharc_mode", 4, FALCON_SHARC_MODE_OFF);
+  if (const char *mode = getenv("FALCON_SHARC_MODE")) {
+    sharc_mode = (strcmp(mode, "warmup") == 0) ? FALCON_SHARC_MODE_WARMUP :
+                 (strcmp(mode, "blend") == 0)  ? FALCON_SHARC_MODE_BLEND :
+                 (strcmp(mode, "live") == 0)   ? FALCON_SHARC_MODE_LIVE :
+                                                 FALCON_SHARC_MODE_OFF;
+  }
+  return sharc_mode == FALCON_SHARC_MODE_WARMUP || sharc_mode == FALCON_SHARC_MODE_LIVE;
+}
+#endif
+
+void BlenderSync::sync_falcon_viewport_passes()
+{
+#ifdef WITH_FALCON_SHARC
+  /* The viewport never goes through sync_render_passes: its passes are the default Combined plus
+   * whatever Film::update_passes adds by itself. Without this, warmup/live in the Rendered
+   * viewport finds no Position pass and the deposit skips itself (path_trace.cpp).
+   *
+   * The passes added here carry a name; the automatic ones are anonymous and are dropped again by
+   * Film::update_passes, so the name is what tells them apart. Add when the mode needs them, take
+   * them out again when it does not, and touch nothing in between (each change resets the
+   * render). */
+  const bool needed = falcon_sharc_needs_forced_passes(*b_scene);
+
+  set<Pass *> stale;
+  for (const auto &forced : falcon_sharc_forced_passes) {
+    bool found = false;
+    for (Pass *pass : scene->passes) {
+      if (pass->get_type() == forced.type && pass->get_name() == ustring(forced.name)) {
+        found = true;
+        stale.insert(pass);
+      }
+    }
+    if (needed && !found) {
+      pass_add(scene, forced.type, forced.name);
+    }
+  }
+
+  if (!needed && !stale.empty()) {
+    scene->delete_nodes(stale);
+  }
+#endif
+}
+
 void BlenderSync::sync_render_passes(blender::RenderLayer &b_rlay,
                                      blender::ViewLayer &b_view_layer)
 {
@@ -988,50 +1056,12 @@ void BlenderSync::sync_render_passes(blender::RenderLayer &b_rlay,
   scene->film->set_pass_alpha_threshold(b_view_layer.pass_alpha_threshold);
 
 #ifdef WITH_FALCON_SHARC
-  /* Falcon SHARC warmup/live deposit into the cache using the Position pass, so
-   * force it on for those modes regardless of the view layer's pass settings
-   * (otherwise the deposit silently finds no Position pass and does nothing).
-   * Only add it if the render layer did not already request it. */
-  {
-    /* The mode now normally comes from the scene (see sync_integrator); the
-     * environment variable still wins so the harnesses keep working. */
-    blender::PointerRNA sharc_scene_ptr = RNA_id_pointer_create(&b_scene->id);
-    blender::PointerRNA sharc_cscene = RNA_pointer_get(&sharc_scene_ptr, "cycles");
-    int sharc_mode = get_enum(sharc_cscene, "falcon_sharc_mode", 4, FALCON_SHARC_MODE_OFF);
-    if (const char *mode = getenv("FALCON_SHARC_MODE")) {
-      sharc_mode = (strcmp(mode, "warmup") == 0) ? FALCON_SHARC_MODE_WARMUP :
-                   (strcmp(mode, "blend") == 0)  ? FALCON_SHARC_MODE_BLEND :
-                   (strcmp(mode, "live") == 0)   ? FALCON_SHARC_MODE_LIVE :
-                                                   FALCON_SHARC_MODE_OFF;
-    }
-    if (sharc_mode == FALCON_SHARC_MODE_WARMUP || sharc_mode == FALCON_SHARC_MODE_LIVE) {
-      bool has_position = false;
-      for (const Pass *pass : scene->passes) {
-        if (pass->get_type() == PASS_POSITION) {
-          has_position = true;
-          break;
-        }
-      }
-      if (!has_position) {
-        pass_add(scene, PASS_POSITION, "Position");
-      }
-      /* Also force the Diffuse Direct/Indirect passes so warmup can measure the
-       * scene's GI dominance (indirect / (direct + indirect)) and auto-gate the
-       * SHARC blend: SHARC helps GI-dominated scenes but hurts direct-lit ones. */
-      bool has_diff_dir = false, has_diff_ind = false;
-      for (const Pass *pass : scene->passes) {
-        if (pass->get_type() == PASS_DIFFUSE_DIRECT) {
-          has_diff_dir = true;
-        }
-        else if (pass->get_type() == PASS_DIFFUSE_INDIRECT) {
-          has_diff_ind = true;
-        }
-      }
-      if (!has_diff_dir) {
-        pass_add(scene, PASS_DIFFUSE_DIRECT, "Diffuse Direct");
-      }
-      if (!has_diff_ind) {
-        pass_add(scene, PASS_DIFFUSE_INDIRECT, "Diffuse Indirect");
+  /* Falcon SHARC warmup/live: force the passes the deposit needs (see
+   * falcon_sharc_forced_passes). Only add the ones the render layer did not already request. */
+  if (falcon_sharc_needs_forced_passes(*b_scene)) {
+    for (const auto &forced : falcon_sharc_forced_passes) {
+      if (!Pass::contains(scene->passes, forced.type)) {
+        pass_add(scene, forced.type, forced.name);
       }
     }
   }

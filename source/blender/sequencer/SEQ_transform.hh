@@ -90,18 +90,27 @@ void strip_channel_set(Strip *strip, int channel);
  * every translation unit that includes this header shares the same cached value.
  */
 namespace falcon_flip_detail {
-/** The one runtime copy of the flag. Starts from `FALCON_VSE_FLIP_CHANNELS` (default on) and is
- * then overwritten by the scene's saved value (#channel_flip_sync_from_scene) or by the toolbar
- * button (#channel_flip_store). Inline function-local static = one instance program-wide. */
-inline bool &channel_flip_runtime()
+/** The value `FALCON_VSE_FLIP_CHANNELS` stands for (default on). Read once, see above. Used as
+ * the start value of the runtime flag and for a scene that has never been told
+ * (#channel_flip_sync_from_scene). */
+inline bool channel_flip_env_default()
 {
-  static bool flip = []() {
+  static const bool flip = []() {
     const char *env = std::getenv("FALCON_VSE_FLIP_CHANNELS");
     if (env == nullptr || env[0] == '\0') {
       return true;
     }
     return env[0] != '0';
   }();
+  return flip;
+}
+
+/** The one runtime copy of the flag. Starts from `FALCON_VSE_FLIP_CHANNELS` (default on) and is
+ * then overwritten by the scene's saved value (#channel_flip_sync_from_scene) or by the toolbar
+ * button (#channel_flip_store). Inline function-local static = one instance program-wide. */
+inline bool &channel_flip_runtime()
+{
+  static bool flip = channel_flip_env_default();
   return flip;
 }
 }  // namespace falcon_flip_detail
@@ -121,7 +130,8 @@ inline void channel_flip_set(const bool enable)
  * **その場で切り替えられる値**にした。保存先はチャンネル数と同じ場面の system property なので
  * DNA は増えない。環境変数は「その場面がまだ何も持っていない時の既定」に下がった。
  *
- * 場面が値を持っていれば runtime へ写す。持っていなければ何もしない(環境変数の既定のまま)。
+ * 場面が値を持っていれば runtime へ写す。持っていなければ環境変数の既定へ戻す(前に描いた場面の
+ * 値を引きずらない)。
  * VSE の時間軸を描く直前に呼ぶ = ファイルを開いた時・場面を切り替えた時に自動で追従する。 */
 void channel_flip_sync_from_scene(const Scene *scene);
 

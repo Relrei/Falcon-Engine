@@ -418,22 +418,18 @@ static void file_but_enable_drag(ui::Button *but,
 {
   ID *id;
 
-  /* Falcon: a folded image sequence is one item on screen but stands for every one of its frames.
-   * Drag all of them, so that dropping on e.g. the Video Sequencer builds a single strip out of
-   * the whole sequence instead of an image strip holding the first frame only. This is the same
-   * expansion the file browser does when it hands files to an operator (#file_ops.cc), hence the
-   * shared #filelist_file_expand_names(). */
-  Vector<std::string> drag_path_strings;
-  Vector<const char *> drag_paths;
-  if (file->typeflag & FILE_TYPE_IMAGE_SEQUENCE) {
-    drag_path_strings = filelist_file_expand_full_paths(sfile->files, file);
-    for (const std::string &frame_path : drag_path_strings) {
-      drag_paths.append(frame_path.c_str());
-    }
-  }
-  if (drag_paths.is_empty()) {
-    drag_paths.append(path);
-  }
+  /* Falcon: a folded image sequence is one item on screen but stands for every one of its frames,
+   * and dragging it must hand over all of them (so that dropping on e.g. the Video Sequencer
+   * builds a single strip out of the whole sequence). That expansion is *not* done here: this runs
+   * for every visible tile on every redraw, which would build one path string per frame of every
+   * folded sequence (and classify each by extension) whether or not it is ever dragged.
+   *
+   * Instead it happens when the drag actually starts: #button_drag_start() replaces the path data
+   * with the file browser's selected files, see
+   * #WM_event_drag_path_override_poin_data_with_space_file_paths(). Those come from
+   * #ED_fileselect_selected_files_full_paths(), which expands every folded sequence per frame with
+   * the shared #filelist_file_expand_full_paths() (same enumeration as #file_ops.cc). Pressing on
+   * a tile selects it before the drag starts, so the selection holds the dragged item. */
 
   if ((id = filelist_file_get_id(file))) {
     button_drag_set_id(but, id);
@@ -459,11 +455,11 @@ static void file_but_enable_drag(ui::Button *but,
     }
   }
   else if (preview_image) {
-    button_drag_set_image(but, drag_paths, icon, preview_image, scale);
+    button_drag_set_image(but, path, icon, preview_image, scale);
   }
   else {
     /* path is no more static, cannot give it directly to but... */
-    button_drag_set_path(but, drag_paths);
+    button_drag_set_path(but, path);
   }
 }
 

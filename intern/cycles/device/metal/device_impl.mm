@@ -365,6 +365,12 @@ string MetalDevice::preprocess_source(MetalPipelineType pso_type,
   global_defines += "#define WITH_CYCLES_DEBUG\n";
 #  endif
 
+  /* Falcon SHARC changes the KernelIntegrator / function constant layout, so the shader source
+   * must see the same define as the host. */
+#  ifdef WITH_FALCON_SHARC
+  global_defines += "#define WITH_FALCON_SHARC\n";
+#  endif
+
   global_defines += "#define __KERNEL_METAL_APPLE__\n";
   if (@available(macos 14.0, *)) {
     /* Use Program Scope Global Built-ins, when available. */

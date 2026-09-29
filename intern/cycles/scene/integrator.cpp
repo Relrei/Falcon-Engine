@@ -404,6 +404,19 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
     use_pixel_jitter = true;
   }
 
+#ifdef WITH_FALCON_SHARC
+  /* Scene::update_camera_resolution() tags nothing but `use_pixel_jitter` so that
+   * the jitter (and the seed derived from it) moves on every render iteration.
+   * DLSS forces the jitter on, so with it this is a full device_update per batch.
+   * The Falcon blocks below do not depend on the jitter, and re-running them would
+   * zero the SHARC / photon bake buffers batch by batch (only the last batch would
+   * survive) and re-read and re-upload the caustic map and the DAS / error-field
+   * files every time. They keep what the last full update built (the kernel data
+   * and device buffers persist in dscene). */
+  const bool jitter_only_update = use_pixel_jitter_is_modified() && socket_modified.count() == 1 &&
+                                  !shadow_catcher_needs_recalc_;
+#endif
+
   KernelIntegrator *kintegrator = &dscene->data.integrator;
 
   device_free(device, dscene);
@@ -606,7 +619,7 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
   /* Falcon SHARC is only active when FALCON_SHARC_MODE selects warmup or blend.
    * Everything below is gated on this so a normal render pays nothing: no 64 MB
    * cache allocation and (via falcon_sharc_active) no in-kernel cache lookup. */
-  {
+  if (!jitter_only_update) {
     const int sharc_mode = falcon_knob_sharc_mode(falcon_sharc_mode);
     const bool sharc_active = sharc_mode != FALCON_SHARC_MODE_OFF;
     kintegrator->falcon_sharc_active = sharc_active ? 1 : 0;
@@ -1251,6 +1264,35 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
       }
     }
 
+    /* Release the photon buffers nothing reads or writes any more, so a normal
+     * render (add mode or caustics switched off, no bake) reserves no extra VRAM:
+     * the point buffer (12M points = 432 MB) and its counter belong to the bake
+     * pass, the point buffer and the 4M-slot neighbor grid to the add-mode point
+     * map. */
+    {
+      const bool bake_points = kintegrator->falcon_photon_pass != 0 &&
+                               kintegrator->falcon_photon_point_store != 0;
+      const bool add_points = kintegrator->falcon_photon_add != 0 &&
+                              kintegrator->falcon_photon_point_mode != 0;
+      if (!bake_points && dscene->falcon_photon_pcount.size() != 0) {
+        dscene->falcon_photon_pcount.free();
+      }
+      if (!bake_points && !add_points && dscene->falcon_photon_points.size() != 0) {
+        dscene->falcon_photon_points.free();
+      }
+      if (!add_points) {
+        if (dscene->falcon_photon_grid_start.size() != 0) {
+          dscene->falcon_photon_grid_start.free();
+        }
+        if (dscene->falcon_photon_grid_count.size() != 0) {
+          dscene->falcon_photon_grid_count.free();
+        }
+        if (dscene->falcon_photon_index.size() != 0) {
+          dscene->falcon_photon_index.free();
+        }
+      }
+    }
+
     if (sharc_active) {
       /* Allocate and zero the spatial hash radiance cache. Size must match
        * FALCON_SHARC_CELL_COUNT * FALCON_SHARC_CELL_STRIDE in
@@ -1327,7 +1369,7 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
    * on load. Two things now stop it: the resolution has to match here, and the
    * kernel bounds-checks the index (falcon_das_active carries the element
    * count). Neither changes anything for a correctly built map. */
-  {
+  if (!jitter_only_update) {
     kintegrator->falcon_das_active = 0;
     kintegrator->falcon_das_strength = 0.0f;
     const string map_path = falcon_knob_string("FALCON_DAS_MAP", falcon_das_map);
@@ -1377,7 +1419,7 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
    * the same hash the kernel uses, with a negative value for cells the probe
    * never reached. Armed only when a threshold is set, so a scene that does
    * not opt in pays neither the 16 MB nor the lookup. */
-  {
+  if (!jitter_only_update) {
     kintegrator->falcon_error_cell_size = 0.8f;
     kintegrator->falcon_error_threshold = 0.0f;
     kintegrator->falcon_error_raise_alpha = 0;
@@ -1439,6 +1481,11 @@ void Integrator::device_free(Device * /*unused*/, DeviceScene *dscene, bool forc
   dscene->sample_pattern_lut.free_if_need_realloc(force_free);
 #ifdef WITH_FALCON_SHARC
   dscene->falcon_sharc_cache.free_if_need_realloc(force_free);
+  dscene->falcon_photon_points.free_if_need_realloc(force_free);
+  dscene->falcon_photon_pcount.free_if_need_realloc(force_free);
+  dscene->falcon_photon_grid_start.free_if_need_realloc(force_free);
+  dscene->falcon_photon_grid_count.free_if_need_realloc(force_free);
+  dscene->falcon_photon_index.free_if_need_realloc(force_free);
   dscene->falcon_das_scale.free_if_need_realloc(force_free);
   dscene->falcon_error_field.free_if_need_realloc(force_free);
 #endif

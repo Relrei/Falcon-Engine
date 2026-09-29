@@ -340,8 +340,9 @@ static void filelist_sequence_group_reset(FileList *filelist)
 
 static void filelist_sequence_group_build(FileList *filelist)
 {
-  /* Key is `<head>\x01<tail>\x01<digits>`, so only files that share the exact same name pattern
-   * *and* the same amount of digits can end up in the same sequence. */
+  /* Key is `<dir>\x01<head>\x01<tail>\x01<digits>`, so only files that share the exact same name
+   * pattern, the same amount of digits *and* the same sub-directory (recursive listing) can end up
+   * in the same sequence. */
   Map<std::string, Vector<FileListInternEntry *>> groups;
 
   for (FileListInternEntry &file : filelist->filelist_intern.entries) {
@@ -366,7 +367,10 @@ static void filelist_sequence_group_build(FileList *filelist)
       continue;
     }
 
-    std::string key = std::string(head) + '\x01' + tail + '\x01' + std::to_string(int(digits));
+    /* `relpath` may carry a sub-directory, `filename` is only its last part. */
+    const std::string dir(file.relpath, size_t(filename - file.relpath));
+    std::string key = dir + '\x01' + head + '\x01' + tail + '\x01' +
+                      std::to_string(int(digits));
     groups.lookup_or_add_default(key).append(&file);
     file.seq_first = framenr;
     file.seq_digits = digits;
@@ -434,6 +438,41 @@ static void filelist_sequence_group_build(FileList *filelist)
   }
 }
 
+/**
+ * Only the first frame of a folded sequence reaches the filter function, so a search text would
+ * only be matched against that frame's name. Match it against the display name and against every
+ * frame's name as well (searching `0005` must keep the sequence that contains frame 5).
+ * \return true when the folded sequence \a file matches the search text (and passes the type
+ * filters), false otherwise (also for anything that is not a folded sequence).
+ */
+static bool filelist_sequence_matches_search(const FileListInternEntry *file,
+                                             const FileListFilter *filter)
+{
+  if (!(file->typeflag & FILE_TYPE_IMAGE_SEQUENCE) || file->seq_name == nullptr ||
+      filter->filter_search[0] == '\0' || !is_filtered_file_type(file, filter))
+  {
+    return false;
+  }
+
+  if (fnmatch(filter->filter_search, file->seq_name, FNM_CASEFOLD) == 0) {
+    return true;
+  }
+
+  char head[FILE_MAX], tail[FILE_MAX];
+  ushort digits = 0;
+  BLI_path_sequence_decode(file->relpath, head, sizeof(head), tail, sizeof(tail), &digits);
+  for (int framenr = file->seq_first; framenr <= file->seq_last; framenr++) {
+    char frame_relpath[FILE_MAX];
+    BLI_path_sequence_encode(frame_relpath, sizeof(frame_relpath), head, tail, digits, framenr);
+    if (fnmatch(filter->filter_search, frame_relpath, FNM_CASEFOLD) == 0 ||
+        fnmatch(filter->filter_search, BLI_path_basename(frame_relpath), FNM_CASEFOLD) == 0)
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
 /** \} */
 
 void filelist_filter(FileList *filelist)
@@ -479,7 +518,9 @@ void filelist_filter(FileList *filelist)
     if (file.seq_skip) {
       continue;
     }
-    if (filelist->filter_fn(&file, filelist->filelist.root, &filelist->filter_data)) {
+    if (filelist->filter_fn(&file, filelist->filelist.root, &filelist->filter_data) ||
+        filelist_sequence_matches_search(&file, &filelist->filter_data))
+    {
       filtered_tmp[num_filtered++] = &file;
     }
   }

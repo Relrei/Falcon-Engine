@@ -54,6 +54,21 @@ def get_strips(sequence_editor):
     return sequence_editor.sequences
 
 
+def get_scene(context):
+    """The scene whose strips are being edited: the sequencer scene.
+
+    WARNING: never context.scene for anything a strip is read from. The window
+    scene and the scene the sequencer shows are two different things since 5.0
+    (and are on purpose in the Falcon build, where the strips live in their own
+    scene), so context.scene.sequence_editor is None there while
+    selected_strips still finds the strips. The frame keys are written at and
+    the resolution the preview is laid out in are the sequencer scene's too.
+    Falls back to context.scene where there is no sequencer scene to ask (4.x).
+    """
+    scene = getattr(context, "sequencer_scene", None)
+    return scene if scene is not None else context.scene
+
+
 def get_selected_strips(context):
     """Get selected strips from context (compat for 4.4/5.0).
 
@@ -248,8 +263,12 @@ def compute_crop_delta(dx_pixels, dy_pixels, view2d, strip):
         dx_view, dy_view = (dx_view * cos_a - dy_view * sin_a,
                             dx_view * sin_a + dy_view * cos_a)
 
-    dx_res = dx_view / strip.transform.scale_x
-    dy_res = dy_view / strip.transform.scale_y
+    # A strip may be scaled to 0, which leaves nothing on screen to drag: no
+    # movement, rather than a ZeroDivisionError out of the modal operator.
+    scale_x = strip.transform.scale_x
+    scale_y = strip.transform.scale_y
+    dx_res = dx_view / scale_x if scale_x else 0.0
+    dy_res = dy_view / scale_y if scale_y else 0.0
 
     # On a mirrored axis, dragging right moves the image left.
     if flip_x:
@@ -332,7 +351,7 @@ def autokey_crop(context, strip, handle_index, flip_x, flip_y):
     if tool_settings is None or not tool_settings.use_keyframe_insert_auto:
         return ()
 
-    frame = context.scene.frame_current
+    frame = get_scene(context).frame_current
     keyed = crop_props_for_handle(handle_index, flip_x, flip_y)
     for prop in keyed:
         strip.crop.keyframe_insert(prop, frame=frame, group="Crop")

@@ -256,8 +256,16 @@ ccl_device_inline ShaderEvalResult integrate_sun_lights(
 
     /* Write to render buffer. */
     guiding_record_background(kg, state, eval, mis_weight);
-    film_write_surface_emission(
-        kg, state, eval, mis_weight, render_buffer, object_lightgroup(kg, klight->object_id));
+#ifdef __FALCON_SHARC__
+    /* 光子パスでは太陽にも書かない(背景・ランプ・発光メッシュと同じ囲い)。
+     * 光子の (x,y) は発射番号の画素なので、SHADER_USE_MIS の太陽へ抜けた光子が
+     * throughput * 太陽の放射を発射画素へ落としてホタルになる。 */
+    if (!kernel_data.integrator.falcon_photon_pass)
+#endif
+    {
+      film_write_surface_emission(
+          kg, state, eval, mis_weight, render_buffer, object_lightgroup(kg, klight->object_id));
+    }
   }
 
   return SHADER_EVAL_OK;
