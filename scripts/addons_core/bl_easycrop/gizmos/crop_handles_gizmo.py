@@ -18,7 +18,7 @@ from bpy.types import Gizmo, GizmoGroup
 from mathutils import Vector, Matrix
 
 from ..operators.crop_core import (
-    get_crop_state, is_strip_visible_at_frame,
+    get_crop_state, is_strip_visible_at_frame, get_scene,
     get_strip_geometry_with_flip_support, get_strip_flip_state,
     get_strip_dimensions, get_edge_midpoints,
     res_to_screen, compute_crop_delta, apply_crop_changes, autokey_crop,
@@ -125,7 +125,7 @@ class EASYCROP_GT_crop_handle(Gizmo):
         """Start handle dragging."""
         if self.handle_type == "center":
             try:
-                # sequencer.crop is this addon's own operator, registered into
+                # sequencer.easycrop_crop is this addon's own operator, registered into
                 # Blender's own namespace, so no type stub knows about it.
                 bpy.ops.sequencer.easycrop_crop('INVOKE_DEFAULT')  # pyright: ignore[reportAttributeAccessIssue]
                 return {'FINISHED'}
@@ -152,7 +152,7 @@ class EASYCROP_GT_crop_handle(Gizmo):
             self._modal_draw_handler = bpy.types.SpaceSequenceEditor.draw_handler_add(
                 self._draw_handles_during_modal, (), 'PREVIEW', 'POST_PIXEL')
 
-            strip = context.scene.sequence_editor.active_strip
+            strip = get_scene(context).sequence_editor.active_strip
             if strip and hasattr(strip, 'crop') and strip.crop:
                 self.crop_start = (float(strip.crop.min_x), float(strip.crop.max_x),
                                    float(strip.crop.min_y), float(strip.crop.max_y))
@@ -184,7 +184,7 @@ class EASYCROP_GT_crop_handle(Gizmo):
         # WARNING: do not wrap this in a blanket except. last_mouse_pos has
         # already advanced, so a swallowed failure consumes the event's delta and
         # the drag carries on with the crop no longer tracking the cursor.
-        strip = context.scene.sequence_editor.active_strip
+        strip = get_scene(context).sequence_editor.active_strip
         if strip and hasattr(strip, 'crop'):
             self._update_crop_from_gizmo_drag(context, delta, strip)
 
@@ -197,7 +197,7 @@ class EASYCROP_GT_crop_handle(Gizmo):
     def _draw_handles_during_modal(self):
         """Custom drawing function to keep handles visible during modal."""
         context = bpy.context
-        scene = context.scene
+        scene = get_scene(context)
         if not scene.sequence_editor or not scene.sequence_editor.active_strip:
             return
 
@@ -268,7 +268,7 @@ class EASYCROP_GT_crop_handle(Gizmo):
         Gizmos get no undo step of their own, so without the push here a crop
         dragged with the tool cannot be undone at all.
         """
-        strip = context.scene.sequence_editor.active_strip
+        strip = get_scene(context).sequence_editor.active_strip
         if not strip or not hasattr(strip, 'crop') or not strip.crop:
             return
 
@@ -304,8 +304,8 @@ class EASYCROP_GT_crop_handle(Gizmo):
         flat_index = (self.handle_index if self.handle_type == "corner"
                       else self.handle_index + 4)
         position = handle_window_position(
-            context.scene.sequence_editor.active_strip,
-            context.scene, context.region, flat_index)
+            get_scene(context).sequence_editor.active_strip,
+            get_scene(context), context.region, flat_index)
         if not position:
             return
         final_x, final_y = position
@@ -350,7 +350,7 @@ class EASYCROP_GT_crop_handle(Gizmo):
             context.space_data.show_gizmo = self._saved_gizmo_state
 
         if cancel and hasattr(self, 'crop_start'):
-            strip = context.scene.sequence_editor.active_strip
+            strip = get_scene(context).sequence_editor.active_strip
             if strip and hasattr(strip, 'crop') and strip.crop:
                 strip.crop.min_x = int(self.crop_start[0])
                 strip.crop.max_x = int(self.crop_start[1])
@@ -369,7 +369,7 @@ class EASYCROP_GT_crop_handle(Gizmo):
 
         dx_res, dy_res, flip_x, flip_y = compute_crop_delta(
             delta[0], delta[1], region.view2d, strip)
-        strip_width, strip_height = get_strip_dimensions(strip, context.scene)
+        strip_width, strip_height = get_strip_dimensions(strip, get_scene(context))
 
         # Convert gizmo handle type/index to unified handle index (0-7)
         handle_index = self.handle_index if self.handle_type == "corner" else self.handle_index + 4
@@ -405,17 +405,17 @@ class EASYCROP_GGT_crop_handles(GizmoGroup):
         if context.space_data.display_mode != 'IMAGE':
             return False
 
-        if not context.scene.sequence_editor:
+        if not get_scene(context).sequence_editor:
             return False
 
-        active_strip = context.scene.sequence_editor.active_strip
+        active_strip = get_scene(context).sequence_editor.active_strip
         if not active_strip or not hasattr(active_strip, 'crop'):
             return False
 
         if not active_strip.select:
             return False
 
-        current_frame = context.scene.frame_current
+        current_frame = get_scene(context).frame_current
         if not is_strip_visible_at_frame(active_strip, current_frame):
             return False
 
@@ -470,7 +470,7 @@ class EASYCROP_GGT_crop_handles(GizmoGroup):
         if self._drag_active:
             return
 
-        scene = context.scene
+        scene = get_scene(context)
         if not scene.sequence_editor or not scene.sequence_editor.active_strip:
             return
 

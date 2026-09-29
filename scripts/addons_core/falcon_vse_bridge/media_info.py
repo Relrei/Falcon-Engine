@@ -56,6 +56,10 @@ def _bit_depth(stream):
     match = re.search(r"p(\d+)(le|be)?$", pix_fmt)            # yuv420p10le, gbrap12le
     if match:
         return int(match.group(1))
+    # Float formats (OpenEXR: gbrpf32le, gbrapf16le, rgbaf32le, grayf32le): 16 or 32 bits per component.
+    match = re.search(r"f(16|32)(le|be)?$", pix_fmt)
+    if match:
+        return int(match.group(1))
     if re.search(r"(rgb|bgr)48|(rgba|bgra)64|gray16|ya16", pix_fmt):
         return 16
     match = re.search(r"gray(\d+)", pix_fmt)
@@ -139,11 +143,17 @@ def _image_header(path):
 
 
 def _total_size(paths):
-    key = tuple(_stat_key(p) for p in paths)
+    # This runs on every draw of the panel. The key is only the count and the first and last
+    # file: stat-ing every file of a long image sequence just to look the answer up would be
+    # thousands of system calls per redraw. The sizes are read once, on a miss.
+    if not paths:
+        return 0
+    key = (len(paths), _stat_key(paths[0]), _stat_key(paths[-1]))
     if key in _size_cache:
         return _size_cache[key]
     total = 0
-    for k in key:
+    for path in paths:
+        k = _stat_key(path)
         if k is not None:
             total += k[1]
     _size_cache[key] = total

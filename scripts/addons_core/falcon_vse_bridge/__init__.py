@@ -429,18 +429,25 @@ def _written_by_this_render(scene, path):
         return False
 
 
-def output_target(scene):
+def output_target(scene, fresh_only=True):
     """出力先に「出来ている物」を返す。
 
     戻り値 = (kind, paths, frame_start) / 何も無ければ None。
       kind = 'MOVIE' なら paths は動画1本、'IMAGE' なら連番のファイル列。
+
+    `fresh_only`: 今回のレンダーが書いた物だけを返す(自動の側)。False は新旧おかまいなし
+    (手で押す口。冒頭の表のとおり)。
     """
     rd = scene.render
+
+    def usable(path):
+        return bool(path) and os.path.isfile(path) and (
+            not fresh_only or _written_by_this_render(scene, path))
 
     if rd.is_movie_format:
         # 動画は 1 本。名前にコマ範囲が入る(0001-0003.mp4)。
         path = _frame_path(rd, scene.frame_start)
-        if path and os.path.isfile(path) and _written_by_this_render(scene, path):
+        if usable(path):
             return ('MOVIE', [path], int(scene.frame_start))
         return None
 
@@ -452,7 +459,7 @@ def output_target(scene):
     first = None
     for f in frames:
         path = _frame_path(rd, f)
-        if path and os.path.isfile(path) and _written_by_this_render(scene, path):
+        if usable(path):
             if first is None:
                 first = f
             # Preserve the duration of stepped renders; repeat references, not image files.
@@ -1515,6 +1522,8 @@ def clear_preview_range_on_load():
 
 @persistent
 def _on_load_post(*args):
+    # ★レンダーの開始時刻はシーン名で覚えている。別のファイルの同じ名前へ持ち越さない。
+    _render_started.clear()
     # ★メッセージバスの購読はファイルを読み込むと消える。張り直す。
     _subscribe_workspace()
     # 「自動」の場面に GPU 再生などを当てる(`apply_auto_all` の注記)。
@@ -1573,6 +1582,9 @@ def _on_render_complete(scene, *args):
     try:
         _render_complete(scene)
     finally:
+        # ★判定(`_render_complete` の `output_target`)が済んだら開始時刻は要らない。
+        #   残すと、次の判定(別の出力先・別のファイル)が古い開始時刻で弾かれる。
+        _render_started.pop(scene.name, None)
         # ★何があっても `render.filepath` は元へ戻す。
         restore_output_name(scene)
 
@@ -1739,7 +1751,8 @@ class FALCON_OT_vse_edit(Operator):
         from . import scene_follow
         scene = scene_follow.source_scene(context.scene)  # VSE に揃えた窓でも 3D のレンダーの出力
         with output_name_applied(scene):
-            target = output_target(scene)
+            # ★手で押す口は新旧おかまいなし(冒頭の表)。時刻で落とすのは自動の側だけ。
+            target = output_target(scene, fresh_only=False)
         if target is None:
             self.report({'WARNING'}, "No files at the output path")
             return {'CANCELLED'}
@@ -2131,11 +2144,26 @@ def machine_report():
         flags = _cpu_flags()
         _machine_cache.update({
             "gpu": _machine_has_nvidia(),
+            # ★/proc/cpuinfo は Linux にしか無い。ここは読めた時だけの写しで、
+            #   AVX2 の正本は C++ の `falcon_cpu_has_avx2`(`_cpu_has_avx2`)。
+            #   AVX-512 には C++ の口が無いので、読めなかった時は「不明」(None)。
             "avx2": "avx2" in flags,
-            "avx512": "avx512f" in flags,
+            "avx512": ("avx512f" in flags) if flags else None,
             "sse42": "sse4_2" in flags,
         })
     return _machine_cache
+
+
+def _cpu_has_avx2(scene):
+    """この CPU が AVX2 を持っているか。正本は C++ が答える `scene.falcon_cpu_has_avx2`。
+
+    ★Windows などでは /proc/cpuinfo が無く、写しは常に False になる
+      (CPU カーネルの選択が灰色のままになり、行の表示も食い違った)。
+      C++ の口が読めない時だけ写しに落ちる。"""
+    try:
+        return bool(scene.falcon_cpu_has_avx2)
+    except Exception:  # noqa: BLE001
+        return bool(machine_report()["avx2"])
 
 
 def apply_auto(scene):
@@ -2198,13 +2226,62 @@ _SCENE_PANELS_HIDDEN_FOR_VSE = (
 _scene_panel_polls = {}
 
 
+def _always_visible(cls_, context):
+    return True
+
+
+def _reregister_scene_panels(need):
+    """元から `poll` を持たない札を登録し直す。
+
+    ★C 側の `pt->poll` は、登録の時に「Python のクラスに `poll` が在るか」で決まる
+      (`rna_ui.cc`)。後から `cls.poll = ...` と足しても C 側は空のままで、呼ばれない
+      (= 単位・キーイングセット・重力・シミュレーション・剛体ワールドが VSE でも出続けた)。
+    ★登録し直すと札は他の札の後ろへ回るので、他のエンジンで並びが変わらないよう、
+      本家の並び(`properties_scene.classes`)で、最初に対象になる札から後ろの札を
+      まとめて付け直す。親を外すと子は親を見失う(`_panel_children` の注)ので、子も一緒に。
+    """
+    from bl_ui import properties_scene
+
+    def registered(cls):
+        return getattr(bpy.types, cls.__name__, None) is cls
+
+    panels = [c for c in properties_scene.classes
+              if isinstance(c, type) and issubclass(c, bpy.types.Panel)]
+    ids = [c.__name__ for c in panels]
+    firsts = [ids.index(c.__name__) for c in need if c.__name__ in ids]
+    if not firsts:
+        return
+    # `bl_order` が付いた札(プロパティ / アニメーション)は、どの順で登録しても最後に来る。
+    tail = [c for c in panels[min(firsts):] if registered(c) and not getattr(c, "bl_order", 0)]
+    tail_ids = {getattr(c, "bl_idname", c.__name__) for c in tail}
+    # 他のアドオンが足した子。
+    extra = [c for c in bpy.types.Panel.__subclasses__()
+             if c not in tail and getattr(c, "bl_parent_id", "") in tail_ids and registered(c)]
+
+    for cls in reversed(tail + extra):
+        try:
+            bpy.utils.unregister_class(cls)
+        except Exception as ex:  # noqa: BLE001  外れなかった札は、そのまま残る
+            print("falcon_vse_bridge:", ex)
+    for cls in tail + extra:
+        if registered(cls):
+            continue
+        try:
+            bpy.utils.register_class(cls)
+        except Exception as ex:  # noqa: BLE001  ここで止めると札が消える。残りは登録する
+            print("falcon_vse_bridge:", ex)
+
+
 def _install_scene_panel_polls():
+    reregister = []
     for name in _SCENE_PANELS_HIDDEN_FOR_VSE:
         cls = getattr(bpy.types, name, None)
         if cls is None or name in _scene_panel_polls:
             continue
         original = getattr(cls, "poll", None)
         _scene_panel_polls[name] = original
+        if original is None:
+            reregister.append(cls)
 
         def make(orig):
             @classmethod
@@ -2219,6 +2296,12 @@ def _install_scene_panel_polls():
 
         cls.poll = make(original)
 
+    if reregister:
+        try:
+            _reregister_scene_panels(reregister)
+        except Exception as ex:  # noqa: BLE001  札が VSE でも出るだけ
+            print("falcon_vse_bridge:", ex)
+
 
 def _remove_scene_panel_polls():
     for name, original in _scene_panel_polls.items():
@@ -2226,10 +2309,9 @@ def _remove_scene_panel_polls():
         if cls is None:
             continue
         if original is None:
-            try:
-                del cls.poll
-            except Exception:  # noqa: BLE001
-                pass
+            # ★登録し直した札の C 側は `poll` を呼びに来る(外すと「関数が無い」になる)ので、
+            #   消さずに「常に出す」へ戻す。
+            cls.poll = classmethod(_always_visible)
         else:
             cls.poll = original
     _scene_panel_polls.clear()
@@ -2267,7 +2349,7 @@ class FALCON_PT_machine(Panel):
         col.prop(scene, "falcon_vse_gpu_preview")
         col.prop(scene.render.ffmpeg, "use_hardware_encoder", text="GPU Encoding (NVENC)")
         row = col.row()
-        row.enabled = (not auto) and m["avx2"]
+        row.enabled = (not auto) and _cpu_has_avx2(scene)
         row.prop(scene, "falcon_vse_cpu_kernel")
 
         box = layout.box()
@@ -2275,8 +2357,9 @@ class FALCON_PT_machine(Panel):
         box.label(text="This machine", icon='SYSTEM')
         row = box.row(); row.label(text="GPU (NVIDIA)"); row.label(text="Yes" if m["gpu"] else "No")
         row = box.row(); row.label(text="AVX2")
-        row.label(text="Yes" if scene.falcon_cpu_has_avx2 else "No")
-        row = box.row(); row.label(text="AVX-512"); row.label(text="Yes" if m["avx512"] else "No")
+        row.label(text="Yes" if _cpu_has_avx2(scene) else "No")
+        row = box.row(); row.label(text="AVX-512")
+        row.label(text="Unknown" if m["avx512"] is None else "Yes" if m["avx512"] else "No")
         row = box.row(); row.label(text="CPU Instructions (this build)")
         row.label(text=scene.falcon_cpu_simd_tier)
         box.label(text="Instruction set is fixed when the program is built", icon='INFO')
@@ -2551,7 +2634,8 @@ def _env_int(name, default, empty):
         return empty
     text = value.strip()
     sign, digits = 1, ""
-    if text[:1] in "+-":
+    # ★空白だけの値は strip で "" になる。`"" in "+-"` は True なので、`text and` が要る。
+    if text and text[0] in "+-":
         sign, text = (-1 if text[0] == "-" else 1), text[1:]
     for ch in text:
         if not ch.isdigit():
@@ -3071,7 +3155,7 @@ def unregister():
         bpy.app.timers.unregister(_jump_to_video_editing)
     if bpy.app.timers.is_registered(_remember_engines_deferred):
         bpy.app.timers.unregister(_remember_engines_deferred)
-    for function in (_auto_engine_deferred, _auto_engine_watch):
+    for function in (_auto_engine_deferred, _auto_engine_watch, _apply_auto_all_deferred):
         if bpy.app.timers.is_registered(function):
             bpy.app.timers.unregister(function)
     global _auto_last_sig, _auto_dirty, _auto_reason
@@ -3079,6 +3163,7 @@ def unregister():
     _engine_seen.clear()
     _browser_seen.clear()
     _written.clear()
+    _render_started.clear()
     _pending.clear()
 
     # ★差し替えたままアドオンを外されても、.blend に残さない。

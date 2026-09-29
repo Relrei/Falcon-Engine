@@ -63,13 +63,31 @@ def _falcon_is_crop_extension(module_name):
     return module_name.startswith("bl_ext.") and module_name.rsplit(".", 1)[-1] == "BL_EasyCrop"
 
 
+def _falcon_crop_extension_loadable(module_name):
+    # Falcon: whether `enable(module_name)` can find the extension at all. A preferences entry alone says
+    # nothing: the repository can be disabled or removed and the extension deleted or incompatible, and
+    # then skipping the bundled copy for it leaves the user with no crop tool.
+    if _extensions_incompatible.get(module_name[len(_ext_base_pkg_idname_with_dot):].partition(".")[0::2]):
+        return False
+    import importlib.util
+    try:
+        return importlib.util.find_spec(module_name) is not None
+    except (ImportError, ValueError):
+        # The `bl_ext.{repo}` package is not registered (repository disabled/removed).
+        return False
+
+
 def _falcon_crop_extension_selected():
     # The bundled legacy copy and the extension register the same RNA classes and tool.
-    # Prefer the user's extension, including during startup before it is registered.
+    # Prefer the user's extension, including during startup before it is registered,
+    # but only an extension that is enabled or that will really load.
     import sys
-    return any(_falcon_is_crop_extension(addon.module) for addon in _preferences.addons) or any(
+    return any(
         _falcon_is_crop_extension(name) and mod.__dict__.get("__addon_enabled__", False)
         for name, mod in tuple(sys.modules.items()) if mod is not None
+    ) or any(
+        _falcon_is_crop_extension(addon.module) and _falcon_crop_extension_loadable(addon.module)
+        for addon in _preferences.addons
     )
 
 
@@ -698,6 +716,10 @@ def reset_all(*, reload_scripts=False):
     # Potentially refreshing wheels too.
     extensions_refresh()
 
+    if reload_scripts:
+        # Falcon Engine: they are re-enabled by `_falcon_hidden_core_ensure()` below.
+        _falcon_hidden_core_disable()
+
     for path, pkg_id in _paths_with_extension_repos():
         if not pkg_id:
             _bpy.utils._sys_path_ensure_append(path)
@@ -723,6 +745,28 @@ def reset_all(*, reload_scripts=False):
     _falcon_hidden_core_ensure()
 
 
+def _falcon_hidden_core_reset_off():
+    import os
+    return os.environ.get("FALCON_HIDDEN_CORE_RESET", "1").strip().lower() in {"", "0", "off", "false", "no"}
+
+
+def _falcon_hidden_core_disable():
+    # Falcon Engine: `bpy.utils.load_scripts(reload_scripts=True)` (Reload Scripts) only disables the add-ons in
+    # the preferences' list before `reset_all()` reloads their modules. The hidden core add-ons that are not in that
+    # list (`falcon_vse_bridge`, ...) would be reloaded while still registered: the old classes and handlers stay
+    # behind and the reloaded module's `unregister()` fails on classes that were never registered.
+    # Unregister them first, `_falcon_hidden_core_ensure()` enables them again once the modules are reloaded.
+    import sys
+    if _falcon_hidden_core_reset_off():
+        return  # Nothing would enable them again.
+    for module_name in sorted(_addons_hidden_core):
+        if module_name in _preferences.addons:
+            continue  # Disabled by `load_scripts()`, and enabled again by the loop in `reset_all()`.
+        mod = sys.modules.get(module_name)
+        if (mod is not None) and mod.__dict__.get("__addon_enabled__"):
+            disable(module_name, refresh_handled=True)
+
+
 def _falcon_hidden_core_ensure():
     # Falcon Engine: `disable_all()` runs before an app template is loaded ("New File > Video Editing"),
     # before factory settings / preferences are loaded and before scripts are reloaded. It also turns off
@@ -730,9 +774,8 @@ def _falcon_hidden_core_ensure():
     # add-on list. Upstream's core add-ons are in that list (`BKE_blendfile_userdef_from_defaults`),
     # Falcon's (`falcon_vse_bridge`) are not, so they stayed off until Blender was restarted.
     # Enable them again the way `_initialize_once()` does. `FALCON_HIDDEN_CORE_RESET=0`: previous behavior.
-    import os
     import sys
-    if os.environ.get("FALCON_HIDDEN_CORE_RESET", "1").strip().lower() in {"", "0", "off", "false", "no"}:
+    if _falcon_hidden_core_reset_off():
         return
     for module_name in sorted(_addons_hidden_core):
         if module_name in _preferences.addons:
