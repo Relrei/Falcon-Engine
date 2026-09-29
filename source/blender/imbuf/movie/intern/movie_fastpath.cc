@@ -511,6 +511,15 @@ static bool reencoder_open_encoder(const SourceInfo &src,
      * (`set_quality_rate_options`)。辞書へ "b:v" を入れても効かない("b:v" は ffmpeg コマンドの
      * 書き方で、`AVCodecContext` の option 名は "b")。 */
     re->enc->bit_rate = 0;
+    if (par->codec_id == AV_CODEC_ID_MPEG4) {
+      /* ★mpeg4(libavcodec 内蔵)は crf を持たない。ビットレート 0 のままだと品質の
+       * 指定が何も残らず、最も粗い量子化になり得る。素材のビットレートを引き継ぎ、
+       * 分からない時(mp4 は 0 で返ることがある)は 1 画素あたり 0.2 bit で置く。 */
+      const double fps = av_q2d(re->enc->framerate);
+      re->enc->bit_rate = (par->bit_rate > 0) ?
+                              par->bit_rate :
+                              int64_t(double(par->width) * double(par->height) * fps * 0.2);
+    }
     /* ★これを立てないと符号化器は Annex-B(開始符号つき)で出す。mp4 は
      * 「長さ + NAL」なので、そのまま入れると復号側が長さとして開始符号を読み、
      * `Invalid NAL unit size 17039362` になる(実測。焼き直した区間だけ壊れた)。

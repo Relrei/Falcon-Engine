@@ -1269,7 +1269,11 @@ void PathTrace::cancel()
 {
   thread_scoped_lock lock(render_cancel_.mutex);
 
-  render_cancel_.is_requested = true;
+  /* Only cancel in the middle of rendering when there is at least one sample in the output.
+   * Otherwise interactivity becomes bad. */
+  if (get_num_samples_in_buffer() > 1) {
+    render_cancel_.is_requested = true;
+  }
 
   while (render_cancel_.is_rendering) {
     render_cancel_.condition.wait(lock);
