@@ -85,4 +85,4 @@ $ file BL_proxy/images/100/0001.png_proxy.jpg
 - 再生開始直後に Strip 側の GPU 再生パスが正しく使われず、CPU 使用率だけ上がる不具合を修正
 
 いずれも実機で複数回の動作確認済みです。詳しい経緯は
-[Issue #10](https://github.com/Relrei/Falcon-Engine/issues/10) を参照してください。
+[Issue #10](https://github.com/Relrei/Falcon-Engine-DEMO/issues/10) を参照してください。

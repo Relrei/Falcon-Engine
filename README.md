@@ -48,8 +48,8 @@ Blender 5.2.2 をベースに、個人で手を入れているカスタムビル
 
 ```sh
 # 1) この木を取る
-git clone https://github.com/Relrei/Falcon-Engine.git
-cd Falcon-Engine
+git clone https://github.com/Relrei/Falcon-Engine-DEMO.git
+cd Falcon-Engine-DEMO
 
 # 2) 本家の事前ビルド済みライブラリ(git-lfs が要ります)
 make update                # 本家と同じ入口。5.2 用の枝を選んで lib/linux_x64 へ入れてくれます
