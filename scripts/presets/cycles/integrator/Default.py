@@ -1,3 +1,4 @@
+"""Blender's default light bounces (12 in total, caustics on)"""
 import bpy
 cycles = bpy.context.scene.cycles
 

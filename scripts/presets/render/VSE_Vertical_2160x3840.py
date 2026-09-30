@@ -1,3 +1,4 @@
+"""2160 x 3840 vertical video in 4K"""
 import bpy
 bpy.context.scene.render.resolution_x = 2160
 bpy.context.scene.render.resolution_y = 3840

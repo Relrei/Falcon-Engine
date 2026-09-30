@@ -281,8 +281,10 @@ def enum_dlss_denoiser(self, context):
     from . import falcon_plugins
     # Falcon: DLSS is off until its add-on is enabled (falcon_plugins.DLSS_ADDON). The add-on is only
     # listed once the NVIDIA runtime, which is not shipped, is in a Falcon plugin folder.
-    if (_cycles.with_dlss and falcon_plugins.dlss_allowed() and
-            (not context or bool(context.preferences.addons[__package__].preferences.get_devices_for_type('CUDA')))):
+    # The entry stays listed while DLSS cannot run on this machine or scene (no runtime, CPU device,
+    # no supported GPU): the Denoiser menus grey it out and say why (ui.py `draw_denoiser_menu`),
+    # instead of hiding it, and a scene that uses it keeps its value.
+    if _cycles.with_dlss and falcon_plugins.dlss_allowed():
         return [('DLSS', "DLSS",
                  n_("Use NVIDIA DLSS Ray Reconstruction"), 8)]
     return []

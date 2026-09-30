@@ -1,3 +1,4 @@
+"""8 bounces in total, 1 diffuse bounce, no caustics"""
 import bpy
 cycles = bpy.context.scene.cycles
 

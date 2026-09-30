@@ -106,6 +106,31 @@ def dlss_status():
     return 'CONNECTED' if _state["connected"] else 'NOT_FOUND'
 
 
+def dlss_unavailable_reason(context=None, scene=None):
+    """Why DLSS Ray Reconstruction cannot run right now, or '' when it can. Shown next to the greyed
+    out DLSS entry of the Denoiser menus (the entry is listed only while `dlss_allowed()`), and on the
+    console when an F12 render falls back (Cycles itself falls back to OpenImageDenoise on the CPU
+    without a word, `get_effective_denoise_params`). The wording is a proposal."""
+    if not _with_dlss():
+        return "not in this build"
+    if dlss_status() == 'NOT_FOUND':
+        return "runtime not found"
+    context = context or bpy.context
+    scene = scene or getattr(context, "scene", None)
+    cscene = getattr(scene, "cycles", None)
+    if cscene is not None and cscene.device == 'CPU':
+        return "render device is CPU"
+    try:
+        prefs = context.preferences.addons[__package__].preferences
+        if prefs.get_compute_device_type() not in {'CUDA', 'OPTIX'}:
+            return "needs CUDA or OptiX in Preferences"
+        if not prefs.has_dlss_gpu_devices():
+            return "no supported GPU"
+    except Exception:  # never break a draw over this
+        return "no supported GPU"
+    return ""
+
+
 def current_platform():
     machine = platform.machine().lower()
     arch = "x64" if machine in {"x86_64", "amd64"} else ("arm64" if machine in {"aarch64", "arm64"} else machine)
@@ -403,6 +428,23 @@ def _load_post(*_args):
         dlss_fallback("DLSS is off")
 
 
+@bpy.app.handlers.persistent
+def _render_init(scene, *_args):
+    # Cycles falls back to OpenImageDenoise on the CPU without a word when DLSS cannot run: say so.
+    try:
+        cs = getattr(scene, "cycles", None)
+        if cs is None or scene.render.engine != 'CYCLES' or not cs.use_denoising:
+            return
+        if getattr(cs, "denoiser", "") != 'DLSS' and _stored_enum(cs, "denoiser") != DENOISER_DLSS:
+            return
+        why = dlss_unavailable_reason(scene=scene)
+        if why:
+            print("[Falcon plugins] %s: DLSS is not available (%s), denoising with OpenImageDenoise "
+                  "on the CPU instead" % (scene.name, why))
+    except Exception as ex:
+        print("[Falcon plugins] ERROR: DLSS check before the render failed: %r" % ex)
+
+
 # ---------------------------------------------------------------- watch the plugin folders
 
 _watch_sig = [None]
@@ -602,6 +644,8 @@ def register():
         print("[Falcon plugins] ERROR: scan failed: %r" % ex)
     if _load_post not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_load_post)
+    if _render_init not in bpy.app.handlers.render_init:
+        bpy.app.handlers.render_init.append(_render_init)
     if _watch_wanted() and not bpy.app.timers.is_registered(_watch):
         bpy.app.timers.register(_watch, first_interval=WATCH_INTERVAL, persistent=True)
 
@@ -611,5 +655,7 @@ def unregister():
         bpy.app.timers.unregister(_watch)
     if _load_post in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_load_post)
+    if _render_init in bpy.app.handlers.render_init:
+        bpy.app.handlers.render_init.remove(_render_init)
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

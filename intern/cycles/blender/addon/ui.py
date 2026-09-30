@@ -187,6 +187,76 @@ def _has_camera_cuts(context):
     return any(m.camera is not None for m in scene.timeline_markers)
 
 
+def _falcon_enum_items(context, prop):
+    from . import properties
+    cscene = context.scene.cycles
+    if prop == "denoiser":
+        return properties.enum_denoiser(cscene, context)
+    return properties.enum_preview_denoiser(cscene, context)
+
+
+def _falcon_blocked_reason(context, ident):
+    """Falcon: why an entry of a denoiser menu cannot be picked right now, or ''."""
+    from . import falcon_plugins
+    if ident == 'DLSS':
+        return falcon_plugins.dlss_unavailable_reason(context)
+    return ""
+
+
+class CYCLES_MT_falcon_enum:
+    """Falcon: the entries of a denoiser setting, with the ones that cannot run greyed out. A plain
+    enum drop-down cannot disable a single entry, so the panels open this menu instead while one of
+    the entries is blocked (see `draw_denoiser_menu`)."""
+    bl_label = ""
+    prop = ""
+
+    def draw(self, context):
+        layout = self.layout
+        cscene = context.scene.cycles
+        for item in _falcon_enum_items(context, self.prop):
+            ident, name = item[0], item[1]
+            reason = _falcon_blocked_reason(context, ident)
+            row = layout.row()
+            row.enabled = not reason
+            if reason:
+                row.prop_enum(cscene, self.prop, ident,
+                              text="%s (%s)" % (iface_(name), iface_(reason)), translate=False)
+            else:
+                row.prop_enum(cscene, self.prop, ident)
+
+
+class CYCLES_MT_falcon_denoiser(CYCLES_MT_falcon_enum, Menu):
+    prop = "denoiser"
+
+
+class CYCLES_MT_falcon_preview_denoiser(CYCLES_MT_falcon_enum, Menu):
+    prop = "preview_denoiser"
+
+
+_FALCON_ENUM_MENUS = {
+    "denoiser": "CYCLES_MT_falcon_denoiser",
+    "preview_denoiser": "CYCLES_MT_falcon_preview_denoiser",
+}
+
+
+def draw_denoiser_menu(layout, context, prop, text):
+    """Falcon: draw a denoiser setting. While every entry can run it is the usual drop-down; while
+    one cannot (DLSS without its runtime, on a CPU device, without a supported GPU), it becomes a
+    menu that shows that entry greyed out with the reason, so it cannot be picked."""
+    cscene = context.scene.cycles
+    items = _falcon_enum_items(context, prop)
+    if not any(_falcon_blocked_reason(context, item[0]) for item in items):
+        layout.prop(cscene, prop, text=text)
+        return
+    current = getattr(cscene, prop)
+    name = next((item[1] for item in items if item[0] == current), "")
+    split = layout.split(factor=0.4, align=True)
+    label = split.row()
+    label.alignment = 'RIGHT'
+    label.label(text=text)
+    split.menu(_FALCON_ENUM_MENUS[prop], text=iface_(name) if name else "", translate=False)
+
+
 def show_denoise_active(context):
     cscene = context.scene.cycles
     if not cscene.use_denoising:
@@ -334,7 +404,7 @@ class CYCLES_RENDER_PT_sampling_viewport_denoise(CyclesButtonsPanel, Panel):
 
         sub = col.column()
         sub.active = show_preview_denoise_active(context)
-        sub.prop(cscene, "preview_denoiser", text="Denoiser")
+        draw_denoiser_menu(sub, context, "preview_denoiser", "Denoiser")
 
         has_oidn_gpu = has_oidn_gpu_devices(context)
         effective_preview_denoiser = get_effective_preview_denoiser(context, has_oidn_gpu)
@@ -425,7 +495,7 @@ class CYCLES_RENDER_PT_sampling_render_denoise(CyclesButtonsPanel, Panel):
 
         sub = col.column()
         sub.active = show_denoise_active(context)
-        sub.prop(cscene, "denoiser", text="Denoiser")
+        draw_denoiser_menu(sub, context, "denoiser", "Denoiser")
 
         col.prop(cscene, "denoising_input_passes", text="Passes")
         if cscene.denoiser == 'OPENIMAGEDENOISE':
@@ -3384,6 +3454,8 @@ class CYCLES_OUTPUT_PT_temporal(CyclesButtonsPanel, Panel):
 classes = (
     CYCLES_OUTPUT_PT_temporal,
     CYCLES_PT_sampling_presets,
+    CYCLES_MT_falcon_denoiser,
+    CYCLES_MT_falcon_preview_denoiser,
     CYCLES_PT_viewport_sampling_presets,
     CYCLES_PT_integrator_presets,
     CYCLES_PT_performance_presets,

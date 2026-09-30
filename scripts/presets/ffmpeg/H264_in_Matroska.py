@@ -1,3 +1,4 @@
+"""H.264 video in a Matroska (.mkv) file"""
 import bpy
 is_ntsc = (bpy.context.scene.render.fps != 25)
 

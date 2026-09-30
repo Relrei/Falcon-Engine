@@ -1,3 +1,4 @@
+"""2560 x 1440 (WQHD) output for video editing"""
 import bpy
 bpy.context.scene.render.resolution_x = 2560
 bpy.context.scene.render.resolution_y = 1440

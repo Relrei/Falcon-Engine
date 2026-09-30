@@ -1,3 +1,4 @@
+"""Viewport: up to 4096 samples with a noise threshold of 0.01, denoised by OpenImageDenoise"""
 import bpy
 cycles = bpy.context.scene.cycles
 

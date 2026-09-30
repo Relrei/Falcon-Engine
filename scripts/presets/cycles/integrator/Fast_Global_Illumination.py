@@ -1,3 +1,4 @@
+"""Approximates indirect light (Fast GI) after 1 diffuse bounce: quicker, less accurate"""
 import bpy
 cycles = bpy.context.scene.cycles
 

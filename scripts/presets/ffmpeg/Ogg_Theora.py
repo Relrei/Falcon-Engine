@@ -1,3 +1,4 @@
+"""Theora video in an Ogg file"""
 import bpy
 is_ntsc = (bpy.context.scene.render.fps != 25)
 

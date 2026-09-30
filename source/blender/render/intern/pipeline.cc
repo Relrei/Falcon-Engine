@@ -2860,6 +2860,12 @@ static bool falcon_dlss_anim_wants_persistent(const Scene *scene,
   if (sfra == efra || (rd.mode & R_PERSISTENT_DATA) || !STREQ(rd.engine, "CYCLES")) {
     return false;
   }
+  /* ★モーションブラーのある場面では入れない。永続データ + モーションブラーは本家で
+   * 絵が壊れる既知の組み合わせ(#163820・#157576・#133491・#143545)で、利用者が
+   * 切っていた永続データをこちらが勝手に入れると、その壊れ方を呼び込む(2026-09-30)。 */
+  if (rd.mode & R_MBLUR) {
+    return false;
+  }
   const int denoiser_dlss = 8; /* properties.py の ('DLSS', ..., 8) / DENOISER_DLSS */
   return falcon_scene_cycles_int(scene, "use_denoising", 1) != 0 &&
          falcon_scene_cycles_int(scene, "denoiser", 0) == denoiser_dlss;

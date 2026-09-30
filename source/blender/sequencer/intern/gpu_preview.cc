@@ -30,6 +30,9 @@
 #include "IMB_colormanagement.hh"
 #include "IMB_imbuf.hh"
 #include "IMB_imbuf_types.hh"
+#include "IMB_metadata.hh"
+
+#include "BKE_image.hh"
 
 #include "GPU_context.hh"
 #include "GPU_framebuffer.hh"
@@ -373,14 +376,49 @@ static bool gpu_yuv_enabled()
   return on;
 }
 
+/**
+ * プレビューのメタデータの重ね表示(`ED_region_image_metadata_draw`)が、この素材で何かを描くか。
+ * 描く物の決め方(決まった 10 個の欄か、スタンプ以外の欄)を写している。
+ * ★画像ファイルは OIIO が `oiio:ColorSpace` などを必ず付けるので、重ね表示中は画像のあるコマは
+ * CPU の道になる(CPU の道はこれを画の上下の枠の外に描く)。
+ */
+static bool imbuf_metadata_is_drawn(const ImBuf *ibuf)
+{
+  if (ibuf->metadata == nullptr) {
+    return false;
+  }
+  static const char *fields[] = {
+      "File", "Strip", "Date", "RenderTime", "Note", "Marker", "Time", "Frame", "Camera", "Scene"};
+  char value[1024];
+  for (const char *field : fields) {
+    if (IMB_metadata_get_field(ibuf->metadata, field, value, sizeof(value)) && value[0]) {
+      return true;
+    }
+  }
+  bool custom = false;
+  IMB_metadata_foreach(
+      ibuf,
+      [](const char *field, const char * /*value*/, void *userdata) {
+        if (!STREQ(field, "BlenderMultiChannel") && !STREQ(field, "type") &&
+            !BKE_stamp_is_known_field(field))
+        {
+          *static_cast<bool *>(userdata) = true;
+        }
+      },
+      &custom);
+  return custom;
+}
+
 /** 通せるなら素材をそろえて true。1 本でも外れたら何も残さず false。 */
 static bool gpu_preview_collect(const RenderData *context,
                                 const float timeline_frame,
                                 const int chanshown,
                                 Vector<GpuLayer> &r_layers,
-                                const char **r_colorspace)
+                                const char **r_colorspace,
+                                bool *r_has_metadata)
 {
   *r_colorspace = nullptr;
+  *r_has_metadata = false;
 
   Scene *scene = context->scene;
   Editing *ed = editing_get(scene);
@@ -504,6 +542,11 @@ static bool gpu_preview_collect(const RenderData *context,
                                                image_scale_factor,
                                                preview_scale_factor);
     layer.factor = strip->blend_opacity / 100.0f;
+    /* 画像ファイルの注記のうち、プレビューのメタデータの重ね表示が描く物があるか。
+     * 動画のコマ・テキスト・カラーは持たない。 */
+    if (imbuf_metadata_is_drawn(res.image)) {
+      *r_has_metadata = true;
+    }
     layer.use_linear = use_linear[i] != 0;
     r_layers.append(layer);
   }
@@ -1072,6 +1115,8 @@ struct GpuFrameItem {
   int64_t last_used = -1;
   gpu::Texture *texture = nullptr;
   const char *colorspace = nullptr;
+  /** 素材のどれかが注記(metadata)を持っていた。メタデータの重ね表示中は使わない。 */
+  bool has_metadata = false;
 
   bool matches(const Scene *scene_orig,
                const int frame,
@@ -1186,7 +1231,9 @@ bool gpu_preview_produce(const RenderData *context, const float timeline_frame, 
 
   Vector<GpuLayer> layers;
   const char *colorspace = nullptr;
-  if (!gpu_preview_collect(context, timeline_frame, chanshown, layers, &colorspace)) {
+  bool has_metadata = false;
+  if (!gpu_preview_collect(context, timeline_frame, chanshown, layers, &colorspace, &has_metadata))
+  {
     return gpu_preview_no(2);
   }
 
@@ -1245,6 +1292,7 @@ bool gpu_preview_produce(const RenderData *context, const float timeline_frame, 
       slot->width = context->rectx;
       slot->height = context->recty;
       slot->colorspace = colorspace;
+      slot->has_metadata = has_metadata;
       slot->last_used = ++g_ring.tick;
     }
   }
@@ -1262,6 +1310,7 @@ bool gpu_preview_produce(const RenderData *context, const float timeline_frame, 
 gpu::Texture *gpu_preview_render(const RenderData *context,
                                  const float timeline_frame,
                                  const int chanshown,
+                                 const bool shows_metadata,
                                  const char **r_colorspace_name,
                                  bool *r_owned)
 {
@@ -1316,6 +1365,10 @@ gpu::Texture *gpu_preview_render(const RenderData *context,
       if (item.matches(
               scene_orig, frame, context->view_id, chanshown, context->rectx, context->recty))
       {
+        if (shows_metadata && item.has_metadata) {
+          /* 注記を持つ素材があるコマ: 重ね表示に ImBuf の注記が要るので CPU の道へ。 */
+          break;
+        }
         item.last_used = ++g_ring.tick;
         if (timing_start != 0.0) {
           timing::frame_done(frame, BLI_time_now_seconds() - timing_start, false);
@@ -1329,7 +1382,15 @@ gpu::Texture *gpu_preview_render(const RenderData *context,
   /* ②無ければこの場で作る。 */
   Vector<GpuLayer> layers;
   const char *colorspace = nullptr;
-  if (!gpu_preview_collect(context, timeline_frame, chanshown, layers, &colorspace)) {
+  bool has_metadata = false;
+  if (!gpu_preview_collect(context, timeline_frame, chanshown, layers, &colorspace, &has_metadata))
+  {
+    return gpu_preview_give_up();
+  }
+  if (shows_metadata && has_metadata) {
+    /* メタデータの重ね表示は仕上がりの ImBuf の注記を描く。注記を持つ素材(画像ファイル)がある時だけ
+     * CPU の道へ落とす。持たない時は CPU の道でも何も描かれないので、GPU の道で同じ絵になる。 */
+    gpu_layers_free(layers);
     return gpu_preview_give_up();
   }
 

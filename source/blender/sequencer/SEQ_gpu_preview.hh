@@ -74,10 +74,13 @@ bool gpu_preview_is_active();
  * `r_colorspace_name` には、そのテクスチャの色空間の名前が入る(表示側が要る)。
  * 中身は **アルファを掛けた形(premultiplied)** なので、表示側は predivide を真にする。
  * `r_owned` が偽なら**輪から借りた物**なので、呼び手は手放してはいけない。
+ * `shows_metadata` はプレビューがメタデータを重ねて表示している時に真。注記を持つ素材
+ * (画像ファイル)があるコマだけ nullptr を返す(重ね表示に ImBuf の注記が要るため)。
  */
 gpu::Texture *gpu_preview_render(const RenderData *context,
                                  float timeline_frame,
                                  int chanshown,
+                                 bool shows_metadata,
                                  const char **r_colorspace_name,
                                  bool *r_owned);
 

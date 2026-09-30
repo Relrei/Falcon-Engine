@@ -1217,41 +1217,59 @@ static PrefetchState &vse_prefetch_state()
   return state;
 }
 
+/* Process-lifetime task pool for the VSE read-ahead, created on first use.
+ *
+ * With TBB available (the normal build config for this fork),
+ * `BLI_task_pool_create_background()` collapses to a `TASK_POOL_TBB`
+ * pool internally (see `task_pool.cc`): work items run on Blender's
+ * own shared TBB worker threads, not on a thread we spawned ourselves.
+ *
+ * It used to be leaked on purpose (never `BLI_task_pool_free()`d). That was
+ * harmless, but the pool is a guarded allocation, so every run that read ahead
+ * (any VSE export) ended with "Not freed memory blocks: 1" (248 bytes) where
+ * upstream reports 0. #prefetch_pool_free() now frees it from
+ * #BKE_blender_free(), after all scenes are gone and before the task
+ * scheduler is torn down. */
+static TaskPool *vse_prefetch_pool_ptr = nullptr;
+static std::mutex vse_prefetch_pool_mutex;
+
 static TaskPool *vse_prefetch_pool()
 {
-  /* Process-lifetime task pool, created once and never freed.
-   *
-   * With TBB available (the normal build config for this fork),
-   * `BLI_task_pool_create_background()` collapses to a `TASK_POOL_TBB`
-   * pool internally (see `task_pool.cc`): work items run on Blender's
-   * own shared TBB worker threads, not on a thread we spawned ourselves.
-   * The `TaskPool` destructor for that pool type is a no-op -- and since
-   * we only ever leak the raw pointer (never call `BLI_task_pool_free()`),
-   * that destructor never runs at all, so we never hit the
-   * "task_group destroyed with pending tasks" case. At process exit the
-   * OS reclaims this ~40 byte singleton exactly like it would any other
-   * Meyers singleton; no dangling OS thread is left behind because we
-   * never created one. */
-  static TaskPool *pool = BLI_task_pool_create_background(nullptr, TASK_PRIORITY_LOW);
-  return pool;
+  std::lock_guard lock(vse_prefetch_pool_mutex);
+  if (vse_prefetch_pool_ptr == nullptr) {
+    vse_prefetch_pool_ptr = BLI_task_pool_create_background(nullptr, TASK_PRIORITY_LOW);
+  }
+  return vse_prefetch_pool_ptr;
+}
+
+void prefetch_pool_free()
+{
+  std::lock_guard lock(vse_prefetch_pool_mutex);
+  if (vse_prefetch_pool_ptr == nullptr) {
+    return;
+  }
+  /* Drain first: freeing a TBB pool with tasks still queued is not allowed. */
+  BLI_task_pool_work_and_wait(vse_prefetch_pool_ptr);
+  BLI_task_pool_free(vse_prefetch_pool_ptr);
+  vse_prefetch_pool_ptr = nullptr;
 }
 
 void vse_prefetch_wait_all()
 {
   /* BL_VSE_PREFETCH_N=0, or nothing rendered yet (the UI never dispatches):
-   * nothing was ever dispatched, and vse_prefetch_pool()'s singleton was
-   * never even constructed. Bail out rather than constructing the
-   * (otherwise idle) TaskPool/tbb::task_group here just to immediately wait
+   * nothing was ever dispatched, and vse_prefetch_pool() was never even
+   * called. Bail out rather than constructing the (otherwise idle)
+   * TaskPool/tbb::task_group here just to immediately wait
    * on an empty one -- this must cost nothing when nothing was read ahead. */
   if (vse_prefetch_n_get() == 0 ||
       vse_prefetch_state().dispatched.load(std::memory_order_relaxed) == 0)
   {
     return;
   }
-  /* Previously this pool's tasks were deliberately never waited on (see
-   * the leak-by-design comment above): at process exit that's harmless,
-   * but at *scene* teardown (editing_free() -> source_image_cache_destroy())
-   * it is not -- a still-running task's vse_prefetch_task_run() calls
+  /* Previously this pool's tasks were deliberately never waited on: at
+   * process exit that's harmless, but at *scene* teardown
+   * (editing_free() -> source_image_cache_destroy()) it is not -- a
+   * still-running task's vse_prefetch_task_run() calls
    * source_image_cache_put(), which touches scene->ed->runtime->
    * source_image_cache under source_image_cache_mutex. If that destroy
    * call frees the Scene (and the cache) out from under a task still in

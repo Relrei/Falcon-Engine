@@ -1,3 +1,4 @@
+"""H.264 video in an MP4 file, plays almost everywhere"""
 import bpy
 is_ntsc = (bpy.context.scene.render.fps != 25)
 

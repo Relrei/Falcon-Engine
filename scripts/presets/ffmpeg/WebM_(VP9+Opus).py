@@ -1,3 +1,4 @@
+"""VP9 video with Opus audio in a WebM file, for the web"""
 # WebM container, VP9 video, Opus audio.
 import bpy
 

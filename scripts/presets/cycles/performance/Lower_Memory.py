@@ -1,3 +1,4 @@
+"""Compact acceleration structure and 512 px tiles: uses less memory"""
 import bpy
 render = bpy.context.scene.render
 cycles = bpy.context.scene.cycles

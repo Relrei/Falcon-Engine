@@ -1,3 +1,4 @@
+"""Keep scene data between renders and use spatial splits: faster, uses more memory"""
 import bpy
 render = bpy.context.scene.render
 cycles = bpy.context.scene.cycles

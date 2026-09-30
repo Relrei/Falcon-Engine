@@ -1,3 +1,4 @@
+"""1080 x 1920 vertical video (phone formats such as Shorts or Reels)"""
 import bpy
 bpy.context.scene.render.resolution_x = 1080
 bpy.context.scene.render.resolution_y = 1920

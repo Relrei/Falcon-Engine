@@ -1,3 +1,4 @@
+"""1920 x 1080 (Full HD) output for video editing"""
 import bpy
 bpy.context.scene.render.resolution_x = 1920
 bpy.context.scene.render.resolution_y = 1080

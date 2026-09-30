@@ -267,10 +267,51 @@ class AddPresetBase:
             return self.execute(context)
 
 
+# Falcon: a Python preset may describe itself with a docstring at its top (before anything but
+# imports); the preset menus show it as the tooltip of that entry. Read, never executed, and cached
+# by modification time. Presets without one keep the operator's own description.
+_preset_description_cache = {}
+
+
+def _preset_description(filepath):
+    import os
+    if not filepath.lower().endswith(".py"):
+        return ""
+    try:
+        mtime = os.path.getmtime(filepath)
+    except OSError:
+        return ""
+    cached = _preset_description_cache.get(filepath)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+    text = ""
+    try:
+        import ast
+        with open(filepath, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), filepath)
+        for node in tree.body:
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                continue
+            if (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant) and
+                    isinstance(node.value.value, str)):
+                text = " ".join(node.value.value.split())
+            break
+    except (OSError, SyntaxError, ValueError):
+        text = ""
+    _preset_description_cache[filepath] = (mtime, text)
+    return text
+
+
 class ExecutePreset(Operator):
     """Load a preset"""
     bl_idname = "script.execute_preset"
     bl_label = "Execute a Python Preset"
+
+    @classmethod
+    def description(cls, _context, properties):
+        from bpy.app.translations import pgettext_tip as tip_
+        text = _preset_description(properties.filepath)
+        return tip_(text) if text else ""
 
     filepath: StringProperty(
         subtype='FILE_PATH',

@@ -154,6 +154,10 @@ def classify(obj):
     if not obj.data.materials:
         return 'DIFFUSE', 0.0
     mat = obj.data.materials[0]
+    # 空の材質スロット(None)は拡散と同じ扱い。ここで落ちると光子の焼きが
+    # 丸ごと止まり、集光のチェックが黙って外れる(2026-09-29 cut_switch.blend)
+    if mat is None:
+        return 'DIFFUSE', 0.0
     key = (mat.name, getattr(mat, "session_uid", 0))
     hit = _classify_cache.get(key)
     if hit is not None:

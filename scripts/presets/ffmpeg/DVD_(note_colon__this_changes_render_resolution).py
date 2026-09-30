@@ -1,3 +1,4 @@
+"""MPEG-2 for DVD at 720 x 480 (NTSC) or 720 x 576 (PAL, 25 fps); changes the render resolution"""
 import bpy
 is_ntsc = (bpy.context.scene.render.fps != 25)
 

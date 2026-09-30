@@ -66,6 +66,9 @@ void ensure_unique_name(Strip *strip, Scene *scene);
 
 void fontmap_clear();
 
+/** Free the VSE read-ahead task pool (called once at exit from #BKE_blender_free). */
+void prefetch_pool_free();
+
 /**
  * Check whether a sequence strip has missing media.
  * Results of the query for this strip will be cached into #MediaPresence cache. The cache

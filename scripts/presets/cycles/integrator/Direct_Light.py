@@ -1,3 +1,4 @@
+"""Direct light only: no diffuse bounces and no caustics (fastest, darkest)"""
 import bpy
 cycles = bpy.context.scene.cycles
 

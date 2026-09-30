@@ -85,6 +85,7 @@ void BKE_blender_free()
 
   IMB_cache_destruct();
   seq::fontmap_clear();
+  seq::prefetch_pool_free();
   MOV_exit();
 
   bke::node_system_exit();
@@ -159,7 +160,7 @@ static void blender_version_init()
    * 配布の版を上げる時は、下の1行だけ書き換える。ここ以外に文言を増やさないこと。
    * 土台の Blender の版は表示に出さない(.desktop と README に書く)。 */
 #ifdef FALCON_DIST_BUILD
-  const char *kFalconName = "Falcon Engine v0.5 demo";
+  const char *kFalconName = "Falcon Engine v0.6 demo";
 #else
   const char *kFalconName = "Falcon Engine";
 #endif

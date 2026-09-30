@@ -912,6 +912,15 @@ class CYCLES_OT_falcon_photon_bake(Operator):
                      cscene.samples, cscene.use_adaptive_sampling,
                      cscene.max_bounces, cscene.transmission_bounces,
                      cscene.glossy_bounces)
+            # ★焼きの段はデノイズしない(2026-09-29)。段の出力は光子の格子で
+            #   絵ではないので無駄なうえ、場面の denoiser が DLSS だと焼きの
+            #   正方形の解像度で NGX の feature が作れず、焼きごと落ちる
+            #   ("Failed to create DLSS instance" → 集光のチェックが黙って外れる)。
+            saved_denoise = (cscene.use_denoising,
+                             [(vl, vl.cycles.use_denoising) for vl in scene.view_layers])
+            cscene.use_denoising = False
+            for vl, _v in saved_denoise[1]:
+                vl.cycles.use_denoising = False
             # Cell size / deposit radius / dispersion ride on the scene
             # properties now (integrator sockets), so nothing to export here.
             # Only the per-pass state below still travels by environment.
@@ -1055,6 +1064,9 @@ class CYCLES_OT_falcon_photon_bake(Operator):
                     restore_prev_env()
                 for li in lights:
                     li.hide_render = saved_hide[li.name]
+                cscene.use_denoising = saved_denoise[0]
+                for vl, v in saved_denoise[1]:
+                    vl.cycles.use_denoising = v
                 (r.resolution_x, r.resolution_y, r.resolution_percentage,
                  cscene.samples, cscene.use_adaptive_sampling,
                  cscene.max_bounces, cscene.transmission_bounces,

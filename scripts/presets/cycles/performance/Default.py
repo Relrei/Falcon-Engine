@@ -1,3 +1,4 @@
+"""Default acceleration structure and 2048 px tiles, scene data not kept between renders"""
 import bpy
 render = bpy.context.scene.render
 cycles = bpy.context.scene.cycles

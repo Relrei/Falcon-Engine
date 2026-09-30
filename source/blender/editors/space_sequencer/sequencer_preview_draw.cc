@@ -188,6 +188,7 @@ ImBuf *sequencer_ibuf_get(const bContext *C, const int timeline_frame, const cha
 static gpu::Texture *sequencer_gpu_preview_get(const bContext *C,
                                                const int timeline_frame,
                                                const char *viewname,
+                                               const bool shows_metadata,
                                                const char **r_colorspace_name,
                                                bool *r_owned)
 {
@@ -224,7 +225,7 @@ static gpu::Texture *sequencer_gpu_preview_get(const bContext *C,
   const short is_break = G.is_break;
   G.is_break = false;
   gpu::Texture *texture = seq::gpu_preview_render(
-      &context, timeline_frame, sseq->chanshown, r_colorspace_name, r_owned);
+      &context, timeline_frame, sseq->chanshown, shows_metadata, r_colorspace_name, r_owned);
   G.is_break = is_break;
 
   return texture;
@@ -1959,18 +1960,22 @@ void sequencer_preview_region_draw(const bContext *C, ARegion *region)
   }
   const char *current_gpu_colorspace = nullptr;
   bool current_gpu_owned = false;
-  /* GPU 経路は CPU の ImBuf を作らない。スコープ(波形・パレード・ベクトルスコープ)・ゼブラ・
-   * メタデータは ImBuf が要る(空だと描かれない)ので、その間は今までの経路(ImBuf)に落とし、
-   * 普通の画像表示だけ GPU 経路を通す。 */
-  const bool overlay_needs_ibuf = !show_imbuf || (space_sequencer.zebra != 0) ||
-                                  (draw_overlay && (space_sequencer.preview_overlay.flag &
-                                                    SEQ_PREVIEW_SHOW_METADATA));
+  /* GPU 経路は CPU の ImBuf を作らない。スコープ(波形・パレード・ベクトルスコープ)・ゼブラは
+   * ImBuf が要る(空だと描かれない)ので、その間は今までの経路(ImBuf)に落とし、
+   * 普通の画像表示だけ GPU 経路を通す。
+   * ★メタデータの重ね表示は Video Editing の既定で入っている。以前はこれだけで GPU 経路に
+   * 一度も入らなかった(2026-09-30)。描かれるのは素材が注記を持つ時だけ(動画のコマ・テキスト・
+   * カラーは持たない)なので、注記を持つ素材があるコマだけを GPU 経路の側で落とす。 */
+  const bool overlay_needs_ibuf = !show_imbuf || (space_sequencer.zebra != 0);
+  const bool shows_metadata = draw_overlay &&
+                              (space_sequencer.preview_overlay.flag & SEQ_PREVIEW_SHOW_METADATA);
   if (need_current_frame && use_gpu_texture && !overlay_needs_ibuf) {
     /* ★GPU 経路: 変形と重ねを GPU でやって、CPU に戻さずそのまま描く。
      * 通せない配置ならここは nullptr を返し、下の今までの経路に落ちる。 */
     current_texture = sequencer_gpu_preview_get(C,
                                                timeline_frame,
                                                view_names[space_sequencer.multiview_eye],
+                                               shows_metadata,
                                                &current_gpu_colorspace,
                                                &current_gpu_owned);
   }

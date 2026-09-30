@@ -1,3 +1,4 @@
+"""MPEG-4 Part 2 (Xvid) video in an AVI file"""
 import bpy
 is_ntsc = (bpy.context.scene.render.fps != 25)
 

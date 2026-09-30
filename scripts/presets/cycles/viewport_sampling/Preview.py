@@ -1,3 +1,4 @@
+"""Viewport: up to 1024 samples with a noise threshold of 0.1, no denoising"""
 import bpy
 cycles = bpy.context.scene.cycles
 

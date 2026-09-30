@@ -1,3 +1,4 @@
+"""32 bounces of every kind with caustics (slowest, most complete light)"""
 import bpy
 cycles = bpy.context.scene.cycles
 
