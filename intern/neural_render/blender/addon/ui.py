@@ -1,0 +1,2892 @@
+# SPDX-FileCopyrightText: 2011-2022 Blender Foundation
+#
+# SPDX-License-Identifier: Apache-2.0
+
+from __future__ import annotations
+
+import bpy
+from bpy.app.translations import contexts as i18n_contexts
+from bl_ui.utils import PresetPanel
+
+from bpy.types import Panel, Menu
+
+from bl_ui.properties_grease_pencil_common import GreasePencilSimplifyPanel
+from bl_ui.properties_render import draw_curves_settings, CompositorPerformanceButtonsPanel, CompositorDenoisePerformanceButtonsPanel
+from bl_ui.properties_view_layer import (
+    ViewLayerCryptomattePanelHelper,
+    ViewLayerAOVPanelHelper,
+    ViewLayerLightgroupsPanelHelper,
+)
+
+from bl_ui.properties_object import has_geometry_visibility
+from bpy.app.translations import (
+    pgettext_rpt as rpt_,
+)
+
+
+class NeuralRenderPresetPanel(PresetPanel, Panel):
+    COMPAT_ENGINES = {'NEURAL_RENDERING'}
+    preset_operator = "script.execute_preset"
+
+    @staticmethod
+    def post_cb(context, _filepath):
+        # Modify an arbitrary built-in scene property to force a depsgraph
+        # update, because add-on properties don't. (see #62325)
+        render = context.scene.render
+        render.filter_size = render.filter_size
+
+
+class NEURAL_RENDER_PT_sampling_presets(NeuralRenderPresetPanel):
+    bl_label = "Sampling Presets"
+    preset_subdir = "neural_render/sampling"
+    preset_add_operator = "render.neural_render_sampling_preset_add"
+
+
+class NEURAL_RENDER_PT_viewport_sampling_presets(NeuralRenderPresetPanel):
+    bl_label = "Viewport Sampling Presets"
+    preset_subdir = "neural_render/viewport_sampling"
+    preset_add_operator = "render.neural_render_viewport_sampling_preset_add"
+
+
+class NEURAL_RENDER_PT_integrator_presets(NeuralRenderPresetPanel):
+    bl_label = "Integrator Presets"
+    preset_subdir = "neural_render/integrator"
+    preset_add_operator = "render.neural_render_integrator_preset_add"
+
+
+class NEURAL_RENDER_PT_performance_presets(NeuralRenderPresetPanel):
+    bl_label = "Performance Presets"
+    preset_subdir = "neural_render/performance"
+    preset_add_operator = "render.neural_render_performance_preset_add"
+
+
+class NeuralRenderButtonsPanel:
+    bl_space_type = "PROPERTIES"
+    bl_region_type = "WINDOW"
+    bl_context = "render"
+    COMPAT_ENGINES = {'NEURAL_RENDERING'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.engine in cls.COMPAT_ENGINES
+
+
+class NeuralRenderDebugButtonsPanel(NeuralRenderButtonsPanel):
+    @classmethod
+    def poll(cls, context):
+        prefs = bpy.context.preferences
+        return (
+            NeuralRenderButtonsPanel.poll(context) and
+            prefs.experimental.use_cycles_debug and
+            prefs.view.show_developer_ui
+        )
+
+
+# Adapt properties editor panel to display in node editor. We have to
+# copy the class rather than inherit due to the way bpy registration works.
+def node_panel(cls):
+    node_cls = type('NODE_' + cls.__name__, cls.__bases__, dict(cls.__dict__))
+
+    node_cls.bl_space_type = 'NODE_EDITOR'
+    node_cls.bl_region_type = 'UI'
+    node_cls.bl_category = "Options"
+    if hasattr(node_cls, 'bl_parent_id'):
+        node_cls.bl_parent_id = 'NODE_' + node_cls.bl_parent_id
+
+    return node_cls
+
+
+def get_device_type(context):
+    return context.preferences.addons[__package__].preferences.compute_device_type
+
+
+def backend_has_active_gpu(context):
+    return context.preferences.addons[__package__].preferences.has_active_device()
+
+
+def use_cpu(context):
+    cscene = context.scene.cycles
+
+    return (get_device_type(context) == 'NONE' or cscene.device == 'CPU' or not backend_has_active_gpu(context))
+
+
+def use_gpu(context):
+    cscene = context.scene.cycles
+
+    return (get_device_type(context) != 'NONE' and cscene.device == 'GPU' and backend_has_active_gpu(context))
+
+
+def use_metal(context):
+    return (get_device_type(context) == 'METAL' and use_gpu(context))
+
+
+def use_cuda(context):
+    return (get_device_type(context) == 'CUDA' and use_gpu(context))
+
+
+def use_hip(context):
+    return (get_device_type(context) == 'HIP' and use_gpu(context))
+
+
+def use_optix(context):
+    return (get_device_type(context) == 'OPTIX' and use_gpu(context))
+
+
+def use_oneapi(context):
+    return (get_device_type(context) == 'ONEAPI' and use_gpu(context))
+
+
+def use_multi_device(context):
+    if use_gpu(context):
+        return context.preferences.addons[__package__].preferences.has_multi_device()
+    return False
+
+
+def show_device_active(context):
+    cscene = context.scene.cycles
+    if cscene.device == 'CPU':
+        return True
+    return use_gpu(context)
+
+
+def show_preview_denoise_active(context):
+    cscene = context.scene.cycles
+    if not cscene.use_preview_denoising:
+        return False
+
+    if cscene.preview_denoiser == 'DLSS':
+        return has_dlss_gpu_devices(context)
+
+    if cscene.preview_denoiser == 'OPTIX':
+        return has_optixdenoiser_gpu_devices(context)
+
+    # OIDN is always available, thanks to CPU support
+    return True
+
+
+def show_denoise_active(context):
+    cscene = context.scene.cycles
+    if not cscene.use_denoising:
+        return False
+
+    if cscene.denoiser == 'OPTIX':
+        return has_optixdenoiser_gpu_devices(context)
+
+    if cscene.denoiser == 'DLSS':
+        return has_dlss_gpu_devices(context)
+
+    # OIDN is always available, thanks to CPU support
+    return True
+
+
+def is_nr_mode(context):
+    # Falcon Cycles-expansion: Neural Rendering mode (scene.cycles.falcon_mode).
+    return context.scene.cycles.falcon_mode == 'NR'
+
+
+def show_preview_dlss_active(context):
+    cscene = context.scene.cycles
+    return cscene.use_preview_denoising and cscene.preview_denoiser == 'DLSS' and has_dlss_gpu_devices(context)
+
+
+def get_effective_preview_denoiser(context, has_oidn_gpu):
+    scene = context.scene
+    cscene = scene.cycles
+
+    # Falcon Cycles-expansion: there is no "Automatic" any more, the chosen denoiser is the one that runs.
+    return cscene.preview_denoiser or 'OPENIMAGEDENOISE'
+
+
+def has_oidn_gpu_devices(context):
+    return context.preferences.addons[__package__].preferences.has_oidn_gpu_devices()
+
+
+def has_dlss_gpu_devices(context):
+    return context.preferences.addons[__package__].preferences.has_dlss_gpu_devices()
+
+
+def has_optixdenoiser_gpu_devices(context):
+    return context.preferences.addons[__package__].preferences.has_optixdenoiser_gpu_devices()
+
+
+class NEURAL_RENDER_RENDER_PT_sampling(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Sampling"
+
+    def draw(self, context):
+        pass
+
+
+class NEURAL_RENDER_RENDER_PT_sampling_viewport(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Viewport"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_sampling"
+
+    def draw_header_preset(self, context):
+        NEURAL_RENDER_PT_viewport_sampling_presets.draw_panel_header(self.layout)
+
+    def draw(self, context):
+        layout = self.layout
+
+        scene = context.scene
+        cscene = scene.cycles
+
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        # Falcon Neural Rendering viewport (from v4): frames of a few samples, moving or still, up to
+        # their own Max Samples.
+        if is_nr_mode(context):
+            col = layout.column(align=True)
+            col.prop(cscene, "neural_viewport_samples", text="Samples per Frame")
+            col.prop(cscene, "neural_viewport_moving_samples", text="While Moving")
+            sub = col.row(align=True)
+            sub.active = cscene.use_neural_viewport_history and cscene.preview_denoising_upscale_quality == 'NONE'
+            sub.prop(cscene, "neural_viewport_glass_samples", text="Glass")
+            col.prop(cscene, "neural_viewport_max_samples", text="Max Samples")
+
+            col = layout.column(heading="History")
+            col.prop(cscene, "use_neural_viewport_history", text="Carry Over Frames")
+            return
+
+        heading = layout.column(align=True, heading="Noise Threshold")
+        heading.active = not show_preview_dlss_active(context)
+        row = heading.row(align=True)
+        row.prop(cscene, "use_preview_adaptive_sampling", text="")
+        sub = row.row()
+        sub.active = cscene.use_preview_adaptive_sampling
+        sub.prop(cscene, "preview_adaptive_threshold", text="")
+
+        col = layout.column(align=True)
+        if cscene.use_preview_adaptive_sampling:
+            col.prop(cscene, "preview_samples", text="Max Samples")
+            col.prop(cscene, "preview_adaptive_min_samples", text="Min Samples")
+        else:
+            col.prop(cscene, "preview_samples", text="Samples")
+
+
+class NEURAL_RENDER_RENDER_PT_sampling_viewport_denoise(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Denoise"
+    bl_parent_id = 'NEURAL_RENDER_RENDER_PT_sampling_viewport'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw_header(self, context):
+        # NR always denoises with DLSS.
+        if not is_nr_mode(context):
+            self.layout.prop(context.scene.cycles, "use_preview_denoising", text="")
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        cscene = context.scene.cycles
+
+        if is_nr_mode(context):
+            col = layout.column()
+            if has_dlss_gpu_devices(context):
+                col.prop(cscene, "preview_denoising_upscale_quality", text="Upscale Mode")
+            else:
+                draw_not_denoised(col, 'DLSS')
+            return
+
+        col = layout.column()
+        col.active = cscene.use_preview_denoising
+
+        sub = col.column()
+        sub.active = show_preview_denoise_active(context)
+        sub.prop(cscene, "preview_denoiser", text="Denoiser")
+
+        has_oidn_gpu = has_oidn_gpu_devices(context)
+        effective_preview_denoiser = get_effective_preview_denoiser(context, has_oidn_gpu)
+
+        if effective_preview_denoiser == 'DLSS':
+            if has_dlss_gpu_devices(context):
+                col.prop(cscene, "preview_denoising_upscale_quality", text="Upscale Mode")
+            else:
+                draw_not_denoised(col, 'DLSS')
+            return
+        if effective_preview_denoiser == 'OPTIX' and not has_optixdenoiser_gpu_devices(context):
+            draw_not_denoised(col, 'OPTIX')
+            return
+
+        col.prop(cscene, "preview_denoising_input_passes", text="Passes")
+
+        if effective_preview_denoiser == 'OPENIMAGEDENOISE':
+            col.prop(cscene, "preview_denoising_prefilter", text="Prefilter")
+            col.prop(cscene, "preview_denoising_quality", text="Quality")
+
+        col.prop(cscene, "preview_denoising_start_sample", text="Start Sample")
+
+        if effective_preview_denoiser == 'OPENIMAGEDENOISE':
+            row = col.row()
+            row.active = has_oidn_gpu
+            row.prop(cscene, "preview_denoising_use_gpu", text="Use GPU")
+
+
+class NEURAL_RENDER_RENDER_PT_sampling_render(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Render"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_sampling"
+
+    def draw_header_preset(self, context):
+        NEURAL_RENDER_PT_sampling_presets.draw_panel_header(self.layout)
+
+    def draw(self, context):
+        layout = self.layout
+
+        scene = context.scene
+        cscene = scene.cycles
+
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        # Falcon Neural Rendering: every pixel the same samples (no noise threshold), more on glass.
+        if is_nr_mode(context):
+            col = layout.column(align=True)
+            col.prop(cscene, "samples", text="Samples")
+            sub = col.row(align=True)
+            sub.active = cscene.denoising_upscale_quality == 'NONE'
+            sub.prop(cscene, "glass_samples", text="Glass")
+            col.prop(cscene, "use_neural_halve_samples")
+            col.prop(cscene, "time_limit")
+            return
+
+        heading = layout.column(align=True, heading="Noise Threshold")
+        row = heading.row(align=True)
+        row.prop(cscene, "use_adaptive_sampling", text="")
+        sub = row.row()
+        sub.active = cscene.use_adaptive_sampling
+        sub.prop(cscene, "adaptive_threshold", text="")
+
+        unlimited = cscene.use_unlimited_render and not cscene.use_denoising
+        heading.active = not unlimited
+        col = layout.column(align=True)
+        col.active = not unlimited
+        if cscene.use_adaptive_sampling:
+            col.prop(cscene, "samples", text="Max Samples")
+            col.prop(cscene, "adaptive_min_samples", text="Min Samples")
+        else:
+            col.prop(cscene, "samples", text="Samples")
+        col.prop(cscene, "time_limit")
+        # Render until stopped; denoising runs at the end only, so it has to be off.
+        row = layout.row()
+        row.active = not cscene.use_denoising
+        row.prop(cscene, "use_unlimited_render")
+        if cscene.use_unlimited_render and cscene.use_denoising:
+            layout.label(text="Turn denoising off to render without a limit", icon='INFO')
+
+
+class NEURAL_RENDER_RENDER_PT_sampling_render_denoise(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Denoise"
+    bl_parent_id = 'NEURAL_RENDER_RENDER_PT_sampling_render'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw_header(self, context):
+        # NR always denoises with DLSS.
+        if not is_nr_mode(context):
+            self.layout.prop(context.scene.cycles, "use_denoising", text="")
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        cscene = context.scene.cycles
+
+        col = layout.column()
+        nr = is_nr_mode(context)
+        if not nr:
+            col.active = cscene.use_denoising
+            sub = col.column()
+            sub.active = show_denoise_active(context)
+            sub.prop(cscene, "denoiser", text="Denoiser")
+
+        denoiser = 'DLSS' if nr else cscene.denoiser
+        if denoiser == 'DLSS':
+            if has_dlss_gpu_devices(context):
+                # Falcon Cycles-expansion: what the guide passes tell DLSS, and the history warm-up.
+                col.prop(cscene, "denoising_upscale_quality", text="Upscale Mode")
+                col.prop(cscene, "dlss_glass_matte")
+                sub = col.column()
+                sub.active = not cscene.dlss_glass_matte
+                sub.prop(cscene, "dlss_glass_through")
+                col.prop(cscene, "dlss_preroll_passes")
+            else:
+                draw_not_denoised(col, 'DLSS')
+            return
+        if denoiser == 'OPTIX' and not has_optixdenoiser_gpu_devices(context):
+            draw_not_denoised(col, 'OPTIX')
+            return
+
+        col.prop(cscene, "denoising_input_passes", text="Passes")
+        if denoiser == 'OPENIMAGEDENOISE':
+            col.prop(cscene, "denoising_prefilter", text="Prefilter")
+            col.prop(cscene, "denoising_quality", text="Quality")
+
+            row = col.row()
+            row.active = has_oidn_gpu_devices(context)
+            row.prop(cscene, "denoising_use_gpu", text="Use GPU")
+
+
+def draw_not_denoised(col, denoiser):
+    # Falcon Cycles-expansion: the chosen denoiser cannot run here, and no other one is used in its place
+    # (blender/sync.cpp get_denoise_params).
+    if denoiser == 'DLSS':
+        text = rpt_("DLSS Ray Reconstruction cannot run on this device: the image is not denoised. "
+                    "It needs an NVIDIA GPU with compute capability %s, selected in Preferences > System.") % "7.5"
+    else:
+        text = rpt_("OptiX cannot run on this device: the image is not denoised. "
+                    "It needs an NVIDIA GPU, selected in Preferences > System.")
+    col.label_multiline(text=text, icon='ERROR', translate=False)
+
+
+class NEURAL_RENDER_RENDER_PT_sampling_path_guiding(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Path Guiding"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_sampling"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        from . import engine
+        return use_cpu(context) and engine.with_path_guiding()
+
+    def draw_header(self, context):
+        scene = context.scene
+        cscene = scene.cycles
+
+        self.layout.prop(cscene, "use_guiding", text="")
+
+    def draw(self, context):
+        scene = context.scene
+        cscene = scene.cycles
+
+        layout = self.layout
+
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        layout.active = cscene.use_guiding
+
+        layout.prop(cscene, "guiding_training_samples")
+
+        col = layout.column(align=True)
+        col.prop(cscene, "use_surface_guiding", text="Surface")
+        col.prop(cscene, "use_volume_guiding", text="Volume", text_ctxt=i18n_contexts.id_id)
+
+        if cscene.use_guiding:
+            # Calculation matches TileManager::compute_render_tile_size and
+            # Session::get_effective_tile_size
+            if cscene.tile_size < 128:
+                tile_size = cscene.tile_size
+            else:
+                tile_size = (cscene.tile_size + 128 - 1) & ~(128 - 1)
+                tile_size = min(tile_size, 8192)
+            tile_area = tile_size ** 2
+
+            render_scale = scene.render.resolution_percentage / 100.0
+            render_size_x = int(scene.render.resolution_x * render_scale)
+            render_size_y = int(scene.render.resolution_y * render_scale)
+            render_area = render_size_x * render_size_y
+
+            if render_area > tile_area and render_size_x <= 8192 and render_size_y <= 8192:
+                layout.label(text="May work poorly with render tiling", icon='STATUS_INFO')
+
+
+class NEURAL_RENDER_RENDER_PT_sampling_path_guiding_debug(NeuralRenderDebugButtonsPanel, Panel):
+    bl_label = "Debug"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_sampling_path_guiding"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        scene = context.scene
+        cscene = scene.cycles
+
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        layout.active = cscene.use_guiding
+
+        layout.prop(cscene, "guiding_distribution_type", text="Distribution Type")
+        layout.prop(cscene, "guiding_roughness_threshold")
+        layout.prop(cscene, "guiding_directional_sampling_type", text="Directional Sampling Type")
+
+        col = layout.column(align=True)
+        col.prop(cscene, "surface_guiding_probability")
+        col.prop(cscene, "volume_guiding_probability")
+
+        col = layout.column(align=True)
+        col.prop(cscene, "use_deterministic_guiding")
+        col.prop(cscene, "use_guiding_direct_light")
+        col.prop(cscene, "use_guiding_mis_weights")
+
+
+class NEURAL_RENDER_RENDER_PT_sampling_advanced(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Advanced"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_sampling"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        scene = context.scene
+        cscene = scene.cycles
+
+        row = layout.row(align=True)
+        row.prop(cscene, "sampling_pattern", text="Pattern")
+
+        row = layout.row(align=True)
+        row.prop(cscene, "seed")
+        row.prop(cscene, "use_animated_seed", text="", icon='TIME')
+
+        layout.separator()
+
+        prefs = context.preferences
+        use_debug = prefs.experimental.use_cycles_debug and prefs.view.show_developer_ui
+        if use_debug:
+            row = layout.row(align=True)
+            row.prop(cscene, "use_pixel_jitter")
+
+            layout.separator()
+
+        if cscene.sampling_pattern == 'TABULATED_SOBOL':
+            heading = layout.column(align=True, heading="Scrambling Distance")
+            heading.prop(cscene, "auto_scrambling_distance", text="Automatic")
+            preview_scrambling_row = heading.row()
+            preview_scrambling_row.prop(cscene, "preview_scrambling_distance", text="Viewport")
+            # Disable preview scrambling if DLSS denoising is used.
+            # Preview scrambling and DLSS are generally incompatible with each other,
+            # so preview scrambling is internally disabled when using DLSS.
+            preview_scrambling_row.active = not show_preview_dlss_active(context)
+            heading.prop(cscene, "scrambling_distance", text="Multiplier")
+
+            layout.separator()
+
+        col = layout.column(align=True)
+        col.prop(cscene, "min_light_bounces")
+        col.prop(cscene, "min_transparent_bounces")
+
+        for view_layer in scene.view_layers:
+            if view_layer.samples > 0:
+                layout.separator()
+                layout.row().prop(cscene, "use_layer_samples")
+                break
+
+
+class NEURAL_RENDER_RENDER_PT_sampling_advanced_sample_subset(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Sample Subset"
+    bl_parent_id = 'NEURAL_RENDER_RENDER_PT_sampling_advanced'
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw_header(self, context):
+        scene = context.scene
+        cscene = scene.cycles
+
+        self.layout.prop(cscene, "use_sample_subset", text="")
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        scene = context.scene
+        cscene = scene.cycles
+
+        col = layout.column(align=True)
+        col.active = cscene.use_sample_subset
+        col.prop(cscene, "sample_offset", text="Offset")
+        col.prop(cscene, "sample_subset_length", text="Length")
+
+
+class NEURAL_RENDER_RENDER_PT_sampling_lights(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Lights"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_sampling"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        scene = context.scene
+        cscene = scene.cycles
+
+        col = layout.column(align=True)
+        col.prop(cscene, "use_light_tree")
+        sub = col.row()
+        sub.prop(cscene, "light_sampling_threshold", text="Light Threshold")
+        sub.active = not cscene.use_light_tree
+
+
+class NEURAL_RENDER_RENDER_PT_subdivision(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Subdivision"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        scene = context.scene
+        cscene = scene.cycles
+
+        col = layout.column()
+        sub = col.column(align=True)
+        sub.prop(cscene, "dicing_rate", text="Dicing Rate Render")
+        sub.prop(cscene, "preview_dicing_rate", text="Viewport")
+
+        col.separator()
+
+        col.prop(cscene, "offscreen_dicing_scale", text="Offscreen Scale")
+        col.prop(cscene, "max_subdivisions")
+
+        col.prop(cscene, "dicing_camera")
+
+
+class NEURAL_RENDER_RENDER_PT_curves(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Curves"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        scene = context.scene
+        ccscene = scene.cycles_curves
+
+        col = layout.column()
+        col.prop(ccscene, "shape", text="Shape")
+        if ccscene.shape == 'RIBBONS':
+            col.prop(ccscene, "subdivisions", text="Curve Subdivisions")
+
+
+class NEURAL_RENDER_RENDER_PT_curves_viewport_display(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Viewport Display"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_curves"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        draw_curves_settings(self, context)
+
+
+class NEURAL_RENDER_RENDER_PT_volumes(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Volumes"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        scene = context.scene
+        cscene = scene.cycles
+
+        col = layout.column(align=True)
+        col.prop(cscene, "volume_biased", text="Biased")
+        if cscene.volume_biased:
+            col.prop(cscene, "volume_step_rate", text="Step Rate Render")
+            col.prop(cscene, "volume_preview_step_rate", text="Viewport")
+
+            layout.prop(cscene, "volume_max_steps", text="Max Steps")
+
+
+class NEURAL_RENDER_RENDER_PT_light_paths(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Light Paths"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw_header_preset(self, context):
+        NEURAL_RENDER_PT_integrator_presets.draw_panel_header(self.layout)
+
+    def draw(self, context):
+        pass
+
+
+class NEURAL_RENDER_RENDER_PT_light_paths_dlss_viewport(NeuralRenderButtonsPanel, Panel):
+    # Falcon: while the checkbox is off, Falcon chooses the values:
+    # the bounces of the DLSS viewport (blender/sync.h NeuralViewportLightPaths).
+    bl_label = "Neural Rendering Viewport"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_light_paths"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        return super().poll(context) and is_nr_mode(context)
+
+    def draw(self, context):
+        import _neural_render
+
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        cscene = context.scene.cycles
+
+        layout.prop(cscene, "use_neural_viewport_scene_light_paths")
+        col = layout.column(align=True)
+        col.active = not cscene.use_neural_viewport_scene_light_paths
+        names = {
+            "max_bounces": "Total",
+            "diffuse_bounces": "Diffuse",
+            "glossy_bounces": "Glossy",
+            "transmission_bounces": "Transmission",
+            "transparent_max_bounces": "Transparent",
+        }
+        for identifier, value in _neural_render.neural_viewport_light_paths():
+            row = col.row(align=True)
+            row.label(text=names.get(identifier, identifier))
+            row.label(text=str(value))
+
+
+class NEURAL_RENDER_RENDER_PT_light_paths_max_bounces(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Max Bounces"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_light_paths"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        scene = context.scene
+        cscene = scene.cycles
+
+        col = layout.column(align=True)
+        col.prop(cscene, "max_bounces", text="Total")
+
+        col = layout.column(align=True)
+        col.prop(cscene, "diffuse_bounces", text="Diffuse")
+        col.prop(cscene, "glossy_bounces", text="Glossy")
+        col.prop(cscene, "transmission_bounces", text="Transmission")
+        col.prop(cscene, "volume_bounces", text="Volume", text_ctxt=i18n_contexts.id_id)
+
+        col = layout.column(align=True)
+        col.prop(cscene, "transparent_max_bounces", text="Transparent")
+
+
+class NEURAL_RENDER_RENDER_PT_light_paths_clamping(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Clamping"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_light_paths"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        scene = context.scene
+        cscene = scene.cycles
+
+        col = layout.column(align=True)
+        col.prop(cscene, "sample_clamp_direct", text="Direct Light")
+        col.prop(cscene, "sample_clamp_indirect", text="Indirect Light")
+
+
+class NEURAL_RENDER_RENDER_PT_light_paths_caustics(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Caustics"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_light_paths"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        scene = context.scene
+        cscene = scene.cycles
+
+        col = layout.column()
+        col.prop(cscene, "blur_glossy")
+        col = layout.column(heading="Caustics", align=True)
+        col.prop(cscene, "caustics_reflective", text="Reflective")
+        col.prop(cscene, "caustics_refractive", text="Refractive")
+
+
+class NEURAL_RENDER_RENDER_PT_light_paths_bidirectional(NeuralRenderButtonsPanel, Panel):
+    """Falcon Cycles-expansion: bidirectional light transport."""
+    bl_label = "Bidirectional"
+    bl_options = {'DEFAULT_CLOSED'}
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_light_paths"
+
+    # Settings of each strategy, by the identifier from _neural_render.bidirectional_strategies().
+    STRATEGY_PROPS = {
+        'LIGHT_TRACING': "use_bidirectional_light_tracing",
+        'PHOTON_MAPPING': "use_bidirectional_photon_mapping",
+        'MANIFOLD': "use_bidirectional_manifold",
+    }
+
+    @staticmethod
+    def strategies():
+        import _neural_render
+        if hasattr(_neural_render, "bidirectional_strategies"):
+            return _neural_render.bidirectional_strategies()
+        return ()
+
+    def draw_header(self, context):
+        self.layout.prop(context.scene.cycles, "use_bidirectional", text="")
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        cscene = context.scene.cycles
+        layout.active = cscene.use_bidirectional
+
+        # Automatic hides the techniques; the amount and strength of the photons stay.
+        layout.prop(cscene, "use_bidirectional_auto")
+        col = layout.column(align=True)
+        col.active = cscene.use_bidirectional_auto or cscene.use_bidirectional_photon_mapping
+        col.prop(cscene, "bidirectional_photons")
+        col.prop(cscene, "bidirectional_photon_strength")
+        if cscene.use_bidirectional_auto:
+            return
+
+        not_implemented = []
+        col = layout.column(heading="Strategies", align=True)
+        for identifier, name, implemented in self.strategies():
+            prop = self.STRATEGY_PROPS.get(identifier)
+            if prop is None:
+                continue
+            col.prop(cscene, prop, text=name)
+            if not implemented and getattr(cscene, prop):
+                not_implemented.append(name)
+
+        col = layout.column()
+        col.prop(cscene, "bidirectional_max_light_bounces", text="Light Bounces")
+
+        if cscene.use_bidirectional and not_implemented:
+            col = layout.column(align=True)
+            col.label(text="Not implemented yet, rendered without:", icon='INFO')
+            for name in not_implemented:
+                col.label(text=name)
+
+
+class NEURAL_RENDER_RENDER_PT_light_paths_fast_gi(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Fast GI Approximation"
+    bl_options = {'DEFAULT_CLOSED'}
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_light_paths"
+
+    def draw_header(self, context):
+        scene = context.scene
+        cscene = scene.cycles
+
+        self.layout.prop(cscene, "use_fast_gi", text="")
+
+    def draw(self, context):
+        scene = context.scene
+        cscene = scene.cycles
+        world = scene.world
+
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        layout.active = cscene.use_fast_gi
+
+        col = layout.column(align=True)
+        col.prop(cscene, "fast_gi_method", text="Method")
+
+        if world:
+            light = world.light_settings
+            col = layout.column(align=True)
+            col.prop(light, "ao_factor", text="AO Factor")
+            col.prop(light, "distance", text="AO Distance")
+
+        if cscene.fast_gi_method == 'REPLACE':
+            col = layout.column(align=True)
+            col.prop(cscene, "ao_bounces", text="Viewport Bounces")
+            col.prop(cscene, "ao_bounces_render", text="Render Bounces")
+
+
+class NEURAL_RENDER_RENDER_PT_motion_blur(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Motion Blur"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw_header(self, context):
+        rd = context.scene.render
+
+        self.layout.prop(rd, "use_motion_blur", text="")
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        scene = context.scene
+        cscene = scene.cycles
+        rd = scene.render
+        layout.active = rd.use_motion_blur
+
+        col = layout.column()
+        col.prop(rd, "motion_blur_position", text="Position")
+        col.prop(rd, "motion_blur_shutter")
+        col.separator()
+        col.prop(cscene, "rolling_shutter_type", text="Rolling Shutter")
+        sub = col.column()
+        sub.active = cscene.rolling_shutter_type != 'NONE'
+        sub.prop(cscene, "rolling_shutter_duration")
+
+
+class NEURAL_RENDER_RENDER_PT_motion_blur_curve(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Shutter Curve"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_motion_blur"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        scene = context.scene
+        rd = scene.render
+        layout.active = rd.use_motion_blur
+
+        col = layout.column()
+
+        col.template_curve_mapping(rd, "motion_blur_shutter_curve")
+
+        col = layout.column(align=True)
+        row = col.row(align=True)
+        row.operator("render.shutter_curve_preset", icon='SMOOTHCURVE', text="").shape = 'SMOOTH'
+        row.operator("render.shutter_curve_preset", icon='SPHERECURVE', text="").shape = 'ROUND'
+        row.operator("render.shutter_curve_preset", icon='ROOTCURVE', text="").shape = 'ROOT'
+        row.operator("render.shutter_curve_preset", icon='SHARPCURVE', text="").shape = 'SHARP'
+        row.operator("render.shutter_curve_preset", icon='LINCURVE', text="").shape = 'LINE'
+        row.operator("render.shutter_curve_preset", icon='NOCURVE', text="").shape = 'MAX'
+
+
+class NEURAL_RENDER_RENDER_PT_film(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Film"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        scene = context.scene
+        cscene = scene.cycles
+
+        col = layout.column()
+        col.prop(cscene, "film_exposure")
+
+
+class NEURAL_RENDER_RENDER_PT_film_transparency(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Transparent"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_film"
+
+    def draw_header(self, context):
+        layout = self.layout
+
+        scene = context.scene
+        rd = scene.render
+
+        layout.prop(rd, "film_transparent", text="")
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        scene = context.scene
+        rd = scene.render
+        cscene = scene.cycles
+
+        layout.active = rd.film_transparent
+
+        col = layout.column()
+        col.prop(cscene, "film_transparent_glass", text="Transparent Glass")
+
+        sub = col.column()
+        sub.active = rd.film_transparent and cscene.film_transparent_glass
+        sub.prop(cscene, "film_transparent_roughness", text="Roughness Threshold")
+
+
+class NEURAL_RENDER_RENDER_PT_film_pixel_filter(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Pixel Filter"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_film"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+        scene = context.scene
+        cscene = scene.cycles
+
+        col = layout.column()
+        col.prop(cscene, "pixel_filter_type", text="Type")
+        if cscene.pixel_filter_type != 'BOX':
+            col.prop(cscene, "filter_width", text="Width")
+
+
+class NEURAL_RENDER_RENDER_PT_performance(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Performance"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw_header_preset(self, context):
+        NEURAL_RENDER_PT_performance_presets.draw_panel_header(self.layout)
+
+    def draw(self, context):
+        pass
+
+
+class NEURAL_RENDER_RENDER_PT_performance_compositor(NeuralRenderButtonsPanel, CompositorPerformanceButtonsPanel, Panel):
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_performance"
+    bl_options = {'DEFAULT_CLOSED'}
+
+
+class NEURAL_RENDER_RENDER_PT_performance_compositor_denoise_settings(
+        NeuralRenderButtonsPanel, CompositorDenoisePerformanceButtonsPanel, Panel):
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_performance_compositor"
+    bl_options = {'DEFAULT_CLOSED'}
+
+
+class NEURAL_RENDER_RENDER_PT_performance_threads(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Threads"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_performance"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        scene = context.scene
+        rd = scene.render
+
+        col = layout.column()
+
+        col.prop(rd, "threads_mode")
+        sub = col.column(align=True)
+        sub.enabled = rd.threads_mode == 'FIXED'
+        sub.prop(rd, "threads")
+
+
+class NEURAL_RENDER_RENDER_PT_performance_memory(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Memory"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_performance"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        scene = context.scene
+        cscene = scene.cycles
+
+        layout.prop(cscene, "tile_size")
+
+
+class NEURAL_RENDER_RENDER_PT_performance_texture_cache(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Texture Cache"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_performance"
+
+    def draw_header(self, context):
+        rd = context.scene.render
+        self.layout.prop(rd, "use_texture_cache", text="")
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        rd = context.scene.render
+
+        col = layout.column()
+        col.active = rd.use_texture_cache
+
+        col.prop(rd, "use_auto_generate_texture_cache", text="Auto Generate")
+
+        row = col.split(factor=col.property_split_factor)
+        row.label()
+        sub = row.row(align=True)
+        sub.operator("render.generate_texture_cache", text="Generate")
+        sub.operator("render.clear_texture_cache", text="Clear")
+
+        prefs = context.preferences
+        if prefs.experimental.use_cycles_debug and prefs.view.show_developer_ui:
+            cscene = context.scene.cycles
+            col = layout.column(heading="Debug")
+            col.active = rd.use_texture_cache
+            col.prop(cscene, "debug_use_texture_cache_eviction")
+            sub = col.column()
+            sub.active = cscene.debug_use_texture_cache_eviction
+            sub.prop(cscene, "debug_texture_cache_preserve_unused")
+
+
+class NEURAL_RENDER_RENDER_PT_performance_acceleration_structure(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Acceleration Structure"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_performance"
+
+    @classmethod
+    def poll(cls, context):
+        return not use_optix(context) or use_multi_device(context)
+
+    def draw(self, context):
+        import _neural_render
+
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        scene = context.scene
+        cscene = scene.cycles
+
+        col = layout.column()
+
+        use_embree = _neural_render.with_embree
+
+        if use_cpu(context):
+            col.prop(cscene, "debug_use_spatial_splits")
+            if use_embree:
+                col.prop(cscene, "debug_use_compact_bvh")
+            else:
+                sub = col.column()
+                sub.active = not cscene.debug_use_spatial_splits
+                sub.prop(cscene, "debug_bvh_time_steps")
+
+                col.prop(cscene, "debug_use_hair_bvh")
+
+                sub = col.column(align=True)
+                sub.label(text="Neural Render built without Embree support")
+                sub.label(text="CPU raytracing performance will be poor")
+        else:
+            col.prop(cscene, "debug_use_spatial_splits")
+            sub = col.column()
+            sub.active = not cscene.debug_use_spatial_splits
+            sub.prop(cscene, "debug_bvh_time_steps")
+
+            col.prop(cscene, "debug_use_hair_bvh")
+
+            # CPU is used in addition to a GPU
+            if use_multi_device(context) and use_embree:
+                col.prop(cscene, "debug_use_compact_bvh")
+
+
+class NEURAL_RENDER_RENDER_PT_performance_final_render(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Final Render"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_performance"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        scene = context.scene
+        rd = scene.render
+
+        col = layout.column()
+
+        col.prop(rd, "use_persistent_data", text="Persistent Data")
+
+
+class NEURAL_RENDER_RENDER_PT_performance_viewport(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Viewport"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_performance"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        scene = context.scene
+        rd = scene.render
+        cscene = scene.cycles
+
+        col = layout.column()
+        col.prop(rd, "preview_pixel_size", text="Pixel Size")
+
+
+class NEURAL_RENDER_RENDER_PT_filter(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Filter"
+    bl_options = {'DEFAULT_CLOSED'}
+    bl_context = "view_layer"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        scene = context.scene
+        rd = scene.render
+        view_layer = context.view_layer
+
+        col = layout.column(heading="Include")
+        col.prop(view_layer, "use_sky", text="Environment")
+        col.prop(view_layer, "use_solid", text="Surfaces")
+        col.prop(view_layer, "use_strand", text="Curves")
+        col.prop(view_layer, "use_volumes", text="Volumes")
+        col.prop(view_layer, "use_grease_pencil", text="Grease Pencil")
+
+        col = layout.column(heading="Use")
+        sub = col.row()
+        sub.prop(view_layer, "use_motion_blur", text="Motion Blur")
+        sub.active = rd.use_motion_blur
+        sub = col.row()
+        sub.prop(view_layer.cycles, "use_denoising", text="Denoising")
+        sub.active = scene.cycles.use_denoising
+
+
+class NEURAL_RENDER_RENDER_PT_passes(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Passes"
+    bl_context = "view_layer"
+
+    def draw(self, context):
+        pass
+
+
+class NEURAL_RENDER_RENDER_PT_passes_data(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Data"
+    bl_context = "view_layer"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_passes"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        scene = context.scene
+        rd = scene.render
+        view_layer = context.view_layer
+        cycles_view_layer = view_layer.cycles
+
+        col = layout.column(heading="Include", align=True)
+        col.prop(view_layer, "use_pass_combined")
+        col.prop(view_layer, "use_pass_z")
+        col.prop(view_layer, "use_pass_mist")
+        col.prop(view_layer, "use_pass_position")
+        col.prop(view_layer, "use_pass_normal")
+        sub = col.column()
+        sub.active = not rd.use_motion_blur
+        sub.prop(view_layer, "use_pass_vector")
+        col.prop(view_layer, "use_pass_uv")
+        col.prop(view_layer, "use_pass_grease_pencil", text="Grease Pencil")
+
+        prefs = context.preferences
+        use_debug = prefs.experimental.use_cycles_debug and prefs.view.show_developer_ui
+        if use_debug:
+            col = layout.column(heading="Denoising", align=True)
+            col.prop(cycles_view_layer, "denoising_store_passes", text="Data Passes")
+            sub = col.column()
+            sub.active = cycles_view_layer.denoising_store_passes
+            sub.prop(cycles_view_layer, "denoising_store_motion_passes", text="Motion")
+            sub.prop(cycles_view_layer, "denoising_pass_follow_reflections", text="Follow Reflections")
+            sub.prop(
+                cycles_view_layer,
+                "denoising_pass_use_albedo_roughness_weighting",
+                text="Albedo Roughness Weighting")
+        else:
+            col.prop(cycles_view_layer, "denoising_store_passes", text="Denoising Data")
+
+        col = layout.column(heading="Indexes", align=True)
+        col.prop(view_layer, "use_pass_object_index")
+        col.prop(view_layer, "use_pass_material_index")
+
+        col = layout.column(heading="Debug", align=True)
+        col.prop(cycles_view_layer, "pass_debug_sample_count", text="Sample Count")
+
+        # Render Time pass - disabled for GPU devices
+        scene = context.scene
+        cscene = scene.cycles
+        row = col.row()
+        row.enabled = (cscene.device == 'CPU')
+        row.prop(cycles_view_layer, "pass_render_time", text="Render Time")
+
+        layout.prop(view_layer, "pass_alpha_threshold")
+
+
+class NEURAL_RENDER_RENDER_PT_passes_light(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Light"
+    bl_context = "view_layer"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_passes"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        view_layer = context.view_layer
+        cycles_view_layer = view_layer.cycles
+
+        col = layout.column(heading="Diffuse", align=True)
+        col.prop(view_layer, "use_pass_diffuse_direct", text="Direct")
+        col.prop(view_layer, "use_pass_diffuse_indirect", text="Indirect")
+        col.prop(view_layer, "use_pass_diffuse_color", text="Color")
+
+        col = layout.column(heading="Glossy", align=True)
+        col.prop(view_layer, "use_pass_glossy_direct", text="Direct")
+        col.prop(view_layer, "use_pass_glossy_indirect", text="Indirect")
+        col.prop(view_layer, "use_pass_glossy_color", text="Color")
+
+        col = layout.column(heading="Transmission", align=True)
+        col.prop(view_layer, "use_pass_transmission_direct", text="Direct")
+        col.prop(view_layer, "use_pass_transmission_indirect", text="Indirect")
+        col.prop(view_layer, "use_pass_transmission_color", text="Color")
+
+        col = layout.column(heading="Volume", heading_ctxt=i18n_contexts.id_id, align=True)
+        col.prop(cycles_view_layer, "use_pass_volume_direct", text="Direct")
+        col.prop(cycles_view_layer, "use_pass_volume_indirect", text="Indirect")
+
+        prefs = context.preferences
+        use_debug = prefs.experimental.use_cycles_debug and prefs.view.show_developer_ui
+        if use_debug:
+            col.prop(cycles_view_layer, "use_pass_volume_scatter", text="Scatter")
+            col.prop(cycles_view_layer, "use_pass_volume_transmit", text="Transmit")
+            col.prop(cycles_view_layer, "use_pass_volume_majorant", text="Majorant")
+
+        col = layout.column(heading="Other", align=True)
+        col.prop(view_layer, "use_pass_emit", text="Emission")
+        col.prop(view_layer, "use_pass_environment")
+        col.prop(view_layer, "use_pass_ambient_occlusion", text="Ambient Occlusion")
+        col.prop(cycles_view_layer, "use_pass_shadow_catcher")
+
+
+class NEURAL_RENDER_RENDER_PT_passes_crypto(NeuralRenderButtonsPanel, ViewLayerCryptomattePanelHelper, Panel):
+    bl_label = "Cryptomatte"
+    bl_context = "view_layer"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_passes"
+
+
+class NEURAL_RENDER_RENDER_PT_passes_aov(NeuralRenderButtonsPanel, ViewLayerAOVPanelHelper, Panel):
+    bl_label = "Shader AOV"
+    bl_context = "view_layer"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_passes"
+
+
+class NEURAL_RENDER_RENDER_PT_passes_lightgroups(NeuralRenderButtonsPanel, ViewLayerLightgroupsPanelHelper, Panel):
+    bl_label = "Light Groups"
+    bl_context = "view_layer"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_passes"
+
+
+class NEURAL_RENDER_PT_post_processing(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Post Processing"
+    bl_options = {'DEFAULT_CLOSED'}
+    bl_context = "output"
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        rd = context.scene.render
+
+        col = layout.column(align=True, heading="Pipeline")
+        col.prop(rd, "use_compositing")
+        col.prop(rd, "use_sequencer")
+
+        layout.prop(rd, "dither_intensity", text="Dither", slider=True)
+
+
+class NEURAL_RENDER_CAMERA_PT_dof(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Depth of Field"
+    bl_context = "data"
+
+    @classmethod
+    def poll(cls, context):
+        return context.camera and NeuralRenderButtonsPanel.poll(context)
+
+    def draw_header(self, context):
+        cam = context.camera
+        dof = cam.dof
+        self.layout.prop(dof, "use_dof", text="")
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+
+        cam = context.camera
+        dof = cam.dof
+        layout.active = dof.use_dof
+
+        split = layout.split()
+
+        col = split.column()
+        col.prop(dof, "focus_object", text="Focus on Object")
+        if dof.focus_object and dof.focus_object.type == 'ARMATURE':
+            col.prop_search(dof, "focus_subtarget", dof.focus_object.data, "bones", text="Focus Bone")
+
+        sub = col.row()
+        sub.active = dof.focus_object is None
+        sub.prop(dof, "focus_distance", text="Focus Distance")
+        sub.operator(
+            "ui.eyedropper_depth",
+            icon='EYEDROPPER',
+            text="").prop_data_path = "scene.camera.data.dof.focus_distance"
+
+
+class NEURAL_RENDER_CAMERA_PT_dof_aperture(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Aperture"
+    bl_parent_id = "NEURAL_RENDER_CAMERA_PT_dof"
+
+    @classmethod
+    def poll(cls, context):
+        return context.camera and NeuralRenderButtonsPanel.poll(context)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+
+        cam = context.camera
+        dof = cam.dof
+        layout.active = dof.use_dof
+        flow = layout.grid_flow(row_major=True, columns=0, even_columns=True, even_rows=False, align=False)
+
+        col = flow.column()
+        col.prop(dof, "aperture_fstop")
+        col.prop(dof, "aperture_blades")
+        col.prop(dof, "aperture_rotation")
+        col.prop(dof, "aperture_ratio")
+
+
+class NEURAL_RENDER_CAMERA_PT_lens_custom_parameters(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Parameters"
+    bl_parent_id = "DATA_PT_lens"
+
+    @classmethod
+    def poll(cls, context):
+        cam = context.camera
+        return (super().poll(context) and
+                cam and
+                cam.type == 'CUSTOM' and
+                len(cam.cycles_custom.keys()) > 0)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+
+        cam = context.camera
+        ccam = cam.cycles_custom
+
+        col = layout.column()
+        for key in ccam.keys():
+            col.prop(ccam, f'["{key}"]', text=bpy.path.display_name(key))
+
+
+class NEURAL_RENDER_PT_context_material(NeuralRenderButtonsPanel, Panel):
+    bl_label = ""
+    bl_context = "material"
+    bl_options = {'HIDE_HEADER'}
+
+    @classmethod
+    def poll(cls, context):
+        if context.active_object and context.active_object.type == 'GREASEPENCIL':
+            return False
+        else:
+            return (context.material or context.object) and NeuralRenderButtonsPanel.poll(context)
+
+    def draw(self, context):
+        layout = self.layout
+
+        mat = context.material
+        ob = context.object
+        slot = context.material_slot
+        space = context.space_data
+
+        if ob:
+            is_sortable = len(ob.material_slots) > 1
+            rows = 3
+            if (is_sortable):
+                rows = 4
+
+            row = layout.row()
+
+            row.template_list("MATERIAL_UL_matslots", "", ob, "material_slots", ob, "active_material_index", rows=rows)
+
+            col = row.column(align=True)
+            col.operator("object.material_slot_add", icon='ADD', text="")
+            col.operator("object.material_slot_remove", icon='REMOVE', text="")
+            col.separator()
+            col.menu("MATERIAL_MT_context_menu", icon='DOWNARROW_HLT', text="")
+
+            if is_sortable:
+                col.separator()
+
+                col.operator("object.material_slot_move", icon='TRIA_UP', text="").direction = 'UP'
+                col.operator("object.material_slot_move", icon='TRIA_DOWN', text="").direction = 'DOWN'
+
+            if ob.mode == 'EDIT':
+                row = layout.row(align=True)
+                row.operator("object.material_slot_assign", text="Assign")
+                row.operator("object.material_slot_select", text="Select")
+                row.operator("object.material_slot_deselect", text="Deselect")
+
+        row = layout.row()
+
+        if ob:
+            row.template_ID(ob, "active_material", new="material.new")
+
+            if slot:
+                icon_link = 'MESH_DATA' if slot.link == 'DATA' else 'OBJECT_DATA'
+                row.prop(slot, "link", text="", icon=icon_link, icon_only=True)
+
+        elif mat:
+            layout.template_ID(space, "pin_id")
+            layout.separator()
+
+
+class NEURAL_RENDER_OBJECT_PT_motion_blur(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Motion Blur"
+    bl_context = "object"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.object
+        if NeuralRenderButtonsPanel.poll(context) and ob:
+            if ob.type in {'MESH', 'CURVE', 'CURVE', 'SURFACE', 'FONT',
+                           'META', 'CAMERA', 'CURVES', 'POINTCLOUD', 'VOLUME'}:
+                return True
+            if ob.instance_type == 'COLLECTION' and ob.instance_collection:
+                return True
+            # TODO(sergey): More duplicator types here?
+        return False
+
+    def draw_header(self, context):
+        layout = self.layout
+
+        rd = context.scene.render
+        # scene = context.scene
+
+        layout.active = rd.use_motion_blur
+
+        ob = context.object
+        cob = ob.cycles
+
+        layout.prop(cob, "use_motion_blur", text="")
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+
+        rd = context.scene.render
+        # scene = context.scene
+
+        ob = context.object
+        cob = ob.cycles
+
+        layout.active = (rd.use_motion_blur and cob.use_motion_blur)
+
+        col = layout.column()
+        col.prop(cob, "motion_steps", text="Steps")
+        if ob.type != 'CAMERA':
+            col.prop(cob, "use_deform_motion", text="Deformation")
+
+
+class NEURAL_RENDER_OBJECT_PT_shading_gi_approximation(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Fast GI Approximation"
+    bl_parent_id = "OBJECT_PT_shading"
+    bl_context = "object"
+
+    @classmethod
+    def poll(cls, context):
+        return NeuralRenderButtonsPanel.poll(context) and context.object.type != 'LIGHT'
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+
+        scene = context.scene
+        ob = context.object
+
+        cob = ob.cycles
+        cscene = scene.cycles
+
+        col = layout.column()
+        col.active = cscene.use_fast_gi
+        col.prop(cob, "ao_distance")
+
+
+class NEURAL_RENDER_OBJECT_PT_shading_caustics(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Caustics"
+    bl_parent_id = "OBJECT_PT_shading"
+    bl_context = "object"
+
+    @classmethod
+    def poll(cls, context):
+        return NeuralRenderButtonsPanel.poll(context) and context.object.type != 'LIGHT'
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        col = layout.column()
+
+        ob = context.object
+        cob = ob.cycles
+        col.prop(cob, "is_caustics_caster")
+        col.prop(cob, "is_caustics_receiver")
+
+
+class NEURAL_RENDER_OBJECT_PT_lightgroup(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Light Group"
+    bl_parent_id = "OBJECT_PT_shading"
+    bl_context = "object"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+
+        ob = context.object
+
+        view_layer = context.view_layer
+
+        row = layout.row(align=True)
+        row.use_property_decorate = False
+
+        sub = row.column(align=True)
+        sub.prop_search(ob, "lightgroup", view_layer, "lightgroups", text="Light Group", results_are_suggestions=True)
+
+        sub = row.column(align=True)
+        sub.enabled = bool(ob.lightgroup) and not any(lg.name == ob.lightgroup for lg in view_layer.lightgroups)
+        sub.operator("scene.view_layer_add_lightgroup", icon='ADD', text="").name = ob.lightgroup
+
+
+class NEURAL_RENDER_OBJECT_PT_visibility(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Visibility"
+    bl_context = "object"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        return NeuralRenderButtonsPanel.poll(context) and (context.object)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+
+        ob = context.object
+
+        layout.prop(ob, "hide_select", text="Selectable", invert_checkbox=True, toggle=False)
+        layout.prop(ob, "hide_surface_pick", text="Surface Picking", toggle=False, invert_checkbox=True)
+
+        col = layout.column(heading="Show In")
+        col.prop(ob, "hide_viewport", text="Viewports", invert_checkbox=True, toggle=False)
+        col.prop(ob, "hide_render", text="Renders", invert_checkbox=True, toggle=False)
+
+        if has_geometry_visibility(ob):
+            col = layout.column(heading="Mask")
+            col.prop(ob, "is_shadow_catcher")
+            col.prop(ob, "is_holdout", toggle=False)
+
+
+class NEURAL_RENDER_OBJECT_PT_visibility_ray_visibility(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Ray Visibility"
+    bl_parent_id = "NEURAL_RENDER_OBJECT_PT_visibility"
+    bl_context = "object"
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.object
+        return NeuralRenderButtonsPanel.poll(context) and has_geometry_visibility(ob)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        scene = context.scene
+        ob = context.object
+
+        col = layout.column()
+        col.prop(ob, "visible_camera", text="Camera", toggle=False)
+        col.prop(ob, "visible_diffuse", text="Diffuse")
+        col.prop(ob, "visible_glossy", text="Glossy")
+        col.prop(ob, "visible_transmission", text="Transmission")
+        col.prop(ob, "visible_volume_scatter", text="Volume Scatter")
+
+        if ob.type != 'LIGHT':
+            sub = col.column()
+            sub.prop(ob, "visible_shadow", text="Shadow")
+            sub.prop(ob, "visible_raycast", text="Raycast")
+
+
+class NEURAL_RENDER_OBJECT_PT_visibility_culling(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Culling"
+    bl_parent_id = "NEURAL_RENDER_OBJECT_PT_visibility"
+    bl_context = "object"
+
+    @classmethod
+    def poll(cls, context):
+        ob = context.object
+        return NeuralRenderButtonsPanel.poll(context) and has_geometry_visibility(ob)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        scene = context.scene
+        cscene = scene.cycles
+        ob = context.object
+        cob = ob.cycles
+
+        row = layout.row()
+        row.active = scene.render.use_simplify and cscene.use_camera_cull
+        row.prop(cob, "use_camera_cull")
+
+        row = layout.row()
+        row.active = scene.render.use_simplify and cscene.use_distance_cull
+        row.prop(cob, "use_distance_cull")
+
+
+def panel_node_draw(layout, id_data, input_name):
+    from bpy_extras.node_utils import find_node_input
+
+    ntree = id_data.node_tree
+
+    if ntree is None:
+        return False
+
+    node = ntree.get_output_node('CYCLES')
+    if node:
+        input = find_node_input(node, input_name)
+        if input:
+            layout.template_node_view(ntree, node, input)
+        else:
+            layout.label(text="Incompatible output node")
+    else:
+        layout.label(text="No output node")
+
+    return True
+
+
+class NEURAL_RENDER_LIGHT_PT_preview(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Preview"
+    bl_context = "data"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        return (
+            context.light and
+            not (
+                context.light.type == 'AREA' and
+                context.light.cycles.is_portal
+            ) and
+            NeuralRenderButtonsPanel.poll(context)
+        )
+
+    def draw(self, context):
+        self.layout.template_preview(context.light)
+
+
+class NEURAL_RENDER_LIGHT_PT_light(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Light"
+    bl_context = "data"
+
+    @classmethod
+    def poll(cls, context):
+        return context.light and NeuralRenderButtonsPanel.poll(context)
+
+    def draw(self, context):
+        layout = self.layout
+
+        light = context.light
+
+        if self.bl_space_type == 'PROPERTIES':
+            layout.row().prop(light, "type", expand=True)
+            layout.use_property_split = True
+        else:
+            layout.use_property_split = True
+            layout.row().prop(light, "type")
+
+        col = layout.column()
+        heading = col.column(align=True, heading="Temperature")
+        row = heading.column(align=True).row(align=True)
+        row.use_property_decorate = False
+        row.prop(light, "use_temperature", text="")
+        # Don't show color preview for now, it is grayed out so the color
+        # is not accurate. Would not a change in the UI code to allow
+        # non-editable colors to be displayed as is.
+        if False:  # light.use_temperature:
+            sub = row.split(factor=0.7, align=True)
+            sub.active = light.use_temperature
+            sub.prop(light, "temperature", text="")
+            sub.prop(light, "temperature_color", text="")
+        else:
+            sub = row.row()
+            sub.active = light.use_temperature
+            sub.prop(light, "temperature", text="")
+            row.prop_decorator(light, "temperature")
+
+        if light.use_temperature:
+            col.prop(light, "color", text="Tint")
+        else:
+            col.prop(light, "color", text="Color")
+
+        layout.separator()
+
+        col = layout.column()
+        # Falcon Cycles-expansion: photometric units (properties.py light_watts_from_photometric()).
+        clamp = light.cycles
+        col.prop(clamp, "power_unit")
+        if clamp.power_unit == 'WATT':
+            col.prop(light, "energy")
+        else:
+            unit_names = {'LUMEN': "lm", 'CANDELA': "cd", 'LUX': "lx"}
+            col.prop(clamp, "power_photometric", text="Power (%s)" % unit_names[clamp.power_unit])
+            sub = col.row()
+            sub.enabled = False
+            sub.prop(light, "energy", text="= Watts" if light.type != 'SUN' else "= W/m²")
+        col.prop(light, "exposure")
+        col.prop(light, "normalize")
+
+        layout.separator()
+
+        col = layout.column()
+        if light.type in {'POINT', 'SPOT'}:
+            col.prop(light, "shadow_soft_size", text="Radius")
+            col.prop(light, "use_soft_falloff")
+        elif light.type == 'SUN':
+            col.prop(light, "angle")
+        elif light.type == 'AREA':
+            col.prop(light, "shape", text="Shape")
+            sub = col.column(align=True)
+
+            if light.shape in {'SQUARE', 'DISK'}:
+                sub.prop(light, "size")
+            elif light.shape in {'RECTANGLE', 'ELLIPSE'}:
+                sub.prop(light, "size", text="Size X")
+                sub.prop(light, "size_y", text="Y")
+
+
+class NEURAL_RENDER_LIGHT_PT_settings(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Settings"
+    bl_context = "data"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.light and NeuralRenderButtonsPanel.poll(context)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+
+        light = context.light
+        clamp = light.cycles
+
+        col = layout.column()
+
+        if not (light.type == 'AREA' and clamp.is_portal):
+            col.separator()
+            sub = col.column()
+            sub.prop(clamp, "max_bounces")
+
+        sub = col.column(align=True)
+        sub.active = not (light.type == 'AREA' and clamp.is_portal)
+        sub.prop(light, "use_shadow", text="Cast Shadow")
+        sub.prop(clamp, "use_multiple_importance_sampling", text="Multiple Importance")
+        sub.prop(clamp, "is_caustics_light", text="Shadow Caustics")
+
+        if light.type == 'AREA':
+            col.prop(clamp, "is_portal", text="Portal")
+
+
+class NEURAL_RENDER_LIGHT_PT_nodes(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Nodes"
+    bl_context = "data"
+
+    @classmethod
+    def poll(cls, context):
+        return context.light and not (context.light.type == 'AREA' and
+                                      context.light.cycles.is_portal) and \
+            NeuralRenderButtonsPanel.poll(context)
+
+    def draw(self, context):
+        layout = self.layout
+
+        layout.use_property_split = True
+
+        light = context.light
+        panel_node_draw(layout, light, 'Surface')
+
+
+class NEURAL_RENDER_LIGHT_PT_beam_shape(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Beam Shape"
+    bl_parent_id = "NEURAL_RENDER_LIGHT_PT_light"
+    bl_context = "data"
+
+    @classmethod
+    def poll(cls, context):
+        if context.light.type in {'SPOT', 'AREA'}:
+            return context.light and NeuralRenderButtonsPanel.poll(context)
+
+    def draw(self, context):
+        layout = self.layout
+        light = context.light
+        layout.use_property_split = True
+
+        col = layout.column()
+        if light.type == 'SPOT':
+            col.prop(light, "spot_size", text="Angle")
+            col.prop(light, "spot_blend", text="Blend", slider=True)
+            col.prop(light, "show_cone")
+        elif light.type == 'AREA':
+            col.prop(light, "spread", text="Spread")
+
+
+class NEURAL_RENDER_WORLD_PT_preview(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Preview"
+    bl_context = "world"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.world and NeuralRenderButtonsPanel.poll(context)
+
+    def draw(self, context):
+        self.layout.template_preview(context.world)
+
+
+class NEURAL_RENDER_WORLD_PT_surface(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Surface"
+    bl_context = "world"
+
+    @classmethod
+    def poll(cls, context):
+        return context.world and NeuralRenderButtonsPanel.poll(context)
+
+    def draw(self, context):
+        layout = self.layout
+
+        layout.use_property_split = True
+
+        world = context.world
+
+        if not panel_node_draw(layout, world, 'Surface'):
+            layout.prop(world, "color")
+
+
+class NEURAL_RENDER_WORLD_PT_volume(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Volume"
+    bl_translation_context = i18n_contexts.id_id
+    bl_context = "world"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        world = context.world
+        return world and world.node_tree and NeuralRenderButtonsPanel.poll(context)
+
+    def draw(self, context):
+        layout = self.layout
+
+        layout.use_property_split = True
+
+        world = context.world
+        panel_node_draw(layout, world, 'Volume')
+
+
+class NEURAL_RENDER_WORLD_PT_mist(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Mist Pass"
+    bl_context = "world"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        if NeuralRenderButtonsPanel.poll(context):
+            if context.world:
+                for view_layer in context.scene.view_layers:
+                    if view_layer.use_pass_mist:
+                        return True
+
+        return False
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+
+        world = context.world
+
+        col = layout.column(align=True)
+        col.prop(world.mist_settings, "start")
+        col.prop(world.mist_settings, "depth")
+
+        col = layout.column()
+        col.prop(world.mist_settings, "falloff")
+
+
+class NEURAL_RENDER_WORLD_PT_ray_visibility(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Ray Visibility"
+    bl_context = "world"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        return NeuralRenderButtonsPanel.poll(context) and context.world
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        world = context.world
+        visibility = world.cycles_visibility
+
+        col = layout.column()
+        col.prop(visibility, "camera")
+        col.prop(visibility, "diffuse")
+        col.prop(visibility, "glossy")
+        col.prop(visibility, "transmission")
+        col.prop(visibility, "scatter")
+
+
+class NEURAL_RENDER_WORLD_PT_settings(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Settings"
+    bl_context = "world"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        return context.world and NeuralRenderButtonsPanel.poll(context)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        layout.column()
+
+
+class NEURAL_RENDER_WORLD_PT_settings_surface(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Surface"
+    bl_parent_id = "NEURAL_RENDER_WORLD_PT_settings"
+    bl_context = "world"
+
+    @classmethod
+    def poll(cls, context):
+        return context.world and NeuralRenderButtonsPanel.poll(context)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        world = context.world
+        cworld = world.cycles
+
+        col = layout.column()
+        col.prop(cworld, "sampling_method", text="Sampling")
+
+        sub = col.column()
+        sub.active = cworld.sampling_method != 'NONE'
+        subsub = sub.row(align=True)
+        subsub.active = cworld.sampling_method == 'MANUAL'
+        subsub.prop(cworld, "sample_map_resolution")
+        sub.prop(cworld, "max_bounces")
+        sub.prop(cworld, "is_caustics_light", text="Shadow Caustics")
+        sub.prop(cworld, "use_shadows", text="Cast Shadow")
+
+
+class NEURAL_RENDER_WORLD_PT_settings_volume(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Volume"
+    bl_translation_context = i18n_contexts.id_id
+    bl_parent_id = "NEURAL_RENDER_WORLD_PT_settings"
+    bl_context = "world"
+
+    @classmethod
+    def poll(cls, context):
+        return context.world and NeuralRenderButtonsPanel.poll(context)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        world = context.world
+        cworld = world.cycles
+
+        col = layout.column()
+
+        sub = col.column()
+        col.prop(cworld, "volume_sampling", text="Sampling")
+        col.prop(cworld, "volume_interpolation", text="Interpolation")
+        if context.scene.cycles.volume_biased:
+            col.prop(cworld, "volume_step_size")
+
+
+class NEURAL_RENDER_WORLD_PT_settings_light_group(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Light Group"
+    bl_parent_id = "NEURAL_RENDER_WORLD_PT_settings"
+    bl_context = "world"
+
+    @classmethod
+    def poll(cls, context):
+        return context.world and NeuralRenderButtonsPanel.poll(context)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        world = context.world
+        view_layer = context.view_layer
+
+        row = layout.row(align=True)
+
+        sub = row.column(align=True)
+        sub.prop_search(
+            world,
+            "lightgroup",
+            view_layer,
+            "lightgroups",
+            text="Light Group",
+            results_are_suggestions=True,
+        )
+
+        sub = row.column(align=True)
+        sub.enabled = bool(world.lightgroup) and not any(lg.name == world.lightgroup for lg in view_layer.lightgroups)
+        sub.operator("scene.view_layer_add_lightgroup", icon='ADD', text="").name = world.lightgroup
+
+
+class NEURAL_RENDER_MATERIAL_PT_preview(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Preview"
+    bl_context = "material"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        mat = context.material
+        return mat and (not mat.grease_pencil) and NeuralRenderButtonsPanel.poll(context)
+
+    def draw(self, context):
+        self.layout.template_preview(context.material)
+
+
+class NEURAL_RENDER_MATERIAL_PT_surface(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Surface"
+    bl_context = "material"
+
+    @classmethod
+    def poll(cls, context):
+        mat = context.material
+        return mat and (not mat.grease_pencil) and NeuralRenderButtonsPanel.poll(context)
+
+    def draw(self, context):
+        layout = self.layout
+
+        layout.use_property_split = True
+
+        mat = context.material
+        if not panel_node_draw(layout, mat, 'Surface'):
+            layout.prop(mat, "diffuse_color")
+
+
+class NEURAL_RENDER_MATERIAL_PT_volume(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Volume"
+    bl_translation_context = i18n_contexts.id_id
+    bl_context = "material"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        mat = context.material
+        return mat and (not mat.grease_pencil) and mat.node_tree and NeuralRenderButtonsPanel.poll(context)
+
+    def draw(self, context):
+        layout = self.layout
+
+        layout.use_property_split = True
+
+        mat = context.material
+        # cmat = mat.cycles
+
+        panel_node_draw(layout, mat, 'Volume')
+
+
+class NEURAL_RENDER_MATERIAL_PT_displacement(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Displacement"
+    bl_context = "material"
+
+    @classmethod
+    def poll(cls, context):
+        mat = context.material
+        return mat and (not mat.grease_pencil) and mat.node_tree and NeuralRenderButtonsPanel.poll(context)
+
+    def draw(self, context):
+        layout = self.layout
+
+        layout.use_property_split = True
+
+        mat = context.material
+        panel_node_draw(layout, mat, 'Displacement')
+
+
+class NEURAL_RENDER_MATERIAL_PT_settings(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Settings"
+    bl_context = "material"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        mat = context.material
+        return mat and (not mat.grease_pencil) and NeuralRenderButtonsPanel.poll(context)
+
+    @staticmethod
+    def draw_shared(self, mat):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        layout.prop(mat, "pass_index")
+
+    def draw(self, context):
+        self.draw_shared(self, context.material)
+
+
+class NEURAL_RENDER_MATERIAL_PT_settings_surface(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Surface"
+    bl_parent_id = "NEURAL_RENDER_MATERIAL_PT_settings"
+    bl_context = "material"
+
+    @staticmethod
+    def draw_shared(self, mat):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        cmat = mat.cycles
+
+        col = layout.column()
+        col.prop(mat, "displacement_method", text="Displacement")
+        col.prop(cmat, "emission_sampling")
+        col.prop(mat, "use_transparent_shadow")
+        col.prop(cmat, "use_bump_map_correction")
+
+    def draw(self, context):
+        self.draw_shared(self, context.material)
+
+
+class NEURAL_RENDER_MATERIAL_PT_settings_volume(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Volume"
+    bl_translation_context = i18n_contexts.id_id
+    bl_parent_id = "NEURAL_RENDER_MATERIAL_PT_settings"
+    bl_context = "material"
+
+    @staticmethod
+    def draw_shared(self, context, mat):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        cmat = mat.cycles
+
+        col = layout.column()
+        sub = col.column()
+        col.prop(cmat, "volume_sampling", text="Sampling")
+        col.prop(cmat, "volume_interpolation", text="Interpolation")
+        if context.scene.cycles.volume_biased:
+            col.prop(cmat, "volume_step_rate")
+
+    def draw(self, context):
+        self.draw_shared(self, context, context.material)
+
+
+class NEURAL_RENDER_RENDER_PT_bake(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Bake"
+    bl_context = "render"
+    bl_options = {'DEFAULT_CLOSED'}
+    COMPAT_ENGINES = {'NEURAL_RENDERING'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False  # No animation.
+
+        scene = context.scene
+        cscene = scene.cycles
+        cbk = scene.render.bake
+
+        if cbk.use_multires:
+            layout.operator("object.bake_image", icon='RENDER_STILL')
+            layout.prop(cbk, "use_multires")
+            layout.prop(cbk, "type")
+
+        else:
+            layout.operator("object.bake", icon='RENDER_STILL').type = cscene.bake_type
+            layout.prop(cbk, "use_multires")
+            layout.prop(cscene, "bake_type")
+
+        if not scene.render.bake.use_multires and cscene.bake_type not in {
+                "AO", "POSITION", "NORMAL", "UV", "ROUGHNESS", "ENVIRONMENT"}:
+            row = layout.row()
+            row.prop(cbk, "view_from")
+            row.active = scene.camera is not None
+
+
+class NEURAL_RENDER_RENDER_PT_bake_influence(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Influence"
+    bl_context = "render"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_bake"
+    COMPAT_ENGINES = {'NEURAL_RENDERING'}
+
+    @classmethod
+    def poll(cls, context):
+        scene = context.scene
+        cscene = scene.cycles
+        rd = scene.render
+        if scene.render.bake.use_multires == False and cscene.bake_type in {
+                'NORMAL', 'COMBINED', 'DIFFUSE', 'GLOSSY', 'TRANSMISSION'}:
+            return True
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False  # No animation.
+
+        scene = context.scene
+        cscene = scene.cycles
+        cbk = scene.render.bake
+        rd = scene.render
+
+        col = layout.column()
+
+        if cscene.bake_type == 'NORMAL':
+            col.prop(cbk, "normal_space", text="Space")
+
+            sub = col.column(align=True)
+            sub.prop(cbk, "normal_r", text="Swizzle R")
+            sub.prop(cbk, "normal_g", text="G", text_ctxt=i18n_contexts.color)
+            sub.prop(cbk, "normal_b", text="B", text_ctxt=i18n_contexts.color)
+
+        elif cscene.bake_type == 'COMBINED':
+
+            col = layout.column(heading="Lighting", align=True)
+            col.prop(cbk, "use_pass_direct")
+            col.prop(cbk, "use_pass_indirect")
+
+            col = layout.column(heading="Contributions", align=True)
+            col.active = cbk.use_pass_direct or cbk.use_pass_indirect
+            col.prop(cbk, "use_pass_diffuse")
+            col.prop(cbk, "use_pass_glossy")
+            col.prop(cbk, "use_pass_transmission")
+            col.prop(cbk, "use_pass_emit")
+
+        elif cscene.bake_type in {'DIFFUSE', 'GLOSSY', 'TRANSMISSION'}:
+            col = layout.column(heading="Contributions", align=True)
+            col.prop(cbk, "use_pass_direct")
+            col.prop(cbk, "use_pass_indirect")
+            col.prop(cbk, "use_pass_color")
+
+
+class NEURAL_RENDER_RENDER_PT_bake_selected_to_active(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Selected to Active"
+    bl_context = "render"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_bake"
+    bl_options = {'DEFAULT_CLOSED'}
+    COMPAT_ENGINES = {'NEURAL_RENDERING'}
+
+    @classmethod
+    def poll(cls, context):
+        scene = context.scene
+        rd = scene.render
+        return rd.bake.use_multires == False
+
+    def draw_header(self, context):
+        scene = context.scene
+        cbk = scene.render.bake
+        self.layout.prop(cbk, "use_selected_to_active", text="")
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False  # No animation.
+
+        scene = context.scene
+        cscene = scene.cycles
+        cbk = scene.render.bake
+        rd = scene.render
+
+        layout.active = cbk.use_selected_to_active
+        col = layout.column()
+
+        col.prop(cbk, "use_cage", text="Cage")
+        if cbk.use_cage:
+            col.prop(cbk, "cage_object")
+            col = layout.column()
+            col.prop(cbk, "cage_extrusion")
+            col.active = cbk.cage_object is None
+        else:
+            col.prop(cbk, "cage_extrusion", text="Extrusion")
+
+        col = layout.column()
+        col.prop(cbk, "max_ray_distance")
+
+
+class NEURAL_RENDER_RENDER_PT_bake_output(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Output"
+    bl_context = "render"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_bake"
+    COMPAT_ENGINES = {'NEURAL_RENDERING'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False  # No animation.
+
+        scene = context.scene
+        cbk = scene.render.bake
+
+        if cbk.use_multires:
+            layout.prop(cbk, "use_clear", text="Clear Image")
+            if cbk.type in {'DISPLACEMENT', 'VECTOR_DISPLACEMENT'}:
+                layout.prop(cbk, "use_lores_mesh")
+            if cbk.type == 'VECTOR_DISPLACEMENT':
+                layout.prop(cbk, "displacement_space", text="Space")
+        else:
+            layout.prop(cbk, "target")
+            if cbk.target == 'IMAGE_TEXTURES':
+                layout.prop(cbk, "use_clear", text="Clear Image")
+
+
+class NEURAL_RENDER_RENDER_PT_bake_output_margin(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Margin"
+    bl_context = "render"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_bake_output"
+    COMPAT_ENGINES = {'NEURAL_RENDERING'}
+
+    @classmethod
+    def poll(cls, context):
+        scene = context.scene
+        cbk = scene.render.bake
+        return cbk.target == 'IMAGE_TEXTURES'
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False  # No animation.
+
+        scene = context.scene
+        cscene = scene.cycles
+        cbk = scene.render.bake
+
+        if (cscene.bake_type == 'NORMAL' and cbk.normal_space == 'TANGENT') or cscene.bake_type == 'UV':
+            if cbk.use_multires or cbk.target == 'IMAGE_TEXTURES':
+                layout.prop(cbk, "margin", text="Size")
+        else:
+            if cbk.use_multires or cbk.target == 'IMAGE_TEXTURES':
+                layout.prop(cbk, "margin_type", text="Type")
+                layout.prop(cbk, "margin", text="Size")
+
+
+class NEURAL_RENDER_RENDER_PT_debug(NeuralRenderDebugButtonsPanel, Panel):
+    bl_label = "Debug"
+    bl_context = "render"
+    bl_options = {'DEFAULT_CLOSED'}
+    COMPAT_ENGINES = {'NEURAL_RENDERING'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False  # No animation.
+
+        scene = context.scene
+        cscene = scene.cycles
+
+        col = layout.column(heading="CPU")
+
+        row = col.row(align=True)
+        row.prop(cscene, "debug_use_cpu_sse42", toggle=True)
+        row.prop(cscene, "debug_use_cpu_avx2", toggle=True)
+        col.prop(cscene, "debug_bvh_layout", text="BVH")
+
+        import platform
+        is_macos = platform.system() == 'Darwin'
+        col.separator()
+
+        if is_macos:
+            col = layout.column(heading="Metal")
+            col.prop(cscene, "debug_use_metal_adaptive_compile")
+        else:
+            col = layout.column(heading="CUDA")
+            col.prop(cscene, "debug_use_cuda_adaptive_compile")
+            col = layout.column(heading="OptiX")
+            col.prop(cscene, "debug_use_optix_debug", text="Module Debug")
+
+            col.separator()
+
+            col = layout.column(heading="HIP")
+            col.prop(cscene, "debug_use_hip_adaptive_compile")
+
+        col.separator()
+
+        col.prop(cscene, "debug_bvh_type", text="Viewport BVH")
+
+        col.separator()
+
+        import _neural_render
+        if _neural_render.with_debug:
+            col.prop(cscene, "direct_light_sampling_type")
+
+
+class NEURAL_RENDER_RENDER_PT_simplify(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Simplify"
+    bl_context = "render"
+    bl_options = {'DEFAULT_CLOSED'}
+    COMPAT_ENGINES = {'NEURAL_RENDERING'}
+
+    def draw_header(self, context):
+        rd = context.scene.render
+        self.layout.prop(rd, "use_simplify", text="")
+
+    def draw(self, context):
+        pass
+
+
+class NEURAL_RENDER_RENDER_PT_simplify_viewport(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Viewport"
+    bl_context = "render"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_simplify"
+    COMPAT_ENGINES = {'NEURAL_RENDERING'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        scene = context.scene
+        rd = scene.render
+        cscene = scene.cycles
+
+        layout.active = rd.use_simplify
+
+        col = layout.column()
+        col.prop(rd, "simplify_subdivision", text="Max Subdivision")
+        col.prop(rd, "simplify_child_particles", text="Child Particles")
+        col.prop(rd, "use_simplify_normals", text="Normals")
+        col.prop(rd, "simplify_volumes", text="Volume Resolution")
+
+        col.separator()
+
+        col.prop(cscene, "texture_resolution", text="Texture Resolution")
+        col.prop(cscene, "texture_limit", text="Texture Size Limit")
+
+
+class NEURAL_RENDER_RENDER_PT_simplify_render(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Render"
+    bl_context = "render"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_simplify"
+    COMPAT_ENGINES = {'NEURAL_RENDERING'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        scene = context.scene
+        rd = scene.render
+        cscene = scene.cycles
+
+        layout.active = rd.use_simplify
+
+        col = layout.column()
+
+        col.prop(rd, "simplify_subdivision_render", text="Max Subdivision")
+        col.prop(rd, "simplify_child_particles_render", text="Child Particles")
+
+        col.separator()
+
+        col.prop(cscene, "texture_resolution_render", text="Texture Resolution")
+        col.prop(cscene, "texture_limit_render", text="Texture Size Limit")
+
+
+class NEURAL_RENDER_RENDER_PT_simplify_culling(NeuralRenderButtonsPanel, Panel):
+    bl_label = "Culling"
+    bl_context = "render"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_simplify"
+    bl_options = {'DEFAULT_CLOSED'}
+    COMPAT_ENGINES = {'NEURAL_RENDERING'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        scene = context.scene
+        rd = scene.render
+        cscene = scene.cycles
+
+        layout.active = rd.use_simplify
+
+        row = layout.row(heading="Camera Culling")
+        row.prop(cscene, "use_camera_cull", text="")
+        sub = row.column()
+        sub.active = cscene.use_camera_cull
+        sub.prop(cscene, "camera_cull_margin", text="")
+
+        row = layout.row(heading="Distance Culling")
+        row.prop(cscene, "use_distance_cull", text="")
+        sub = row.column()
+        sub.active = cscene.use_distance_cull
+        sub.prop(cscene, "distance_cull_margin", text="")
+
+
+class NeuralRenderShadingButtonsPanel(NeuralRenderButtonsPanel):
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'HEADER'
+    bl_parent_id = 'VIEW3D_PT_shading'
+
+    @classmethod
+    def poll(cls, context):
+        return (
+            NeuralRenderButtonsPanel.poll(context) and
+            context.space_data.shading.type == 'RENDERED'
+        )
+
+
+class NEURAL_RENDER_VIEW3D_PT_shading_render_pass(NeuralRenderShadingButtonsPanel, Panel):
+    bl_label = "Render Pass"
+
+    def draw(self, context):
+        shading = context.space_data.shading
+
+        layout = self.layout
+        layout.prop(shading.cycles, "render_pass", text="")
+
+
+class NEURAL_RENDER_VIEW3D_PT_shading_debug(NeuralRenderDebugButtonsPanel,
+                                     NeuralRenderShadingButtonsPanel,
+                                     Panel):
+    bl_label = "Debug"
+
+    @classmethod
+    def poll(cls, context):
+        return (
+            NeuralRenderDebugButtonsPanel.poll(context) and
+            NeuralRenderShadingButtonsPanel.poll(context)
+        )
+
+    def draw(self, context):
+        shading = context.space_data.shading
+
+        layout = self.layout
+        layout.active = context.scene.cycles.use_preview_adaptive_sampling
+        layout.prop(shading.cycles, "show_active_pixels")
+
+
+class NEURAL_RENDER_VIEW3D_PT_shading_lighting(Panel):
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'HEADER'
+    bl_label = "Lighting"
+    bl_parent_id = 'VIEW3D_PT_shading'
+    COMPAT_ENGINES = {'NEURAL_RENDERING'}
+
+    @classmethod
+    def poll(cls, context):
+        return (
+            context.engine in cls.COMPAT_ENGINES and
+            context.space_data.shading.type == 'RENDERED'
+        )
+
+    def draw(self, context):
+        layout = self.layout
+        col = layout.column()
+        split = col.split(factor=0.9)
+
+        shading = context.space_data.shading
+        col.prop(shading, "use_scene_lights_render")
+        col.prop(shading, "use_scene_world_render")
+
+        if not shading.use_scene_world_render:
+            col = layout.column()
+            split = col.split(factor=0.9)
+
+            col = split.column()
+            sub = col.row()
+            sub.scale_y = 0.6
+            sub.template_icon_view(shading, "studio_light", scale_popup=3)
+
+            col = split.column()
+            col.operator("screen.userpref_show", emboss=False, text="", icon='PREFERENCES').section = 'LIGHTS'
+
+            split = layout.split(factor=0.9)
+            col = split.column()
+            col.prop(shading, "studiolight_rotate_z", text="Rotation")
+            col.prop(shading, "studiolight_intensity")
+            col.prop(shading, "studiolight_background_alpha")
+
+
+class NEURAL_RENDER_VIEW3D_PT_simplify_greasepencil(NeuralRenderButtonsPanel, Panel, GreasePencilSimplifyPanel):
+    bl_label = "Grease Pencil"
+    bl_parent_id = "NEURAL_RENDER_RENDER_PT_simplify"
+    COMPAT_ENGINES = {'NEURAL_RENDERING'}
+    bl_options = {'DEFAULT_CLOSED'}
+
+
+def draw_device(self, context):
+    scene = context.scene
+    layout = self.layout
+    layout.use_property_split = True
+    layout.use_property_decorate = False
+
+    if context.engine == 'NEURAL_RENDERING':
+        from . import engine
+        cscene = scene.cycles
+
+        col = layout.column()
+        col.active = show_device_active(context)
+        col.prop(cscene, "device")
+        layout.prop(cscene, "falcon_mode")
+
+        from . import engine
+        if engine.with_osl() and (
+            use_cpu(context) or (
+                use_optix(context) and (
+                engine.osl_version()[1] >= 13 or engine.osl_version()[0] > 1))):
+            osl_col = layout.column()
+            osl_col.prop(cscene, "shading_system")
+
+
+def get_panels():
+    exclude_panels = {
+        'DATA_PT_camera_dof',
+        'DATA_PT_falloff_curve',
+        'DATA_PT_light',
+        'DATA_PT_preview',
+        'DATA_PT_spot',
+        'MATERIAL_PT_context_material',
+        'MATERIAL_PT_preview',
+        'NODE_DATA_PT_light',
+        'NODE_DATA_PT_spot',
+        'OBJECT_PT_visibility',
+        'VIEWLAYER_PT_filter',
+        'VIEWLAYER_PT_layer_passes',
+        'RENDER_PT_post_processing',
+        'RENDER_PT_simplify',
+    }
+
+    panels = []
+    for panel in bpy.types.Panel.__subclasses__():
+        if hasattr(panel, 'COMPAT_ENGINES') and 'BLENDER_RENDER' in panel.COMPAT_ENGINES:
+            if panel.__name__ not in exclude_panels:
+                panels.append(panel)
+
+    return panels
+
+
+classes = (
+    NEURAL_RENDER_PT_sampling_presets,
+    NEURAL_RENDER_PT_viewport_sampling_presets,
+    NEURAL_RENDER_PT_integrator_presets,
+    NEURAL_RENDER_PT_performance_presets,
+    NEURAL_RENDER_RENDER_PT_sampling,
+    NEURAL_RENDER_RENDER_PT_sampling_viewport,
+    NEURAL_RENDER_RENDER_PT_sampling_viewport_denoise,
+    NEURAL_RENDER_RENDER_PT_sampling_render,
+    NEURAL_RENDER_RENDER_PT_sampling_render_denoise,
+    NEURAL_RENDER_RENDER_PT_sampling_path_guiding,
+    NEURAL_RENDER_RENDER_PT_sampling_path_guiding_debug,
+    NEURAL_RENDER_RENDER_PT_sampling_lights,
+    NEURAL_RENDER_RENDER_PT_sampling_advanced,
+    NEURAL_RENDER_RENDER_PT_sampling_advanced_sample_subset,
+    NEURAL_RENDER_RENDER_PT_light_paths,
+    NEURAL_RENDER_RENDER_PT_light_paths_max_bounces,
+    NEURAL_RENDER_RENDER_PT_light_paths_dlss_viewport,
+    NEURAL_RENDER_RENDER_PT_light_paths_clamping,
+    NEURAL_RENDER_RENDER_PT_light_paths_caustics,
+    NEURAL_RENDER_RENDER_PT_light_paths_bidirectional,
+    NEURAL_RENDER_RENDER_PT_light_paths_fast_gi,
+    NEURAL_RENDER_RENDER_PT_volumes,
+    NEURAL_RENDER_RENDER_PT_subdivision,
+    NEURAL_RENDER_RENDER_PT_curves,
+    NEURAL_RENDER_RENDER_PT_curves_viewport_display,
+    NEURAL_RENDER_RENDER_PT_simplify,
+    NEURAL_RENDER_RENDER_PT_simplify_viewport,
+    NEURAL_RENDER_RENDER_PT_simplify_render,
+    NEURAL_RENDER_RENDER_PT_simplify_culling,
+    NEURAL_RENDER_VIEW3D_PT_simplify_greasepencil,
+    NEURAL_RENDER_VIEW3D_PT_shading_lighting,
+    NEURAL_RENDER_VIEW3D_PT_shading_render_pass,
+    NEURAL_RENDER_VIEW3D_PT_shading_debug,
+    NEURAL_RENDER_RENDER_PT_motion_blur,
+    NEURAL_RENDER_RENDER_PT_motion_blur_curve,
+    NEURAL_RENDER_RENDER_PT_film,
+    NEURAL_RENDER_RENDER_PT_film_pixel_filter,
+    NEURAL_RENDER_RENDER_PT_film_transparency,
+    NEURAL_RENDER_RENDER_PT_performance,
+    NEURAL_RENDER_RENDER_PT_performance_compositor,
+    NEURAL_RENDER_RENDER_PT_performance_compositor_denoise_settings,
+    NEURAL_RENDER_RENDER_PT_performance_threads,
+    NEURAL_RENDER_RENDER_PT_performance_memory,
+    NEURAL_RENDER_RENDER_PT_performance_texture_cache,
+    NEURAL_RENDER_RENDER_PT_performance_acceleration_structure,
+    NEURAL_RENDER_RENDER_PT_performance_final_render,
+    NEURAL_RENDER_RENDER_PT_performance_viewport,
+    NEURAL_RENDER_RENDER_PT_passes,
+    NEURAL_RENDER_RENDER_PT_passes_data,
+    NEURAL_RENDER_RENDER_PT_passes_light,
+    NEURAL_RENDER_RENDER_PT_passes_crypto,
+    NEURAL_RENDER_RENDER_PT_passes_aov,
+    NEURAL_RENDER_RENDER_PT_passes_lightgroups,
+    NEURAL_RENDER_RENDER_PT_filter,
+    NEURAL_RENDER_PT_post_processing,
+    NEURAL_RENDER_CAMERA_PT_dof,
+    NEURAL_RENDER_CAMERA_PT_dof_aperture,
+    NEURAL_RENDER_CAMERA_PT_lens_custom_parameters,
+    NEURAL_RENDER_PT_context_material,
+    NEURAL_RENDER_OBJECT_PT_motion_blur,
+    NEURAL_RENDER_OBJECT_PT_shading_gi_approximation,
+    NEURAL_RENDER_OBJECT_PT_shading_caustics,
+    NEURAL_RENDER_OBJECT_PT_lightgroup,
+    NEURAL_RENDER_OBJECT_PT_visibility,
+    NEURAL_RENDER_OBJECT_PT_visibility_ray_visibility,
+    NEURAL_RENDER_OBJECT_PT_visibility_culling,
+    NEURAL_RENDER_LIGHT_PT_preview,
+    NEURAL_RENDER_LIGHT_PT_light,
+    NEURAL_RENDER_LIGHT_PT_settings,
+    NEURAL_RENDER_LIGHT_PT_nodes,
+    NEURAL_RENDER_LIGHT_PT_beam_shape,
+    NEURAL_RENDER_WORLD_PT_preview,
+    NEURAL_RENDER_WORLD_PT_surface,
+    NEURAL_RENDER_WORLD_PT_volume,
+    NEURAL_RENDER_WORLD_PT_mist,
+    NEURAL_RENDER_WORLD_PT_ray_visibility,
+    NEURAL_RENDER_WORLD_PT_settings,
+    NEURAL_RENDER_WORLD_PT_settings_surface,
+    NEURAL_RENDER_WORLD_PT_settings_volume,
+    NEURAL_RENDER_WORLD_PT_settings_light_group,
+    NEURAL_RENDER_MATERIAL_PT_preview,
+    NEURAL_RENDER_MATERIAL_PT_surface,
+    NEURAL_RENDER_MATERIAL_PT_volume,
+    NEURAL_RENDER_MATERIAL_PT_displacement,
+    NEURAL_RENDER_MATERIAL_PT_settings,
+    NEURAL_RENDER_MATERIAL_PT_settings_surface,
+    NEURAL_RENDER_MATERIAL_PT_settings_volume,
+    NEURAL_RENDER_RENDER_PT_bake,
+    NEURAL_RENDER_RENDER_PT_bake_influence,
+    NEURAL_RENDER_RENDER_PT_bake_selected_to_active,
+    NEURAL_RENDER_RENDER_PT_bake_output,
+    NEURAL_RENDER_RENDER_PT_bake_output_margin,
+    NEURAL_RENDER_RENDER_PT_debug,
+    node_panel(NEURAL_RENDER_MATERIAL_PT_settings),
+    node_panel(NEURAL_RENDER_MATERIAL_PT_settings_surface),
+    node_panel(NEURAL_RENDER_MATERIAL_PT_settings_volume),
+    node_panel(NEURAL_RENDER_WORLD_PT_ray_visibility),
+    node_panel(NEURAL_RENDER_WORLD_PT_settings),
+    node_panel(NEURAL_RENDER_WORLD_PT_settings_surface),
+    node_panel(NEURAL_RENDER_WORLD_PT_settings_volume),
+    node_panel(NEURAL_RENDER_LIGHT_PT_light),
+    node_panel(NEURAL_RENDER_LIGHT_PT_settings),
+    node_panel(NEURAL_RENDER_LIGHT_PT_beam_shape)
+)
+
+
+def register():
+    from bpy.utils import register_class
+
+    bpy.types.RENDER_PT_context.append(draw_device)
+
+    for panel in get_panels():
+        panel.COMPAT_ENGINES.add('NEURAL_RENDERING')
+
+    for cls in classes:
+        register_class(cls)
+
+
+def unregister():
+    from bpy.utils import unregister_class
+
+    bpy.types.RENDER_PT_context.remove(draw_device)
+
+    for panel in get_panels():
+        if 'NEURAL_RENDERING' in panel.COMPAT_ENGINES:
+            panel.COMPAT_ENGINES.remove('NEURAL_RENDERING')
+
+    for cls in classes:
+        unregister_class(cls)

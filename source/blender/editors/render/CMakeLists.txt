@@ -1,0 +1,81 @@
+# SPDX-FileCopyrightText: 2023 Blender Authors
+#
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+set(INC
+  ../include
+  ../../makesrna
+  # RNA_prototypes.hh
+  ${CMAKE_BINARY_DIR}/source/blender/makesrna
+)
+
+set(INC_SYS
+)
+
+set(SRC
+  render_internal.cc
+  render_opengl.cc
+  render_ops.cc
+  render_preview.cc
+  render_shading.cc
+  render_texture_cache.cc
+  render_update.cc
+  render_view.cc
+
+  render_intern.hh
+)
+
+set(LIB
+  PRIVATE bf::blenkernel
+  PRIVATE bf::blenlib
+  PRIVATE bf::blenloader
+  PRIVATE bf::blentranslation
+  PRIVATE bf::bmesh
+  PRIVATE bf::depsgraph
+  PRIVATE bf::dna
+  PRIVATE bf::draw
+  PRIVATE bf::gpu
+  PRIVATE bf::imbuf
+  PRIVATE bf::imbuf::movie
+  PRIVATE bf::intern::clog
+  PRIVATE bf::intern::guardedalloc
+  PRIVATE bf::animrig
+  PRIVATE bf::nodes
+  PRIVATE bf::render
+  PRIVATE bf::sequencer
+  PRIVATE bf::windowmanager
+)
+
+if(WITH_HEADLESS)
+  add_definitions(-DWITH_HEADLESS)
+else()
+  list(APPEND LIB
+    bf_editor_datafiles
+  )
+endif()
+
+
+if(WITH_FREESTYLE)
+  list(APPEND INC
+    ../../freestyle
+  )
+  add_definitions(-DWITH_FREESTYLE)
+endif()
+
+if(WITH_CYCLES)
+  add_definitions(-DWITH_CYCLES)
+endif()
+
+# Falcon 1.0: テクスチャのキャッシュは、公式の Cycles を建てた時はその関数、無い時は NR の関数で作る
+if(FALCON_BUILD_OFFICIAL_CYCLES)
+  add_definitions(-DWITH_FALCON_OFFICIAL_CYCLES)
+  list(APPEND INC ../../../../intern/cycles/blender)
+elseif(WITH_CYCLES AND WITH_FALCON_NEURAL_RENDER)
+  add_definitions(-DWITH_FALCON_NEURAL_RENDER)
+  list(APPEND INC ../../../../intern/neural_render/blender)
+endif()
+
+blender_add_lib(bf_editor_render "${SRC}" "${INC}" "${INC_SYS}" "${LIB}")
+
+# RNA_prototypes.hh
+add_dependencies(bf_editor_render bf_rna)
