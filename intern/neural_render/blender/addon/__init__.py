@@ -7,8 +7,8 @@ from __future__ import annotations
 bl_info = {
     "name": "Cycles-expansion",
     "author": "",
-    # Falcon Engine 0.2.0
-    "version": (0, 2, 0),
+    # Falcon Engine 0.7.0 (after the demo v0.5 and v0.6)
+    "version": (0, 7, 0),
     "blender": (2, 80, 0),
     "description": "Neural Render renderer integration",
     "warning": "",
