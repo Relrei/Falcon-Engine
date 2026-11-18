@@ -347,6 +347,10 @@ enum PathRayFlag : uint32_t {
 /* Automatic bidirectional: light tracing goes on for the rest of a frame when its first sample adds
  * at least this share of the image's energy. */
 #define NR_BIDIR_AUTO_MIN_SHARE 0.002f
+/* Automatic bidirectional: photon mapping goes on for the rest of a frame when the gathers of its
+ * first sample add at least this share of the image's energy (nr_photon_counter[1],
+ * PathTraceWorkGPU::update_photon_auto()). */
+#define NR_PHOTON_AUTO_MIN_SHARE NR_BIDIR_AUTO_MIN_SHARE
 
 // 8bit enum, just in case we need to move more variables in it
 enum PathRayMNEE {

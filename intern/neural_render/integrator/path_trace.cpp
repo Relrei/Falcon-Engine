@@ -528,10 +528,10 @@ void PathTrace::path_trace(RenderWork &render_work)
       return;
     }
 
-    /* Falcon Cycles-expansion photon mapping: the photon pass at the start of a frame. */
-    if (render_work.path_trace.start_sample == 0 &&
-        (device_scene_->data.integrator.bidirectional_strategies & BIDIR_STRATEGY_PHOTON_MAPPING))
-    {
+    /* Falcon Cycles-expansion photon mapping: the photon pass at the start of a frame. It checks
+     * the strategy itself: one the automatic bidirectional stopped in the frame before is back on
+     * there. */
+    if (render_work.path_trace.start_sample == 0) {
       path_trace_work->render_photons(render_work.path_trace.sample_offset);
     }
 
@@ -540,6 +540,10 @@ void PathTrace::path_trace(RenderWork &render_work)
                                     render_work.path_trace.start_sample,
                                     num_samples,
                                     render_work.path_trace.sample_offset);
+
+    if (!is_cancel_requested()) {
+      path_trace_work->update_photon_auto(render_work.path_trace.start_sample, num_samples);
+    }
 
     if (light_trace_samples > 0 && !is_cancel_requested()) {
       PathTraceWork::RenderStatistics light_statistics;

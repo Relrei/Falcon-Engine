@@ -370,10 +370,13 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
       memset((void *)dscene->nr_photons.data(), 0, dscene->nr_photons.memory_size());
       dscene->nr_photons.copy_to_device();
     }
-    if (dscene->nr_photon_counter.size() != 1) {
-      dscene->nr_photon_counter.alloc(1);
+    /* [0] the photons stored by the photon pass, [1] (the bits of a float) the energy the gathers of
+     * the first sample add to the image, for the automatic switch. */
+    if (dscene->nr_photon_counter.size() != 2) {
+      dscene->nr_photon_counter.alloc(2);
     }
     dscene->nr_photon_counter.data()[0] = 0;
+    dscene->nr_photon_counter.data()[1] = 0;
     dscene->nr_photon_counter.copy_to_device();
     if (dscene->nr_photon_cells.size() != grid + 1) {
       dscene->nr_photon_cells.alloc(grid + 1);

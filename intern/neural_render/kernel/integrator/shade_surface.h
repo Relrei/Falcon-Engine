@@ -1066,6 +1066,16 @@ ccl_device int integrate_surface(KernelGlobals kg,
         const Spectrum caustics = photon_map_gather(kg, &sd);
         if (!is_zero(caustics)) {
           film_write_surface_emission(kg, state, caustics, 1.0f, render_buffer, LIGHTGROUP_NONE);
+          /* Automatic bidirectional: what the gathers of the first sample add to the image
+           * (PathTraceWorkGPU::update_photon_auto()). Only the first sample, so the atomics do not
+           * slow the rest of the frame. */
+          if ((kernel_data.integrator.bidirectional_pad1 & NR_BIDIR_AUTO_FLAG) &&
+              INTEGRATOR_STATE(state, path, sample) == 0)
+          {
+            atomic_add_and_fetch_float(
+                (ccl_global float *)&kernel_data_array(nr_photon_counter)[1],
+                average(INTEGRATOR_STATE(state, path, throughput) * caustics));
+          }
         }
       }
 

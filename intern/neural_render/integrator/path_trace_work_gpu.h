@@ -38,6 +38,7 @@ class PathTraceWorkGPU : public PathTraceWork {
                       const int sample_offset) override;
 
   bool render_photons(const int sample_offset) override;
+  void update_photon_auto(const int start_sample, const int num_samples) override;
 
   bool render_light_paths(RenderStatistics &statistics,
                           const int start_sample,
@@ -130,6 +131,8 @@ class PathTraceWorkGPU : public PathTraceWork {
    * frame because its first sample added too little (the kernel data has it off until the next
    * frame starts, render_samples()). */
   bool light_trace_auto_stopped_ = false;
+  /* The same for photon mapping (update_photon_auto(); back on in the next frame's photon pass). */
+  bool photon_auto_stopped_ = false;
   /* The energy of the whole image in the render buffer (the combined pass). */
   double combined_energy();
 

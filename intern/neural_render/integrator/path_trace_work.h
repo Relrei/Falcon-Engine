@@ -82,6 +82,10 @@ class PathTraceWork {
     return false;
   }
 
+  /* Automatic bidirectional: after the camera paths of the first work of a frame, stop photon
+   * mapping for the rest of the frame when its gathers added next to nothing. */
+  virtual void update_photon_auto(const int /*start_sample*/, const int /*num_samples*/) {}
+
   virtual bool render_light_paths(RenderStatistics & /*statistics*/,
                                   const int /*start_sample*/,
                                   const int /*samples_num*/,

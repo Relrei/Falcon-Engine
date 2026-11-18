@@ -556,6 +556,13 @@ bool PathTraceWorkGPU::render_photons(const int sample_offset)
 {
   KernelIntegrator &kintegrator = device_scene_->data.integrator;
   const int capacity = kintegrator.nr_photon_capacity;
+  /* A new frame: photon mapping stopped by the automatic bidirectional is back on (the storage is
+   * only there while the scene asks for photon mapping). */
+  if (photon_auto_stopped_ && capacity > 0) {
+    kintegrator.bidirectional_strategies |= BIDIR_STRATEGY_PHOTON_MAPPING;
+    device_->const_copy_to("data", &device_scene_->data, sizeof(device_scene_->data));
+  }
+  photon_auto_stopped_ = false;
   if (!(kintegrator.bidirectional_strategies & BIDIR_STRATEGY_PHOTON_MAPPING) || capacity <= 0) {
     return false;
   }
@@ -566,6 +573,9 @@ bool PathTraceWorkGPU::render_photons(const int sample_offset)
    * (count 0). */
   device_vector<uint> &counter = device_scene_->nr_photon_counter;
   counter.data()[0] = 0;
+  if (counter.size() > 1) {
+    counter.data()[1] = 0;
+  }
   write_global(queue_.get(), counter);
   const int pixels = max(1, effective_buffer_params_.width * effective_buffer_params_.height);
   const int samples = max(1, (capacity + pixels - 1) / pixels);
@@ -697,6 +707,43 @@ bool PathTraceWorkGPU::render_photons(const int sample_offset)
            << per_gather << " photons a gather), in "
            << time_dt() - t0 << " s";
   return true;
+}
+
+void PathTraceWorkGPU::update_photon_auto(const int start_sample, const int num_samples)
+{
+  /* Automatic bidirectional: after the camera paths of the frame's first work, compare what the
+   * gathers of its first sample added (nr_photon_counter[1]) with one sample of the whole image.
+   * Next to nothing stops photon mapping for the rest of the frame; the camera paths then keep their
+   * caustics again. (11-18 BMW27: 290160 photons from the reflections of the car paint, which
+   * passed the count test, changed 0.6% of the image and took 3 times as long.) */
+  KernelIntegrator &kintegrator = device_scene_->data.integrator;
+  if (start_sample != 0 || !(kintegrator.bidirectional_pad1 & NR_BIDIR_AUTO_FLAG) ||
+      !(kintegrator.bidirectional_strategies & BIDIR_STRATEGY_PHOTON_MAPPING) ||
+      kintegrator.nr_photon_count <= 0)
+  {
+    return;
+  }
+  device_vector<uint> &counter = device_scene_->nr_photon_counter;
+  if (counter.size() < 2) {
+    return;
+  }
+  read_global(queue_.get(), counter);
+  float photon_energy;
+  memcpy(&photon_energy, &counter.data()[1], sizeof(float));
+  counter.data()[1] = 0;
+  write_global(queue_.get(), counter);
+
+  /* The render buffer holds the sum of the samples of the work. */
+  const double image_energy = combined_energy() / double(max(num_samples, 1));
+  const double share = (image_energy > 0.0) ? double(photon_energy) / image_energy : 0.0;
+  if (share < double(NR_PHOTON_AUTO_MIN_SHARE)) {
+    kintegrator.bidirectional_strategies &= ~BIDIR_STRATEGY_PHOTON_MAPPING;
+    device_->const_copy_to("data", &device_scene_->data, sizeof(device_scene_->data));
+    photon_auto_stopped_ = true;
+  }
+  LOG_INFO << "Cycles-expansion: automatic bidirectional, photon mapping adds " << share * 100.0
+           << "% of the image after the first sample: "
+           << (photon_auto_stopped_ ? "stopped for this frame" : "kept");
 }
 
 double PathTraceWorkGPU::combined_energy()
