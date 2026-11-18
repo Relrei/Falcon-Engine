@@ -38,7 +38,7 @@ Untick **Automatic** to choose by hand:
 
 Notes:
 - Light paths also pass through fog (volumes): light shafts from a spot light or through a prism show up in the fog.
-  Heterogeneous fog is stepped (Volumes → Steps, default 32). *(known issue: fog is about 25 % darker than a reference renderer)*
+  Heterogeneous fog is stepped (Volumes → Steps, default 32). *(known issue: with Bidirectional on, fog renders about 25 % darker than the same scene rendered with Bidirectional off)*
 - Bidirectional uses one GPU.
 - The viewport renders without bidirectional; use a final render (F12) to see it.
 
@@ -57,7 +57,8 @@ Render → Sampling → Render (in Neural Rendering mode):
 surface behind glass stays sharp instead of smeared. Off = the guides as Cycles writes them.
 
 Bidirectional works together with Neural Rendering (caustics are passed into DLSS).
-*(known issue: a cyan halo can appear around a dispersion rainbow on a white wall in Neural Rendering only)*
+*(known issue, Neural Rendering only: when glass with Dispersion splits light into a rainbow, like a prism,
+and the rainbow falls on a white wall or another bright surface, a light-blue fringe can appear around the rainbow)*
 
 ## 4. Neural Rendering — viewport
 
@@ -88,9 +89,19 @@ DLSS Ray Reconstruction is made by NVIDIA and is not part of Falcon Engine.
 Falcon Engine loads it at run time; building needs only the headers of the DLSS SDK (see BUILD.md).
 - Put the runtime (`libnvidia-ngx-dlssd.so.*` on Linux) in a folder and set
   Preferences → Add-ons → Cycles-expansion → **DLSS Runtime Folder**, then restart Blender.
+  The folder path may contain non-ASCII characters (for example Japanese).
 
-## 7. Requirements (decided 2026-11-16)
+## 7. Requirements
 
-- NVIDIA GeForce RTX 20 series or newer, driver 580 or newer. Tested on RTX 30 / 40.
-- Linux first; other distributions supported, Windows later.
+- NVIDIA GeForce RTX 20 series or newer (RTX 30 series or newer recommended), driver 580 or newer.
+- Linux only for now. So far it has been tested only on an RTX 3080 with Arch Linux; other distributions should work.
+  Windows and macOS are not supported yet.
 - Without an NVIDIA GPU, Cycles-expansion can still render on the CPU, and EEVEE works as usual. AMD (HIP) and Intel (oneAPI) GPU rendering are not built by default and not tested.
+
+## 8. Other known issues
+
+- Add-ons written for the official Cycles (those that read `cycles` settings, such as BlendLuxCore) fail to load,
+  because Falcon Engine replaces the official Cycles. Rendering is not affected.
+- Rendering a scene that has Video Sequencer strips can crash. Turning off Output Properties → Post Processing →
+  **Sequencer** lets it render. Falcon does not change this code; whether official Blender 5.3 crashes too is being checked.
+- Report bugs at [Issues](https://github.com/Relrei/Falcon-Engine/issues), not to the Blender project.
