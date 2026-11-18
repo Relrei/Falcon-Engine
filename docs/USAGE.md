@@ -23,7 +23,7 @@ Render → Light Paths → **Bidirectional** (tick the header to turn it on).
 
 | Setting | Meaning |
 |---|---|
-| **Automatic** (default on) | Falcon picks the techniques for the scene, and after the first sample stops the ones that add next to nothing, so scenes without caustics do not get slower. Scenes lit only by emissive meshes stop it at once. |
+| **Automatic** (default on) | Falcon picks the techniques for the scene, and after the first sample stops the ones that add next to nothing, so scenes without caustics get only slightly slower (within 10% in our tests). Scenes lit only by emissive meshes stop it at once. |
 | **Photons** | Light paths of the photon pass at the start of each frame (caustics seen through glass or water). More = smoother and sharper, 48 bytes each. Default 1,000,000. |
 | **Caustic Strength** | Multiplier on the caustics from light tracing and photon mapping. 1 is physically correct. |
 
