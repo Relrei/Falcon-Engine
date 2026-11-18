@@ -1,4 +1,4 @@
-# Building Falcon Engine v0.7.0 (Linux)
+# Building Falcon Engine v0.7.1 (Linux)
 
 Falcon Engine is distributed as source only. You build it on your own PC; the NVIDIA parts
 (CUDA, OptiX, DLSS) are downloaded by you from NVIDIA, under NVIDIA's own licenses, and are
@@ -29,7 +29,7 @@ Each NVIDIA download comes with its own license, which you accept when you downl
 ```sh
 git clone https://github.com/Relrei/Falcon-Engine.git falcon-engine
 cd falcon-engine
-git checkout Falcon-Engine-v0.7.0
+git checkout Falcon-Engine-v0.7.1
 make update          # downloads Blender's prebuilt libraries (lib/linux_x64, via Git LFS)
 ```
 
