@@ -1,89 +1,71 @@
-# Building Falcon Engine v0.7.1 (Linux)
+# Falcon Engine v0.7.1 のビルド案内（Linux）
 
-Falcon Engine is distributed as source only. You build it on your own PC; the NVIDIA parts
-(CUDA, OptiX, DLSS) are downloaded by you from NVIDIA, under NVIDIA's own licenses, and are
-never part of this repository.
+Falcon Engine はソースコードのみで配布しています。ビルド済みのバイナリは配っていないため、ご自分の PC でビルドしてください。
+NVIDIA の部品（CUDA・OptiX・DLSS）はこのリポジトリには一切含まれていません。各自が NVIDIA の公式サイトでライセンスに同意したうえで入手します。
 
-The Falcon Launcher can check all of this for you (Prep page) and takes the downloaded NVIDIA
-packages by drag and drop. The steps below are the same thing done by hand.
+[Falcon Launcher](https://github.com/Relrei/Falcon-Launcher) の「準備」ページを使うと、必要な環境のチェックや、ダウンロードした NVIDIA パッケージのドラッグ＆ドロップ配置、ソース取得からビルドまでを画面上でまとめて行えます。
+以下は手動でビルドする場合の案内です。
 
-## 1. What you need
+## 1. 必要なもの
 
-| | Version | Where to get it |
+| 項目 | バージョン | 入手先 |
 |---|---|---|
-| NVIDIA GPU | GeForce RTX 20 series or newer | |
-| NVIDIA driver | 580 or newer | https://www.nvidia.com/Download/index.aspx (or your distribution's package) |
-| Git, Git LFS | any recent | distribution package (`git`, `git-lfs`) |
-| CMake | 3.10 or newer | distribution package |
-| C++ compiler | GCC 11 or newer | `base-devel` (Arch) / `build-essential` (Debian, Ubuntu) / `gcc-c++ make` (Fedora) |
-| Ninja (optional) | any | `ninja` / `ninja-build` |
-| CUDA Toolkit | 12.8 or newer | https://developer.nvidia.com/cuda-downloads |
-| OptiX SDK | 9.0 | https://developer.nvidia.com/designworks/optix/download (NVIDIA developer account) |
-| DLSS SDK (optional) | 310.x | https://github.com/NVIDIA/DLSS — only the `include` folder is used at build time |
-| Disk | about 20 GB free | source, Blender's prebuilt libraries, build folder, compiler cache |
+| NVIDIA GPU | GeForce RTX 20 シリーズ以降 | — |
+| NVIDIA ドライバー | 580 以降 | https://www.nvidia.com/Download/index.aspx （またはお使いのディストリビューションのパッケージ） |
+| Git・Git LFS | 最近のバージョン | ディストリビューションのパッケージ（`git`、`git-lfs`） |
+| CMake | 3.10 以降 | ディストリビューションのパッケージ |
+| C++ コンパイラー | GCC 14.0 以上（または Clang 17.0 以上） | Arch は `base-devel`、Ubuntu 24.04 等は `build-essential` と `gcc-14` / `g++-14`、Fedora は `gcc-c++` と `make` |
+| Ninja（任意） | 指定なし | `ninja` / `ninja-build` |
+| CUDA Toolkit | 12.8 以降 | https://developer.nvidia.com/cuda-downloads |
+| OptiX SDK | 9.0 | https://developer.nvidia.com/designworks/optix/download （NVIDIA 開発者アカウントが必要） |
+| DLSS SDK（任意） | 310.x | https://github.com/NVIDIA/DLSS （ビルド時は `include` フォルダのみ使用） |
+| 空き容量 | 約 20 GB 以上 | ソース、Blender の事前ビルド済みライブラリ、ビルド先フォルダ、コンパイラーキャッシュ |
 
-Each NVIDIA download comes with its own license, which you accept when you download and install it.
+各 NVIDIA パッケージには個別のライセンスが付属しており、ダウンロード・導入時にご自分で同意する必要があります。
 
-## 2. Get the source
+## 2. ビルドの流れ
 
-```sh
-git clone https://github.com/Relrei/Falcon-Engine.git falcon-engine
-cd falcon-engine
-git checkout Falcon-Engine-v0.7.1
-make update          # downloads Blender's prebuilt libraries (lib/linux_x64, via Git LFS)
-```
+1. **ソースコードと事前ビルド済みライブラリの取得**
+   - GitHub（`Relrei/Falcon-Engine`）からリポジトリを取得し、リリースタグ（例: `Falcon-Engine-v0.7.1`）へ切り替えます。
+   - その後、Blender 標準の更新手順（`make update`）で事前ビルド済みライブラリ（`lib/linux_x64`、Git LFS 経由）を取得します。
 
-## 3. Configure
+2. **CMake でビルド構成を設定**
+   - ソースとは別のビルド用フォルダを用意し、Ninja などのジェネレーターを指定して CMake の構成を行います。
+   - 構成時に指定する主な設定項目は下の「3. 主な CMake 設定項目」を参照してください。
 
-```sh
-mkdir ../build && cd ../build
-cmake -G Ninja ../falcon-engine \
-  -C ../falcon-engine/build_files/cmake/config/blender_release.cmake \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DWITH_CYCLES_CUDA_BINARIES=ON -DCYCLES_CUDA_BINARIES_ARCH="sm_86" \
-  -DOPTIX_ROOT_DIR=/path/to/NVIDIA-OptiX-SDK-9.0.0-linux64-x86_64 \
-  -DWITH_DLSS=ON -DDLSS_SDK_ROOT=/path/to/DLSS \
-  -DWITH_CYCLES_DEVICE_HIP=OFF -DWITH_CYCLES_HIP_BINARIES=OFF -DWITH_CYCLES_DEVICE_HIPRT=OFF \
-  -DWITH_CYCLES_DEVICE_ONEAPI=OFF -DWITH_CYCLES_ONEAPI_BINARIES=OFF
-```
+3. **ビルドとインストール**
+   - ビルドツール（Ninja など）で `install` ターゲットを実行します。
+   - 初回ビルドは 6 コア環境で約 1〜2 時間かかります。2 回目以降は変更された箇所だけが再ビルドされます。
+   - コンパイラーキャッシュ（`ccache`）を CMake のランチャーに指定しておくと、更新時の再ビルド時間を短縮できます。
 
-- `CYCLES_CUDA_BINARIES_ARCH`: build only for your own GPU to save time —
-  `sm_75` RTX 20, `sm_86` RTX 30, `sm_89` RTX 40, `sm_120` RTX 50.
-- Without the DLSS SDK, leave out the two DLSS options: everything except Neural Rendering mode still works.
-- `-DWITH_FALCON_OFFICIAL_CYCLES=ON` also builds the official Cycles next to Cycles-expansion (off by default).
+4. **起動と DLSS ランタイムの指定**
+   - ビルド先フォルダ内の `bin/blender` から起動します。
+   - Neural Rendering モードを使う場合は、Blender の `Preferences → Add-ons → Cycles-expansion → DLSS Runtime Folder` に、`libnvidia-ngx-dlssd.so.*`（DLSS SDK 内の `lib/Linux_x86_64/rel` にあります）を置いたフォルダを指定し、Blender を再起動してください。
+   - 実行時に指定フォルダまたは NVIDIA ドライバーから DLSS ランタイムを読み込みます。
+   - フォルダのパスに日本語などの非 ASCII 文字が含まれていても構いません。NVIDIA NGX が非 ASCII パスから直接読み込めないため、Falcon 側で自動的に ASCII のみのキャッシュフォルダ（`~/.cache/falcon-dlss`）へコピーしてから読み込みます。
 
-## 4. Build
+5. **新しいバージョンへの更新**
+   - ソースフォルダで最新のタグを取得して切り替え、事前ビルド済みライブラリを更新したあと、同じビルド先フォルダで再度ビルド・インストールを行います。
+   - 変更分だけが再ビルドされます。前のバージョンへ戻せるようにしておきたい場合は、更新前の `bin` フォルダを別の場所へ残しておいてください（Falcon Launcher ではバージョンごとに別フォルダへ配置されます）。
 
-```sh
-ninja install        # first build: about 1–2 hours on 6 cores; later updates rebuild only what changed
-```
+## 3. 主な CMake 設定項目
 
-Using `ccache` (`-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache`) makes
-rebuilds after an update much faster.
+CMake 実行時に渡す主なオプションの案内です。環境に合わせてパスや GPU アーキテクチャを置き換えて指定してください。
 
-## 5. Run
+| 設定項目 | 役割・指定の目安 |
+|---|---|
+| 初期キャッシュ（`-C`） | ソース内の `build_files/cmake/config/blender_release.cmake` を指定します。 |
+| `CMAKE_BUILD_TYPE` | `Release` を指定します。 |
+| `WITH_CYCLES_CUDA_BINARIES` | CUDA カーネルをビルドするため `ON` にします。 |
+| `CYCLES_CUDA_BINARIES_ARCH` | お使いの GPU 世代だけを指定するとビルド時間を短縮できます（RTX 20: `sm_75`、RTX 30: `sm_86`、RTX 40: `sm_89`、RTX 50: `sm_120`）。 |
+| `OPTIX_ROOT_DIR` | 展開した OptiX SDK 9.0 のフォルダパスを指定します。 |
+| `WITH_DLSS` / `DLSS_SDK_ROOT` | DLSS を使う場合は `WITH_DLSS=ON` にし、`DLSS_SDK_ROOT` へ DLSS SDK のフォルダパスを指定します。DLSS SDK がない場合はこれらを省いて構成できます（Neural Rendering 以外の機能はすべて動作します）。 |
+| `WITH_CYCLES_DEVICE_HIP` / `WITH_CYCLES_HIP_BINARIES` / `WITH_CYCLES_DEVICE_HIPRT` | AMD GPU 向けビルドを省く場合はすべて `OFF` にします。 |
+| `WITH_CYCLES_DEVICE_ONEAPI` / `WITH_CYCLES_ONEAPI_BINARIES` | Intel GPU 向けビルドを省く場合はすべて `OFF` にします。 |
+| `WITH_FALCON_OFFICIAL_CYCLES` | `ON` にすると、Cycles-expansion と並べて公式の Cycles もビルドできます（既定は `OFF`）。 |
+| `CMAKE_C_COMPILER` / `CMAKE_CXX_COMPILER` | OS 標準の GCC が 14 未満の場合（Ubuntu 24.04 など）に、`gcc-14` / `g++-14` を指定します。 |
+| `CMAKE_C_COMPILER_LAUNCHER` / `CMAKE_CXX_COMPILER_LAUNCHER` | `ccache` を指定すると再ビルドが速くなります（任意）。 |
 
-```sh
-./bin/blender
-```
+## 4. Windows について
 
-For Neural Rendering mode, point Preferences → Add-ons → Cycles-expansion → **DLSS Runtime Folder** at the
-folder holding `libnvidia-ngx-dlssd.so.*` (in the DLSS SDK: `lib/Linux_x86_64/rel`), then restart.
-Falcon loads DLSS from there or from the NVIDIA driver at run time. The folder may contain non-ASCII
-characters: Falcon then copies the runtime into an ASCII-only cache folder (`~/.cache/falcon-dlss`) first,
-because NVIDIA NGX does not load it from such a path.
-
-## 6. Updating
-
-```sh
-cd falcon-engine
-git fetch --tags && git checkout <new tag> && make update
-cd ../build && ninja install
-```
-
-Only the changed files are rebuilt. Keep the previous `bin` folder if you want to be able to go back
-(the Falcon Launcher installs each version into its own folder for this).
-
-## Windows
-
-Not supported yet.
+現時点では未対応です。
