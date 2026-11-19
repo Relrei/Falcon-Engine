@@ -15,7 +15,7 @@ packages by drag and drop. The steps below are the same thing done by hand.
 | NVIDIA driver | 580 or newer | https://www.nvidia.com/Download/index.aspx (or your distribution's package) |
 | Git, Git LFS | any recent | distribution package (`git`, `git-lfs`) |
 | CMake | 3.10 or newer | distribution package |
-| C++ compiler | GCC 11 or newer | `base-devel` (Arch) / `build-essential` (Debian, Ubuntu) / `gcc-c++ make` (Fedora) |
+| C++ compiler | GCC 14.0 or newer (or Clang 17.0 or newer) | `base-devel` (Arch) / `build-essential gcc-14 g++-14` (Ubuntu 24.04) / `gcc-c++ make` (Fedora) |
 | Ninja (optional) | any | `ninja` / `ninja-build` |
 | CUDA Toolkit | 12.8 or newer | https://developer.nvidia.com/cuda-downloads |
 | OptiX SDK | 9.0 | https://developer.nvidia.com/designworks/optix/download (NVIDIA developer account) |
@@ -47,6 +47,7 @@ cmake -G Ninja ../falcon-engine \
   -DWITH_CYCLES_DEVICE_ONEAPI=OFF -DWITH_CYCLES_ONEAPI_BINARIES=OFF
 ```
 
+- On distributions where default `gcc` is older than 14.0 (such as Ubuntu 24.04), install `gcc-14 g++-14` and pass `-DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14`.
 - `CYCLES_CUDA_BINARIES_ARCH`: build only for your own GPU to save time —
   `sm_75` RTX 20, `sm_86` RTX 30, `sm_89` RTX 40, `sm_120` RTX 50.
 - Without the DLSS SDK, leave out the two DLSS options: everything except Neural Rendering mode still works.
