@@ -54,3 +54,20 @@ CUDA・OptiX・DLSS は NVIDIA の著作物であり、このリポジトリに�
 
 NVIDIA・DLSS・OptiX・CUDA は NVIDIA Corporation の商標です。Blender は Blender Foundation の商標です。
 このビルドは NVIDIA および Blender Foundation とは関係がなく、両者が推奨・支援しているものでもありません。
+
+## 更新履歴
+
+各バージョンの詳細は [Releases](../../releases) を参照してください。
+
+| バージョン | 公開日 | ベース | 主な変更点 |
+|---|---|---|---|
+| [v0.7.1](../../releases/tag/Falcon-Engine-v0.7.1) | 2026-11-18 | Blender 5.3.0 | 双方向パストレーシングの Automatic で、コースティクスの無いシーンでも遅くなっていた不具合を修正 |
+| [v0.7.0](../../releases/tag/Falcon-Engine-v0.7.0) | 2026-11-17 | Blender 5.3.0 | Blender 5.3.0 ベースで最初の正式ソース公開。Cycles-expansion・双方向パストレーシング・Neural Rendering・Light Mixer・Unlimited・Falcon Launcher 連携を搭載 |
+| [v0.6-demo](../../releases/tag/v0.6-demo) | 2026-09-30 | Blender 5.2.2 | デモ版最終更新。VSE の GPU プレビュー改善と fast path 音声・画質修正、DLSS UI・アニメーション修正、集光フォトン焼きのクラッシュ修正 |
+| [v0.5-demo](../../releases/tag/v0.5-demo) | 2026-09-28 | Blender 5.2.2 | VSE 書き出し・4 本重ね再生・テキストストリップの不具合修正、集光生成の整理、DLSS ウォームアップ時の再初期化不具合を修正 |
+| [v0.4.1-demo](../../releases/tag/v0.4.1-demo) | 2026-09-05 | Blender 5.2.1 LTS | DLSS RR 連番アニメーションのカット検出と初期化回数を修正、煙・VDB の高速化、VSE 書き出し経路の表示追加、Wayland 環境での起動改善 |
+| [v0.4-demo](../../releases/tag/v0.4-demo) | 2026-09-04 | Blender 5.2.1 LTS | ベースを Blender 5.2.1 LTS へ更新。VSE 高速化（fast path・先読みデコード・色補正最適化）、カメラカリングとビューポート GPU メモリ退避を追加 |
+| [v0.3-beta-demo](../../releases/tag/v0.3-beta-demo) | 2026-08-25 | Blender 5.2.0 LTS | 配布ソースの GPU カーネルヘッダ不足を修正、外部 `.blend` 読み込み時の検証追加、ボクセルリメッシュ目標面数指定、コースティクス・ライトトレース修正 |
+| [v0.2-demo](../../releases/tag/v0.2-demo) | 2026-08-12 | Blender 5.2.0 LTS | コースティクスの計算方式を蓄積グリッドへ移行、DLSS 連番レンダーのサンプル超過修正と解像度制限の撤廃 |
+| [v0.1-demo](../../releases/tag/v0.1-demo) | 2026-08-04 | Blender 5.2.0 LTS | 初期デモ版（当時の名称: Falcon Render）。コースティクス・ライトトレース、ワールドフォトン、空間ハッシュ放射輝度キャッシュ、DLSS RR 実行時読み込み経路を実装 |
+
