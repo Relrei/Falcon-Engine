@@ -264,6 +264,11 @@ KERNEL_STRUCT_MEMBER(integrator, int, nr_photon_pad1)
 /* Light paths from mesh emission (kernel/integrator/light_path_start.h): the emissive triangles
  * in nr_mesh_light_cdf and nr_mesh_light_prims (scene/light.cpp). */
 KERNEL_STRUCT_MEMBER(integrator, int, nr_mesh_light_count)
+/* Multi-device light tracing slice bounds [start, end) in full image Y (0, 0 = full frame). */
+KERNEL_STRUCT_MEMBER(integrator, int, nr_lt_slice_y_start)
+KERNEL_STRUCT_MEMBER(integrator, int, nr_lt_slice_y_end)
+KERNEL_STRUCT_MEMBER(integrator, int, nr_lt_slice_pad1)
+KERNEL_STRUCT_MEMBER(integrator, int, nr_lt_slice_pad2)
 
 KERNEL_STRUCT_MEMBER(integrator, float2, pixel_jitter)
 KERNEL_STRUCT_END(KernelIntegrator)

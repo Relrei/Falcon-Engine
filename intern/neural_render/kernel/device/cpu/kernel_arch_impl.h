@@ -24,6 +24,7 @@
 
 #    include "kernel/integrator/init_from_camera.h"
 #    include "kernel/integrator/init_from_bake.h"
+#    include "kernel/integrator/light_path_start.h"
 #    include "kernel/integrator/megakernel.h"
 
 #    include "kernel/film/adaptive_sampling.h"
@@ -80,6 +81,7 @@ CCL_NAMESPACE_BEGIN
 
 DEFINE_INTEGRATOR_INIT_KERNEL(init_from_camera)
 DEFINE_INTEGRATOR_INIT_KERNEL(init_from_bake)
+DEFINE_INTEGRATOR_INIT_KERNEL(init_from_light)
 DEFINE_INTEGRATOR_SHADE_KERNEL(megakernel)
 
 /* --------------------------------------------------------------------

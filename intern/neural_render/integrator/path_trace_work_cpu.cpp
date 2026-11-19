@@ -2,6 +2,9 @@
  *
  * SPDX-License-Identifier: Apache-2.0 */
 
+#include <algorithm>
+#include <cstring>
+
 #include "integrator/path_trace_work_cpu.h"
 
 #include "device/cpu/kernel.h"
@@ -71,6 +74,12 @@ void PathTraceWorkCPU::render_samples(RenderStatistics &statistics,
                                       const int samples_num,
                                       const int sample_offset)
 {
+  if (start_sample == 0 && light_trace_auto_stopped_) {
+    device_scene_->data.integrator.bidirectional_strategies |= BIDIR_STRATEGY_LIGHT_TRACING;
+    device_->const_copy_to("data", &device_scene_->data, sizeof(device_scene_->data));
+    light_trace_auto_stopped_ = false;
+  }
+
   const int64_t image_width = effective_buffer_params_.width;
   const int64_t image_height = effective_buffer_params_.height;
   const int64_t total_pixels_num = image_width * image_height;
@@ -464,5 +473,345 @@ void PathTraceWorkCPU::guiding_push_sample_data_to_global_storage(ThreadKernelGl
   kg->opgl_path_segment_storage->Clear();
 }
 #endif
+
+void PathTraceWorkCPU::render_light_paths_full_pipeline(ThreadKernelGlobalsCPU *kernel_globals,
+                                                        const KernelWorkTile &work_tile,
+                                                        const int samples_num)
+{
+  IntegratorStateCPU state;
+  KernelWorkTile sample_work_tile = work_tile;
+  float *render_buffer = buffers_->buffer.data();
+
+  for (int sample = 0; sample < samples_num; ++sample) {
+    if (is_cancel_requested()) {
+      break;
+    }
+    if (!kernels_.integrator_init_from_light(
+            kernel_globals, &state, &sample_work_tile, render_buffer))
+    {
+      ++sample_work_tile.start_sample;
+      continue;
+    }
+    kernels_.integrator_megakernel(kernel_globals, &state, render_buffer);
+    ++sample_work_tile.start_sample;
+  }
+}
+
+bool PathTraceWorkCPU::render_light_paths(RenderStatistics &statistics,
+                                          const int start_sample,
+                                          const int samples_num,
+                                          const int sample_offset)
+{
+  const int64_t full_width = effective_buffer_params_.full_width;
+  const int64_t full_height = effective_buffer_params_.full_height;
+  const int64_t total_pixels_num = full_width * full_height;
+
+  const bool is_slice = (effective_buffer_params_.height < effective_buffer_params_.full_height) ||
+                        (effective_buffer_params_.full_y != 0);
+  KernelIntegrator &kintegrator = device_scene_->data.integrator;
+  if (is_slice) {
+    kintegrator.nr_lt_slice_y_start = effective_buffer_params_.full_y;
+    kintegrator.nr_lt_slice_y_end = effective_buffer_params_.full_y +
+                                    effective_buffer_params_.height;
+    device_->const_copy_to("data", &device_scene_->data, sizeof(device_scene_->data));
+  }
+
+  tbb::task_arena local_arena = local_tbb_arena_create(device_);
+  local_arena.execute([&]() {
+    parallel_for(int64_t(0), total_pixels_num, [&](int64_t work_index) {
+      if (is_cancel_requested()) {
+        return;
+      }
+
+      const int y = int(work_index / full_width);
+      const int x = int(work_index - int64_t(y) * full_width);
+
+      KernelWorkTile work_tile;
+      work_tile.x = x;
+      work_tile.y = y;
+      work_tile.w = 1;
+      work_tile.h = 1;
+      work_tile.start_sample = start_sample;
+      work_tile.sample_offset = sample_offset;
+      work_tile.num_samples = 1;
+      work_tile.offset = effective_buffer_params_.offset;
+      work_tile.stride = effective_buffer_params_.stride;
+
+      ThreadKernelGlobalsCPU *kernel_globals = kernel_thread_globals_get(*kernel_thread_globals_);
+      render_light_paths_full_pipeline(kernel_globals, work_tile, samples_num);
+    });
+  });
+
+  if (is_slice) {
+    kintegrator.nr_lt_slice_y_start = 0;
+    kintegrator.nr_lt_slice_y_end = 0;
+    device_->const_copy_to("data", &device_scene_->data, sizeof(device_scene_->data));
+  }
+
+  statistics.occupancy = 1.0f;
+
+  if (!is_cancel_requested() && !is_slice) {
+    update_light_guide(start_sample);
+  }
+  return true;
+}
+
+void PathTraceWorkCPU::update_light_guide(const int start_sample)
+{
+  device_vector<float> &hist = device_scene_->nr_light_guide_hist;
+  device_vector<float> &cdf = device_scene_->nr_light_guide_cdf;
+  const size_t size = hist.size();
+  if (size == 0 || cdf.size() != size) {
+    return;
+  }
+
+  if (start_sample == 0 || light_guide_energy_.size() != size) {
+    light_guide_energy_.assign(size, 0.0);
+  }
+
+  for (size_t i = 0; i < size; i++) {
+    light_guide_energy_[i] += double(hist.data()[i]);
+  }
+  memset(hist.data(), 0, size * sizeof(float));
+
+  const KernelIntegrator &kintegrator = device_scene_->data.integrator;
+  if ((kintegrator.bidirectional_pad1 & NR_BIDIR_AUTO_FLAG) && start_sample == 0 &&
+      kintegrator.bidirectional_pad2 > 0)
+  {
+    const double light_energy = light_guide_energy_[kintegrator.bidirectional_pad2 - 1];
+    const double image_energy = combined_energy();
+    const double share = (image_energy > 0.0) ? light_energy / image_energy : 0.0;
+    if (share < NR_BIDIR_AUTO_MIN_SHARE) {
+      device_scene_->data.integrator.bidirectional_strategies &= ~BIDIR_STRATEGY_LIGHT_TRACING;
+      device_->const_copy_to("data", &device_scene_->data, sizeof(device_scene_->data));
+      light_trace_auto_stopped_ = true;
+    }
+    LOG_INFO << "Cycles-expansion (CPU): automatic bidirectional, light tracing adds "
+             << share * 100.0 << "% of the image after the first sample: "
+             << (light_trace_auto_stopped_ ? "stopped for this frame" : "kept");
+  }
+
+  const size_t num_lights = size / NR_LIGHT_GUIDE_CELLS;
+  for (size_t l = 0; l < num_lights; l++) {
+    const double *e = &light_guide_energy_[l * NR_LIGHT_GUIDE_CELLS];
+    float *c = cdf.data() + l * NR_LIGHT_GUIDE_CELLS;
+    double total = 0.0;
+    for (int i = 0; i < NR_LIGHT_GUIDE_CELLS; i++) {
+      total += e[i];
+    }
+    if (!(total > 0.0)) {
+      memset(c, 0, NR_LIGHT_GUIDE_CELLS * sizeof(float));
+      continue;
+    }
+    const double floor_value = 0.01 * total / NR_LIGHT_GUIDE_CELLS;
+    double sum = 0.0;
+    for (int i = 0; i < NR_LIGHT_GUIDE_CELLS; i++) {
+      sum += max(e[i], floor_value);
+    }
+    double acc = 0.0;
+    for (int i = 0; i < NR_LIGHT_GUIDE_CELLS; i++) {
+      acc += max(e[i], floor_value) / sum;
+      c[i] = float(acc);
+    }
+    c[NR_LIGHT_GUIDE_CELLS - 1] = 1.0f;
+  }
+}
+
+bool PathTraceWorkCPU::render_photons(const int sample_offset)
+{
+  KernelIntegrator &kintegrator = device_scene_->data.integrator;
+  const int capacity = kintegrator.nr_photon_capacity;
+  if (photon_auto_stopped_ && capacity > 0) {
+    kintegrator.bidirectional_strategies |= BIDIR_STRATEGY_PHOTON_MAPPING;
+    device_->const_copy_to("data", &device_scene_->data, sizeof(device_scene_->data));
+  }
+  photon_auto_stopped_ = false;
+  if (!(kintegrator.bidirectional_strategies & BIDIR_STRATEGY_PHOTON_MAPPING) || capacity <= 0) {
+    return false;
+  }
+  const double t0 = time_dt();
+
+  device_vector<uint> &counter = device_scene_->nr_photon_counter;
+  counter.data()[0] = 0;
+  if (counter.size() > 1) {
+    counter.data()[1] = 0;
+  }
+
+  const int pixels = max(1, effective_buffer_params_.full_width * effective_buffer_params_.full_height);
+  const int samples = max(1, (capacity + pixels - 1) / pixels);
+  const int saved_flags = kintegrator.bidirectional_pad1;
+  kintegrator.bidirectional_pad1 |= NR_BIDIR_PHOTON_PASS_FLAG;
+  kintegrator.nr_photon_count = 0;
+  device_->const_copy_to("data", &device_scene_->data, sizeof(device_scene_->data));
+
+  const int max_rounds = 4;
+  int rounds = 0;
+  size_t found = 0;
+  while (rounds < max_rounds && !is_cancel_requested()) {
+    RenderStatistics statistics;
+    const int round_offset = sample_offset + (1 << 22) + rounds * samples;
+    const int64_t full_width = effective_buffer_params_.full_width;
+    const int64_t full_height = effective_buffer_params_.full_height;
+    const int64_t total_pixels_num = full_width * full_height;
+
+    tbb::task_arena local_arena = local_tbb_arena_create(device_);
+    local_arena.execute([&]() {
+      parallel_for(int64_t(0), total_pixels_num, [&](int64_t work_index) {
+        if (is_cancel_requested()) {
+          return;
+        }
+        const int y = int(work_index / full_width);
+        const int x = int(work_index - int64_t(y) * full_width);
+        KernelWorkTile work_tile;
+        work_tile.x = x;
+        work_tile.y = y;
+        work_tile.w = 1;
+        work_tile.h = 1;
+        work_tile.start_sample = 0;
+        work_tile.sample_offset = round_offset;
+        work_tile.num_samples = 1;
+        work_tile.offset = effective_buffer_params_.offset;
+        work_tile.stride = effective_buffer_params_.stride;
+
+        ThreadKernelGlobalsCPU *kernel_globals = kernel_thread_globals_get(
+            *kernel_thread_globals_);
+        render_light_paths_full_pipeline(kernel_globals, work_tile, samples);
+      });
+    });
+
+    (void)statistics;
+    rounds++;
+    found = size_t(counter.data()[0]);
+    const size_t per_round = found / size_t(rounds);
+    if (found * 2 >= size_t(capacity) || found + 2 * per_round > size_t(capacity)) {
+      break;
+    }
+  }
+
+  kintegrator.bidirectional_pad1 = saved_flags;
+  if (is_cancel_requested()) {
+    device_->const_copy_to("data", &device_scene_->data, sizeof(device_scene_->data));
+    return true;
+  }
+
+  device_vector<float4> &photons = device_scene_->nr_photons;
+  const int stored = int(min(found, size_t(capacity)));
+  const bool too_few = (kintegrator.bidirectional_pad1 & NR_BIDIR_AUTO_FLAG) &&
+                       found < size_t(NR_PHOTON_AUTO_MIN_COUNT);
+  const int count = too_few ? 0 : stored;
+
+  float radius = 0.0f;
+  if (count > 0) {
+    const int step = max(1, count / 65536);
+    vector<float> axis[3];
+    for (int i = 0; i < count; i += step) {
+      const float4 p = photons.data()[3 * i];
+      axis[0].push_back(p.x);
+      axis[1].push_back(p.y);
+      axis[2].push_back(p.z);
+    }
+    float diag2 = 0.0f;
+    float extents[3];
+    for (int a = 0; a < 3; a++) {
+      std::sort(axis[a].begin(), axis[a].end());
+      const size_t n = axis[a].size();
+      extents[a] = axis[a][min(n - 1, n * 95 / 100)] - axis[a][n * 5 / 100];
+      diag2 += extents[a] * extents[a];
+    }
+    std::sort(extents, extents + 3);
+    const float area = max(extents[1] * extents[2], 1e-8f);
+    const float density_radius = sqrtf(64.0f * area / (M_PI_F * float(count)));
+    radius = max(min(0.01f * sqrtf(diag2), density_radius), 1e-4f);
+  }
+
+  device_vector<uint> &cells = device_scene_->nr_photon_cells;
+  const uint grid = uint(kintegrator.nr_photon_grid_size);
+  memset(cells.data(), 0, (size_t(grid) + 1) * sizeof(uint));
+  vector<uint> hashes(count);
+  for (int i = 0; i < count; i++) {
+    const float4 p = photons.data()[3 * i];
+    const uint h = (uint(int(floorf(p.x / radius))) * 73856093u ^
+                    uint(int(floorf(p.y / radius))) * 19349663u ^
+                    uint(int(floorf(p.z / radius))) * 83492791u) %
+                   grid;
+    hashes[i] = h;
+    cells.data()[h + 1]++;
+  }
+  for (uint h = 0; h < grid; h++) {
+    cells.data()[h + 1] += cells.data()[h];
+  }
+  vector<float4> sorted(size_t(3) * count);
+  vector<uint> fill(cells.data(), cells.data() + grid);
+  for (int i = 0; i < count; i++) {
+    const uint dst = fill[hashes[i]]++;
+    for (int k = 0; k < 3; k++) {
+      sorted[size_t(3) * dst + k] = photons.data()[size_t(3) * i + k];
+    }
+  }
+  std::copy(sorted.begin(), sorted.end(), photons.data());
+
+  kintegrator.nr_photon_count = count;
+  kintegrator.nr_photon_radius = radius;
+  const size_t paths = size_t(rounds) * size_t(samples) * size_t(pixels);
+  kintegrator.nr_photon_inv_paths = (stored > 0) ?
+                                        float(double(found) / double(stored) / double(paths)) :
+                                        0.0f;
+  device_->const_copy_to("data", &device_scene_->data, sizeof(device_scene_->data));
+
+  LOG_INFO << "Cycles-expansion (CPU): photon mapping, " << count << " photons from " << paths
+           << " light paths (" << rounds << " rounds), radius " << radius << ", in "
+           << time_dt() - t0 << " s";
+  return true;
+}
+
+void PathTraceWorkCPU::update_photon_auto(const int start_sample, const int num_samples)
+{
+  KernelIntegrator &kintegrator = device_scene_->data.integrator;
+  if (start_sample != 0 || !(kintegrator.bidirectional_pad1 & NR_BIDIR_AUTO_FLAG) ||
+      !(kintegrator.bidirectional_strategies & BIDIR_STRATEGY_PHOTON_MAPPING) ||
+      kintegrator.nr_photon_count <= 0)
+  {
+    return;
+  }
+  device_vector<uint> &counter = device_scene_->nr_photon_counter;
+  if (counter.size() < 2) {
+    return;
+  }
+  float photon_energy = 0.0f;
+  memcpy(&photon_energy, &counter.data()[1], sizeof(float));
+  counter.data()[1] = 0;
+
+  const double image_energy = combined_energy() / double(max(num_samples, 1));
+  const double share = (image_energy > 0.0) ? double(photon_energy) / image_energy : 0.0;
+  if (share < double(NR_PHOTON_AUTO_MIN_SHARE)) {
+    kintegrator.bidirectional_strategies &= ~BIDIR_STRATEGY_PHOTON_MAPPING;
+    device_->const_copy_to("data", &device_scene_->data, sizeof(device_scene_->data));
+    photon_auto_stopped_ = true;
+  }
+  LOG_INFO << "Cycles-expansion (CPU): automatic bidirectional, photon mapping adds "
+           << share * 100.0 << "% of the image after the first sample: "
+           << (photon_auto_stopped_ ? "stopped for this frame" : "kept");
+}
+
+double PathTraceWorkCPU::combined_energy()
+{
+  const int pass_combined = effective_buffer_params_.get_pass_offset(PASS_COMBINED);
+  const int pass_stride = effective_buffer_params_.pass_stride;
+  if (pass_combined == PASS_UNUSED || pass_stride <= 0) {
+    return 0.0;
+  }
+  const float *data = buffers_->buffer.data();
+  const int64_t pixels = int64_t(effective_buffer_params_.width) *
+                         effective_buffer_params_.height;
+  double total = 0.0;
+  for (int64_t p = 0; p < pixels; p++) {
+    const float *rgb = data + p * pass_stride + pass_combined;
+    const double v = (double(rgb[0]) + double(rgb[1]) + double(rgb[2])) / 3.0;
+    if (std::isfinite(v) && v > 0.0) {
+      total += v;
+    }
+  }
+  return total;
+}
 
 CCL_NAMESPACE_END

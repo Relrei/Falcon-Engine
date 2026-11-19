@@ -494,11 +494,11 @@ void PathTrace::path_trace(RenderWork &render_work)
                              params.height == params.full_height &&
                              params.width == device_scene_->data.cam.width &&
                              params.height == device_scene_->data.cam.height;
-    if (num_works != 1 || !whole_frame) {
+    if (!whole_frame) {
       static bool warned = false;
       if (!warned) {
-        LOG_WARNING << "Cycles-expansion: bidirectional light tracing needs the whole frame on one "
-                       "device (no render region, no tiles); its caustics are missing";
+        LOG_WARNING << "Cycles-expansion: bidirectional light tracing needs the whole frame "
+                       "(no render region, no tiles); its caustics are missing";
         warned = true;
       }
     }
@@ -519,6 +519,20 @@ void PathTrace::path_trace(RenderWork &render_work)
 
   thread_capture_fp_settings();
 
+  /* Falcon Cycles-expansion photon mapping: run the photon pass once at the start of a frame on
+   * the primary device (GPU first in GPU+CPU), then sync the sorted photon map to all devices. */
+  if (render_work.path_trace.start_sample == 0 && num_works > 0 &&
+      !path_trace_works_[0]->get_device()->have_error())
+  {
+    const bool ran_photons = path_trace_works_[0]->render_photons(
+        render_work.path_trace.sample_offset);
+    if (ran_photons && num_works > 1) {
+      device_scene_->nr_photons.copy_to_device();
+      device_scene_->nr_photon_cells.copy_to_device();
+      device_->const_copy_to("data", &device_scene_->data, sizeof(device_scene_->data));
+    }
+  }
+
   parallel_for(0, num_works, [&](int i) {
     const double work_start_time = time_dt();
     const int num_samples = render_work.path_trace.num_samples;
@@ -528,20 +542,13 @@ void PathTrace::path_trace(RenderWork &render_work)
       return;
     }
 
-    /* Falcon Cycles-expansion photon mapping: the photon pass at the start of a frame. It checks
-     * the strategy itself: one the automatic bidirectional stopped in the frame before is back on
-     * there. */
-    if (render_work.path_trace.start_sample == 0) {
-      path_trace_work->render_photons(render_work.path_trace.sample_offset);
-    }
-
     PathTraceWork::RenderStatistics statistics;
     path_trace_work->render_samples(statistics,
                                     render_work.path_trace.start_sample,
                                     num_samples,
                                     render_work.path_trace.sample_offset);
 
-    if (!is_cancel_requested()) {
+    if (!is_cancel_requested() && num_works == 1) {
       path_trace_work->update_photon_auto(render_work.path_trace.start_sample, num_samples);
     }
 

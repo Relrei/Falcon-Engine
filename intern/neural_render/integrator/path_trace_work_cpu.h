@@ -41,6 +41,13 @@ class PathTraceWorkCPU : public PathTraceWork {
                       const int samples_num,
                       const int sample_offset) override;
 
+  bool render_photons(const int sample_offset) override;
+  void update_photon_auto(const int start_sample, const int num_samples) override;
+  bool render_light_paths(RenderStatistics &statistics,
+                          const int start_sample,
+                          const int samples_num,
+                          const int sample_offset) override;
+
   void copy_to_display(PathTraceDisplay *display,
                        PassMode pass_mode,
                        const int num_samples) override;
@@ -75,6 +82,11 @@ class PathTraceWorkCPU : public PathTraceWork {
   void render_samples_full_pipeline(ThreadKernelGlobalsCPU *kernel_globals,
                                     const KernelWorkTile &work_tile,
                                     const int samples_num);
+  void render_light_paths_full_pipeline(ThreadKernelGlobalsCPU *kernel_globals,
+                                        const KernelWorkTile &work_tile,
+                                        const int samples_num);
+  void update_light_guide(const int start_sample);
+  double combined_energy();
 
   /* CPU kernels. */
   const CPUKernels &kernels_;
@@ -82,6 +94,10 @@ class PathTraceWorkCPU : public PathTraceWork {
   /* Pointer to device-owned kernel globals which is suitable for concurrent access from multiple
    * threads. This allows dynamic updates to image_info when textures are loaded on demand. */
   vector<ThreadKernelGlobalsCPU> *kernel_thread_globals_ = nullptr;
+
+  vector<double> light_guide_energy_;
+  bool light_trace_auto_stopped_ = false;
+  bool photon_auto_stopped_ = false;
 };
 
 CCL_NAMESPACE_END

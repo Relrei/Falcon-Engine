@@ -465,11 +465,33 @@ bool PathTraceWorkGPU::render_light_paths(RenderStatistics &statistics,
                                           const int samples_num,
                                           const int sample_offset)
 {
+  const bool is_slice = (effective_buffer_params_.height < effective_buffer_params_.full_height) ||
+                        (effective_buffer_params_.full_y != 0);
+  BufferParams saved_params = effective_buffer_params_;
+  KernelIntegrator &kintegrator = device_scene_->data.integrator;
+  if (is_slice) {
+    kintegrator.nr_lt_slice_y_start = saved_params.full_y;
+    kintegrator.nr_lt_slice_y_end = saved_params.full_y + saved_params.height;
+    device_->const_copy_to("data", &device_scene_->data, sizeof(device_scene_->data));
+    effective_buffer_params_.full_x = 0;
+    effective_buffer_params_.full_y = 0;
+    effective_buffer_params_.width = saved_params.full_width;
+    effective_buffer_params_.height = saved_params.full_height;
+  }
+
   /* The same wavefront as the camera paths, started at the lights. */
   init_kernel_override_ = DEVICE_KERNEL_INTEGRATOR_INIT_FROM_LIGHT;
   render_samples(statistics, start_sample, samples_num, sample_offset);
   init_kernel_override_ = DEVICE_KERNEL_NUM;
-  if (!is_cancel_requested()) {
+
+  if (is_slice) {
+    effective_buffer_params_ = saved_params;
+    kintegrator.nr_lt_slice_y_start = 0;
+    kintegrator.nr_lt_slice_y_end = 0;
+    device_->const_copy_to("data", &device_scene_->data, sizeof(device_scene_->data));
+  }
+
+  if (!is_cancel_requested() && !is_slice) {
     update_light_guide(start_sample);
   }
   return true;

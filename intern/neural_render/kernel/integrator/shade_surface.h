@@ -944,6 +944,17 @@ ccl_device_forceinline void integrate_surface_light_trace_connect(
   const float strength = (INTEGRATOR_STATE(state, path, flag) & PATH_RAY_NR_CAUSTIC_SPECULAR) ?
                              kernel_data.integrator.nr_photon_strength :
                              1.0f;
+  const int slice_y_start = kernel_data.integrator.nr_lt_slice_y_start;
+  const int slice_y_end = kernel_data.integrator.nr_lt_slice_y_end;
+  if (slice_y_end > slice_y_start) {
+    const int width = int(kernel_data.cam.width);
+    const int px = int(pixel % uint(width));
+    const int py = int(pixel / uint(width));
+    if (py < slice_y_start || py >= slice_y_end) {
+      return;
+    }
+    pixel = uint(px + (py - slice_y_start) * width);
+  }
   const IntegratorShadowState shadow_state = integrate_direct_light_shadow_init_common(
       kg, state, &ray, f * (importance * strength), LIGHTGROUP_NONE, 0, true);
   /* Lands in the pixel the vertex is seen in. The render buffer is the whole frame (checked by

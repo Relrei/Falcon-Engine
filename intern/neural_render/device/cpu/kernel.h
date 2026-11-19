@@ -30,6 +30,7 @@ class CPUKernels {
 
   IntegratorInitFunction integrator_init_from_camera;
   IntegratorInitFunction integrator_init_from_bake;
+  IntegratorInitFunction integrator_init_from_light;
   IntegratorShadeFunction integrator_megakernel;
 
   /* Shader evaluation. */
