@@ -27,6 +27,8 @@
 
 CCL_NAMESPACE_BEGIN
 
+static constexpr int NR_PHOTON_AUTO_MIN_COUNT = 2048;
+
 /* Create TBB arena for execution of path tracing and rendering tasks. */
 static inline tbb::task_arena local_tbb_arena_create(const Device *device)
 {
