@@ -47,8 +47,8 @@ Some data also has to be downloaded and put in place by you, because of its lice
 ## Building and usage
 
 - Launcher (Falcon Launcher): https://github.com/Relrei/Falcon-Launcher
-- How to build (what you need, and the NVIDIA pages to get it from): [docs/BUILD.md](docs/BUILD.md)
-- Features and usage: [docs/USAGE.md](docs/USAGE.md)
+- How to build (what you need, and the NVIDIA pages to get it from): [docs/BUILD.md](docs/BUILD.md#english)
+- Features and usage: [docs/USAGE.md](docs/USAGE.md#english)
 - README of the original Blender: [README.blender.md](README.blender.md)
 
 No prebuilt binaries are distributed. You compile it on your own PC.
