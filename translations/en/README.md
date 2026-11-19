@@ -1,6 +1,6 @@
 # Falcon Engine v0.7.1
 
-[日本語](README.md) | English
+[日本語](../../README.md) | English
 
 I started building this on my own about half a year ago, around May 2026, after a render of a car scene (a GTR) took 40 hours. I wanted to find some way to make rendering faster.
 Development focuses on Linux for now. Windows will follow step by step (some features will be NVIDIA only), and macOS support is planned too, but that is still a long way off…
@@ -41,15 +41,15 @@ Add-ons that I make myself will also become installable through the launcher:
 
 ## Relation to the official Blender, and reporting bugs
 
-Rather than going off on its own route, this custom build keeps the official Blender as its base while laying its own track alongside it. Compatibility problems may come up. If they do, please report them in [Issues](../../issues), not to the official Blender. This custom build has nothing to do with the official Blender; it is a personal custom build.
+Rather than going off on its own route, this custom build keeps the official Blender as its base while laying its own track alongside it. Compatibility problems may come up. If they do, please report them in [Issues](../../../../issues), not to the official Blender. This custom build has nothing to do with the official Blender; it is a personal custom build.
 Some data also has to be downloaded and put in place by you, because of its license. Thank you for your understanding.
 
 ## Building and usage
 
 - Launcher (Falcon Launcher): https://github.com/Relrei/Falcon-Launcher
-- How to build (what you need, and the NVIDIA pages to get it from): [docs/BUILD.md](docs/BUILD.md#english)
-- Features and usage: [docs/USAGE.md](docs/USAGE.md#english)
-- README of the original Blender: [README.blender.md](README.blender.md)
+- How to build (what you need, and the NVIDIA pages to get it from): [docs/BUILD.md](docs/BUILD.md)
+- Features and usage: [docs/USAGE.md](docs/USAGE.md)
+- README of the original Blender: [README.blender.md](../../README.blender.md)
 
 No prebuilt binaries are distributed. You compile it on your own PC.
 CUDA, OptiX and DLSS are made by NVIDIA and are not in this repository. Get them yourself from NVIDIA's pages, agreeing to their licenses.

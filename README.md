@@ -1,6 +1,6 @@
 # Falcon Engine v0.7.1
 
-日本語 | [English](README.en.md)
+日本語 | [English](translations/en/README.md)
 
 これは半年前2026/5月ごろにGTR（車）のシーンのレンダリングで40時間かかったことをきっかけに、レンダリングをどうにか速くできないかと個人的に開発を始めました
 本ビルドは今のところLinuxを優先して開発が進み順次Windows一部機能はNVIDIA専用でmacOSも対応をする予定ではありますが、当分先になると思います…
