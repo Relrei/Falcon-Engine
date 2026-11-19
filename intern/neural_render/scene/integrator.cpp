@@ -333,22 +333,19 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
   const BidirectionalParams bidirectional_params = get_bidirectional_params();
   uint bidirectional_strategies = bidirectional_params.requested() &
                                   bidirectional_implemented_strategies();
-  /* Light tracing (kernel/integrator/init_from_light.h) runs in final renders only, and not with
-   * adaptive sampling unless it is the Neural Rendering glass samples: the light paths are added
-   * per pixel and divided by the pixel's own sample count, which has to be the same everywhere
-   * (PathTrace::render_light_paths()). Without it the camera paths keep their caustics. */
-  const bool single_gpu = device->info.type == DEVICE_CUDA || device->info.type == DEVICE_OPTIX ||
-                          device->info.type == DEVICE_HIP;
-  /* Photon mapping (kernel/integrator/photon_map.h): final renders on one GPU too (the photon pass
-   * runs at the start of each frame, PathTraceWorkGPU::render_photons()). */
+  /* Light tracing and photon mapping run in final renders on GPU, CPU, or GPU+CPU multi-device. */
+  const bool bidir_device_supported = device->info.type == DEVICE_CUDA ||
+                                      device->info.type == DEVICE_OPTIX ||
+                                      device->info.type == DEVICE_HIP ||
+                                      device->info.type == DEVICE_CPU ||
+                                      device->info.type == DEVICE_MULTI;
   if ((bidirectional_strategies & BIDIR_STRATEGY_PHOTON_MAPPING) &&
-      (!scene->params.background || !single_gpu || bidirectional_photons <= 0))
+      (!scene->params.background || !bidir_device_supported || bidirectional_photons <= 0))
   {
     bidirectional_strategies &= ~BIDIR_STRATEGY_PHOTON_MAPPING;
   }
   if ((bidirectional_strategies & BIDIR_STRATEGY_LIGHT_TRACING) &&
-      (!scene->params.background || !single_gpu ||
-       (get_adaptive_sampling().use && get_adaptive_sampling().nr_glass_sample == 0)))
+      (!scene->params.background || !bidir_device_supported))
   {
     bidirectional_strategies &= ~BIDIR_STRATEGY_LIGHT_TRACING;
   }
@@ -625,6 +622,12 @@ AdaptiveSampling Integrator::get_adaptive_sampling() const
 
   adaptive_sampling.use = use_adaptive_sampling;
 
+  /* Light tracing adds per-pixel contributions divided by each pixel's sample count, so switch to
+   * uniform sampling when bidirectional light tracing is enabled instead of silently disabling it. */
+  if (use_bidirectional && use_bidirectional_light_tracing) {
+    adaptive_sampling.use = false;
+  }
+
   /* Disable sample count pass with upscaling. */
   /* NR (a trial in place of the extra glass samples): with NR_DLSS_ADAPTIVE=1, adaptive sampling stays on
    * with a non-upscaling DLSS (samples go to the noisy glass pixels). By default it is off, as official. */
@@ -734,12 +737,6 @@ BidirectionalParams Integrator::get_bidirectional_params() const
   BidirectionalParams params;
   params.use = use_bidirectional;
   params.strategies = BIDIR_STRATEGY_NONE;
-  if (use_bidirectional_auto) {
-    /* Every technique that has kernels; the ones that do not help are left out at render time. */
-    params.strategies = bidirectional_implemented_strategies();
-    params.max_light_bounces = max(bidirectional_max_light_bounces, 0);
-    return params;
-  }
   if (use_bidirectional_light_tracing) {
     params.strategies |= BIDIR_STRATEGY_LIGHT_TRACING;
   }

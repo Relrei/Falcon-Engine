@@ -827,14 +827,15 @@ class NEURAL_RENDER_RENDER_PT_light_paths_bidirectional(NeuralRenderButtonsPanel
         cscene = context.scene.cycles
         layout.active = cscene.use_bidirectional
 
-        # Automatic hides the techniques; the amount and strength of the photons stay.
+        # Automatic stops techniques that add next to nothing after the first sample,
+        # while keeping individual strategy toggles visible so each technique can be switched freely.
         layout.prop(cscene, "use_bidirectional_auto")
         col = layout.column(align=True)
-        col.active = cscene.use_bidirectional_auto or cscene.use_bidirectional_photon_mapping
+        col.active = cscene.use_bidirectional_photon_mapping
         col.prop(cscene, "bidirectional_photons")
+        col = layout.column(align=True)
+        col.active = cscene.use_bidirectional_light_tracing or cscene.use_bidirectional_photon_mapping
         col.prop(cscene, "bidirectional_photon_strength")
-        if cscene.use_bidirectional_auto:
-            return
 
         not_implemented = []
         col = layout.column(heading="Strategies", align=True)

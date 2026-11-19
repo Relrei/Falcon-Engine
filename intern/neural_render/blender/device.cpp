@@ -106,6 +106,8 @@ DeviceInfo blender_device_info(blender::UserDef &b_preferences,
 
   /* Device, which is chosen in the Blender Preferences. Default to CPU device. */
   preferences_device = cpu_device;
+  DeviceInfo gpu_only_device = cpu_device;
+  DeviceInfo gpu_cpu_device = cpu_device;
 
   /* Test if we are using GPU devices. */
   const ComputeDevice compute_device = (ComputeDevice)get_enum(
@@ -133,6 +135,7 @@ DeviceInfo blender_device_info(blender::UserDef &b_preferences,
 
     /* Match device preferences and available devices. */
     vector<DeviceInfo> used_devices;
+    vector<DeviceInfo> used_gpu_devices;
     blender::CollectionPropertyIterator rna_iter;
     for (RNA_collection_begin(&cpreferences, "devices", &rna_iter); rna_iter.valid;
          RNA_property_collection_next(&rna_iter))
@@ -146,6 +149,9 @@ DeviceInfo blender_device_info(blender::UserDef &b_preferences,
              * but must not be added to the active render device list. */
             if (info.meets_driver_requirement) {
               used_devices.push_back(info);
+              if (info.type != DEVICE_CPU) {
+                used_gpu_devices.push_back(info);
+              }
             }
             break;
           }
@@ -154,13 +160,21 @@ DeviceInfo blender_device_info(blender::UserDef &b_preferences,
     }
     blender::RNA_property_collection_end(&rna_iter);
 
+    const int threads = blender_device_threads(b_scene);
     if (!used_devices.empty()) {
-      const int threads = blender_device_threads(b_scene);
       preferences_device = Device::get_multi_device(used_devices, threads, background);
+    }
+    if (!used_gpu_devices.empty()) {
+      gpu_only_device = Device::get_multi_device(used_gpu_devices, threads, background);
+      vector<DeviceInfo> combo_devices = used_gpu_devices;
+      combo_devices.push_back(cpu_device);
+      gpu_cpu_device = Device::get_multi_device(combo_devices, threads, background);
     }
   }
 
   adjust_device_info(preferences_device, cpreferences, preview);
+  adjust_device_info(gpu_only_device, cpreferences, preview);
+  adjust_device_info(gpu_cpu_device, cpreferences, preview);
   adjust_device_info(cpu_device, cpreferences, preview);
 
   /* Device, which will be used, according to Settings, Scene preferences and command line
@@ -189,9 +203,13 @@ DeviceInfo blender_device_info(blender::UserDef &b_preferences,
     adjust_device_info(device, cpreferences, preview);
   }
   else {
-    /* 1 is a "GPU compute" in properties.py for Scene settings. */
-    if (get_enum(cscene, "device") == 1) {
-      device = preferences_device;
+    /* 0 = CPU, 1 = GPU only, 2 = GPU + CPU (enum_devices in properties.py). */
+    const int device_mode = get_enum(cscene, "device");
+    if (device_mode == 2) {
+      device = gpu_cpu_device;
+    }
+    else if (device_mode == 1) {
+      device = gpu_only_device;
     }
     else {
       device = cpu_device;

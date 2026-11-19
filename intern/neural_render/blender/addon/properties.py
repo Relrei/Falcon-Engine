@@ -34,7 +34,9 @@ from . import camera
 enum_devices = (
     ('CPU', "CPU", "Use CPU for rendering"),
     ('GPU', "GPU Compute",
-        "Use GPU compute device for rendering, configured in the system tab in the user preferences"),
+        "Use GPU compute device only for rendering, configured in the system tab in the user preferences"),
+    ('GPU_CPU', "GPU + CPU",
+        "Use both GPU and CPU devices for rendering"),
 )
 
 enum_bvh_layouts = (
@@ -452,9 +454,9 @@ class NeuralRenderRenderSettings(bpy.types.PropertyGroup):
 
     device: EnumProperty(
         name="Device",
-        description="Device to use for rendering",
+        description="Device mode to use for rendering (GPU only, CPU, or GPU + CPU)",
         items=enum_devices,
-        default='CPU',
+        default='GPU',
         update=update_render_passes,
     )
     shading_system: BoolProperty(
@@ -921,7 +923,7 @@ class NeuralRenderRenderSettings(bpy.types.PropertyGroup):
     use_bidirectional_photon_mapping: BoolProperty(
         name="Photon Mapping",
         description="Trace photons from the lights and gather them on the camera paths (caustics)",
-        default=False,
+        default=True,
     )
     use_bidirectional_manifold: BoolProperty(
         name="Manifold Walks",
