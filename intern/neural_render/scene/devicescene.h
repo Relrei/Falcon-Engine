@@ -93,6 +93,11 @@ class DeviceScene {
   device_vector<float4> nr_photons;
   device_vector<uint> nr_photon_counter;
   device_vector<uint> nr_photon_cells;
+  /* Scene version for optional photon map caching across camera-only moves, and base radius for
+   * progressive radius shrinking. */
+  uint64_t nr_photon_scene_version = 1;
+  uint64_t nr_photon_built_version = 0;
+  float nr_photon_base_radius = 0.0f;
 
   /* Falcon Cycles-expansion light paths from mesh emission (kernel/data_arrays.h). */
   device_vector<float> nr_mesh_light_cdf;

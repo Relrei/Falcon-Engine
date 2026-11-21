@@ -85,6 +85,7 @@ set(ADDON_FILES
   addon/__init__.py
   addon/camera.py
   addon/engine.py
+  addon/fake_fast_caustics_node.py
   addon/maketx.py
   addon/light_mixer.py
   addon/operators.py

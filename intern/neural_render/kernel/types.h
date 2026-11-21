@@ -335,6 +335,8 @@ enum PathRayFlag : uint32_t {
 /* In KernelIntegrator::bidirectional_pad1: the light paths being rendered are the photon pass of
  * photon mapping (they store photons instead of connecting to the camera). */
 #define NR_BIDIR_PHOTON_PASS_FLAG 512
+/* In KernelIntegrator::bidirectional_pad1: keep the photon map across camera-only moves. */
+#define NR_BIDIR_PHOTON_CACHE_FLAG 1024
 
 /* IntegratorState path.nr_chain bits (camera paths): a bounce that was not nearly specular happened
  * (the first such vertex is where the caustics are taken: light tracing on the first hit, photon
@@ -1848,7 +1850,24 @@ struct KernelShader {
   float cryptomatte_id;
   int flags;
   int pass_id;
-  int pad2, pad3;
+  /* Falcon Cycles-expansion: per-material Fast Caustics parameters.
+   * fast_caustics_flags: bit 0 = enabled, bits 8..15 = folds (1..8). */
+  int fast_caustics_flags;
+  float fast_caustics_strength;
+  float fast_caustics_dispersion;
+  float fast_caustics_focus;
+  float fast_caustics_ripple;
+  float fast_caustics_shadow;
+  float fast_caustics_focal_distance;
+  float fast_caustics_lens_power;
+  float fast_caustics_lens_smooth;
+  float fast_caustics_reach;
+  float fast_caustics_ior;
+  /* Falcon Cycles-expansion: per-material weight of the bidirectional caustics (the light paths
+   * through or off this material, kernel/integrator/shade_surface.h). */
+  float bd_caustics_weight;
+  float fast_caustics_pad2;
+  float fast_caustics_pad3;
 };
 static_assert_align(KernelShader, 16);
 
@@ -1938,6 +1957,9 @@ enum DeviceKernel : int {
   DEVICE_KERNEL_INTEGRATOR_SHADE_LIGHT_FORWARD,
   DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE,
   DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_RAYTRACE,
+  /* Falcon Cycles-expansion: shade_surface with the bidirectional techniques and the Neural
+   * Rendering glass samples (integrator_shade_surface_kernel()). The plain one leaves them out. */
+  DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_BIDIR,
   DEVICE_KERNEL_INTEGRATOR_SHADE_VOLUME,
   DEVICE_KERNEL_INTEGRATOR_SHADE_VOLUME_RAY_MARCHING,
   DEVICE_KERNEL_INTEGRATOR_SHADE_SHADOW,
@@ -2004,6 +2026,12 @@ enum DeviceKernel : int {
   DEVICE_KERNEL_CRYPTOMATTE_POSTPROCESS,
 
   DEVICE_KERNEL_PREFIX_SUM,
+
+  /* Falcon Cycles-expansion: VRAM-resident GPU photon map hash-grid sort. */
+  DEVICE_KERNEL_PHOTON_GRID_SAMPLE,
+  DEVICE_KERNEL_PHOTON_GRID_COUNT,
+  DEVICE_KERNEL_PHOTON_GRID_SCATTER,
+  DEVICE_KERNEL_PHOTON_GRID_COPY,
 
   DEVICE_KERNEL_NUM,
 };

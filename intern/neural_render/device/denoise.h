@@ -88,6 +88,9 @@ class DenoiseParams : public Node {
   DenoiserPrefilter prefilter = DENOISER_PREFILTER_FAST;
   DenoiserQuality quality = DENOISER_QUALITY_HIGH;
   float upscale_factor = 1.0f;
+  /* DLSS Ray Reconstruction model, the NVSDK_NGX_RayReconstruction_Hint_Render_Preset value
+   * (F by default, E and D to choose): 6 = F, 5 = E, 4 = D. */
+  int dlss_preset = 6;
 
   static const NodeEnum *get_type_enum();
   static const NodeEnum *get_prefilter_enum();

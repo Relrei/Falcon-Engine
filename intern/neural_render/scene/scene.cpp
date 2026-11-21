@@ -250,6 +250,17 @@ void Scene::device_update(Device *device_, Progress &progress)
     }
   }
 
+  /* Track non-camera scene updates so optional photon map caching only rebuilds when objects,
+   * lights, shaders, background, or integrator settings change. */
+  const bool non_camera_modified = geometry_manager->need_update() ||
+                                   object_manager->need_update() ||
+                                   light_manager->need_update() ||
+                                   shader_manager->need_update() ||
+                                   background->is_modified() || integrator->is_modified();
+  if (non_camera_modified) {
+    dscene.nr_photon_scene_version++;
+  }
+
   /* Upload shaders to GPU and compile OSL kernels, after kernels have been loaded. */
   shader_manager->device_update_post(device, &dscene, this, progress);
   osl_manager->device_update_post(device, this, progress, kernels_reloaded);
@@ -672,9 +683,14 @@ bool Scene::update_camera_resolution(Progress &progress, int width, int height)
   }
 
   if (integrator->get_use_pixel_jitter()) {
-    integrator->tag_use_pixel_jitter_modified();
-
-    integrator->device_update(device, &dscene, this);
+    if (integrator->is_modified()) {
+      integrator->tag_use_pixel_jitter_modified();
+      integrator->device_update(device, &dscene, this);
+    }
+    else {
+      /* Falcon: keeps the photon map (Integrator::device_update_pixel_jitter()). */
+      integrator->device_update_pixel_jitter(&dscene);
+    }
     update_data = true;
   }
 
@@ -695,6 +711,7 @@ static void log_kernel_features(const uint64_t features)
   LOG_INFO << "Use Voronoi " << string_from_bool(features & KERNEL_FEATURE_NODE_VORONOI_EXTRA);
   LOG_INFO << "Use Shader Raytrace " << string_from_bool(features & KERNEL_FEATURE_NODE_RAYTRACE);
   LOG_INFO << "Use MNEE " << string_from_bool(features & KERNEL_FEATURE_MNEE);
+  LOG_INFO << "Use Bidirectional " << string_from_bool(features & KERNEL_FEATURE_NR_BIDIR);
   LOG_INFO << "Use Transparent " << string_from_bool(features & KERNEL_FEATURE_TRANSPARENT);
   LOG_INFO << "Use Denoising " << string_from_bool(features & KERNEL_FEATURE_DENOISING);
   LOG_INFO << "Use Path Tracing " << string_from_bool(features & KERNEL_FEATURE_PATH_TRACING);

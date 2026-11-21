@@ -78,6 +78,21 @@ NODE_DEFINE(Shader)
 
   SOCKET_INT(pass_id, "Pass ID", 0);
 
+  /* Falcon Cycles-expansion: per-material Fast Caustics */
+  SOCKET_BOOLEAN(use_fast_caustics, "Use Fast Caustics", false);
+  SOCKET_FLOAT(fast_caustics_strength, "Fast Caustics Strength", 1.5f);
+  SOCKET_FLOAT(fast_caustics_dispersion, "Fast Caustics Dispersion", 0.5f);
+  SOCKET_FLOAT(fast_caustics_focus, "Fast Caustics Focus", 1.2f);
+  SOCKET_INT(fast_caustics_folds, "Fast Caustics Folds", 2);
+  SOCKET_FLOAT(fast_caustics_ripple, "Fast Caustics Ripple", 0.0f);
+  SOCKET_FLOAT(fast_caustics_shadow, "Fast Caustics Shadow", 0.5f);
+  SOCKET_FLOAT(fast_caustics_focal_distance, "Fast Caustics Focal Distance", 0.8f);
+  SOCKET_FLOAT(fast_caustics_lens_power, "Fast Caustics Lens Power", 1.0f);
+  SOCKET_FLOAT(fast_caustics_lens_smooth, "Fast Caustics Lens Smooth", 0.15f);
+  SOCKET_FLOAT(fast_caustics_reach, "Fast Caustics Reach", 2.5f);
+  SOCKET_FLOAT(fast_caustics_ior, "Fast Caustics IOR", 1.45f);
+  SOCKET_FLOAT(bd_caustics_weight, "BD Caustics Weight", 1.0f);
+
   return type;
 }
 
@@ -625,6 +640,7 @@ void ShaderManager::device_update_common(Device * /*device*/,
 
   KernelShader *kshader = dscene->shaders.alloc(scene->shaders.size());
   bool has_transparent_shadow = false;
+  bool has_fast_caustics = false;
 
   for (Shader *shader : scene->shaders) {
     uint flag = 0;
@@ -644,6 +660,14 @@ void ShaderManager::device_update_common(Device * /*device*/,
     }
     if (shader->has_surface_transparent && shader->get_use_transparent_shadow()) {
       flag |= SD_HAS_TRANSPARENT_SHADOW;
+    }
+    const bool shader_fast_caustics = shader->get_use_fast_caustics() && shader->has_surface &&
+                                      shader->get_use_transparent_shadow();
+    if (shader_fast_caustics) {
+      flag |= SD_HAS_TRANSPARENT_SHADOW;
+      if (shader->reference_count() > 0) {
+        has_fast_caustics = true;
+      }
     }
     if (shader->has_surface_raytrace) {
       flag |= SD_HAS_RAYTRACE;
@@ -712,6 +736,21 @@ void ShaderManager::device_update_common(Device * /*device*/,
     kshader->constant_emission[1] = shader->emission_estimate.y;
     kshader->constant_emission[2] = shader->emission_estimate.z;
     kshader->cryptomatte_id = util_hash_to_float(cryptomatte_id);
+    const int fc_folds = clamp(shader->get_fast_caustics_folds(), 1, 8);
+    kshader->fast_caustics_flags = (shader_fast_caustics ? 1 : 0) | (fc_folds << 8);
+    kshader->fast_caustics_strength = max(shader->get_fast_caustics_strength(), 0.0f);
+    kshader->fast_caustics_dispersion = max(shader->get_fast_caustics_dispersion(), 0.0f);
+    kshader->fast_caustics_focus = max(shader->get_fast_caustics_focus(), 0.0f);
+    kshader->fast_caustics_ripple = max(shader->get_fast_caustics_ripple(), 0.0f);
+    kshader->fast_caustics_shadow = clamp(shader->get_fast_caustics_shadow(), 0.0f, 1.0f);
+    kshader->fast_caustics_focal_distance = max(shader->get_fast_caustics_focal_distance(), 0.0f);
+    kshader->fast_caustics_lens_power = max(shader->get_fast_caustics_lens_power(), 0.0f);
+    kshader->fast_caustics_lens_smooth = max(shader->get_fast_caustics_lens_smooth(), 0.01f);
+    kshader->fast_caustics_reach = max(shader->get_fast_caustics_reach(), 0.05f);
+    kshader->fast_caustics_ior = clamp(shader->get_fast_caustics_ior(), 1.01f, 10.0f);
+    kshader->bd_caustics_weight = max(shader->get_bd_caustics_weight(), 0.0f);
+    kshader->fast_caustics_pad2 = 0.0f;
+    kshader->fast_caustics_pad3 = 0.0f;
     kshader++;
 
     has_transparent_shadow |= (flag & SD_HAS_TRANSPARENT_SHADOW) != 0;
@@ -738,6 +777,7 @@ void ShaderManager::device_update_common(Device * /*device*/,
   KernelIntegrator *kintegrator = &dscene->data.integrator;
   /* TODO(sergey): De-duplicate with flags set in integrator.cpp. */
   kintegrator->transparent_shadows = has_transparent_shadow;
+  kintegrator->use_fast_caustics = has_fast_caustics ? 1 : 0;
 
   /* film */
   KernelFilm *kfilm = &dscene->data.film;

@@ -361,6 +361,23 @@ ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
 }
 ccl_gpu_kernel_postfix
 
+/* Falcon Cycles-expansion: shade_surface with the bidirectional techniques
+ * (kernel/integrator/state_flow.h integrator_shade_surface_kernel()). */
+ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
+    ccl_gpu_kernel_signature(integrator_shade_surface_bidir,
+                             const ccl_global int *path_index_array,
+                             ccl_global float *render_buffer,
+                             const int work_size)
+{
+  const int global_index = ccl_gpu_global_id_x();
+
+  if (ccl_gpu_kernel_within_bounds(global_index, work_size)) {
+    const int state = (path_index_array) ? path_index_array[global_index] : global_index;
+    ccl_gpu_kernel_call(integrator_shade_surface_bidir(nullptr, state, render_buffer));
+  }
+}
+ccl_gpu_kernel_postfix
+
 #if defined(__KERNEL_METAL_APPLE__) && defined(__KERNEL_METALRT__)
 constant int __dummy_constant [[function_constant(Kernel_DummyConstant)]];
 #endif
@@ -709,6 +726,85 @@ ccl_gpu_kernel_threads(GPU_PARALLEL_PREFIX_SUM_DEFAULT_BLOCK_SIZE) ccl_gpu_kerne
     prefix_sum, ccl_global int *counter, ccl_global int *prefix_sum, const int num_values)
 {
   gpu_parallel_prefix_sum(ccl_gpu_global_id_x(), counter, prefix_sum, num_values);
+}
+ccl_gpu_kernel_postfix
+
+/* --------------------------------------------------------------------
+ * Falcon Cycles-expansion: VRAM-resident GPU photon map hash-grid sort.
+ */
+
+ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
+    ccl_gpu_kernel_signature(photon_grid_sample,
+                             const ccl_global float4 *photons,
+                             ccl_global float4 *samples,
+                             const int count,
+                             const int sample_count,
+                             const int stride)
+{
+  const int i = ccl_gpu_global_id_x();
+  if (i < sample_count) {
+    const int src = min(i * stride, count - 1);
+    samples[i] = photons[size_t(3) * src];
+  }
+}
+ccl_gpu_kernel_postfix
+
+ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
+    ccl_gpu_kernel_signature(photon_grid_count,
+                             const ccl_global float4 *photons,
+                             ccl_global uint *hashes,
+                             ccl_global int *cell_counts,
+                             const int count,
+                             const float inv_radius,
+                             const uint grid_size)
+{
+  const int i = ccl_gpu_global_id_x();
+  if (i < count) {
+    const float4 p = photons[size_t(3) * i];
+    const uint h = (uint(int(floorf(p.x * inv_radius))) * 73856093u ^
+                    uint(int(floorf(p.y * inv_radius))) * 19349663u ^
+                    uint(int(floorf(p.z * inv_radius))) * 83492791u) %
+                   grid_size;
+    hashes[i] = h;
+    atomic_fetch_and_add_uint32((ccl_global uint *)&cell_counts[h], 1u);
+  }
+}
+ccl_gpu_kernel_postfix
+
+ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
+    ccl_gpu_kernel_signature(photon_grid_scatter,
+                             const ccl_global float4 *src_photons,
+                             ccl_global float4 *dst_photons,
+                             const ccl_global uint *hashes,
+                             ccl_global uint *cell_cursors,
+                             const int count)
+{
+  const int i = ccl_gpu_global_id_x();
+  if (i < count) {
+    const uint h = hashes[i];
+    const uint dst = atomic_fetch_and_add_uint32(&cell_cursors[h], 1u);
+    const size_t s = size_t(3) * i;
+    const size_t d = size_t(3) * dst;
+    dst_photons[d + 0] = src_photons[s + 0];
+    dst_photons[d + 1] = src_photons[s + 1];
+    dst_photons[d + 2] = src_photons[s + 2];
+  }
+}
+ccl_gpu_kernel_postfix
+
+ccl_gpu_kernel(GPU_KERNEL_BLOCK_NUM_THREADS, GPU_KERNEL_MAX_REGISTERS)
+    ccl_gpu_kernel_signature(photon_grid_copy,
+                             const ccl_global float4 *src_photons,
+                             ccl_global float4 *dst_photons,
+                             const int count)
+{
+  const int i = ccl_gpu_global_id_x();
+  if (i < count) {
+    const size_t idx = size_t(3) * i;
+    dst_photons[idx + 0] = src_photons[idx + 0];
+    dst_photons[idx + 1] = src_photons[idx + 1];
+    dst_photons[idx + 2] = src_photons[idx + 2];
+  }
 }
 ccl_gpu_kernel_postfix
 

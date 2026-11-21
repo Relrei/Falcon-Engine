@@ -449,6 +449,32 @@ class NeuralRenderLightMixerItem(bpy.types.PropertyGroup):
     )
 
 
+def _use_bidirectional_update(_self, context):
+    # The Caustics items of the Principled BSDF follow (fake_fast_caustics_node.py).
+    from . import fake_fast_caustics_node
+    fake_fast_caustics_node.sync_principled_bidirectional(context.scene)
+
+
+def _bidirectional_mode_update(self, _context):
+    mode = self.bidirectional_mode
+    if mode == 'AUTO':
+        self.use_bidirectional_auto = True
+        self.use_bidirectional_light_tracing = True
+        self.use_bidirectional_photon_mapping = True
+    elif mode == 'BOTH':
+        self.use_bidirectional_auto = False
+        self.use_bidirectional_light_tracing = True
+        self.use_bidirectional_photon_mapping = True
+    elif mode == 'LIGHT_TRACING':
+        self.use_bidirectional_auto = False
+        self.use_bidirectional_light_tracing = True
+        self.use_bidirectional_photon_mapping = False
+    elif mode == 'PHOTON_MAPPING':
+        self.use_bidirectional_auto = False
+        self.use_bidirectional_light_tracing = False
+        self.use_bidirectional_photon_mapping = True
+
+
 class NeuralRenderRenderSettings(bpy.types.PropertyGroup):
     __slots__ = ()
 
@@ -501,6 +527,18 @@ class NeuralRenderRenderSettings(bpy.types.PropertyGroup):
         description="Passes used by the denoiser to distinguish noise from shader and geometry detail",
         items=enum_denoising_input_passes,
         default='RGB_ALBEDO_NORMAL',
+    )
+    # The DLSS Ray Reconstruction model: F by default, E and D to choose (integrator/denoiser_dlss.cpp).
+    dlss_model: EnumProperty(
+        name="Model",
+        description="DLSS Ray Reconstruction model, for the render and the viewport",
+        items=(
+            ('F', "F", "Preset F (the SDK headers say it gives the default behavior, which NVIDIA may "
+             "update)", 0),
+            ('E', "E", "Preset E, the latest transformer model", 1),
+            ('D', "D", "Preset D, the default transformer model", 2),
+        ),
+        default='F',
     )
     dlss_glass_matte: BoolProperty(
         name="Glass Matte Guides",
@@ -887,8 +925,25 @@ class NeuralRenderRenderSettings(bpy.types.PropertyGroup):
     use_bidirectional: BoolProperty(
         name="Bidirectional",
         description="Add paths that start at the lights to the camera paths, "
-        "with the strategies chosen below",
+        "with the mode chosen below",
         default=False,
+        update=_use_bidirectional_update,
+    )
+    bidirectional_mode: EnumProperty(
+        name="Mode",
+        description="Bidirectional caustic rendering mode",
+        items=(
+            ('AUTO', "Automatic",
+             "Use Light Tracing and Photon Mapping, stopping techniques that add next to nothing"),
+            ('BOTH', "Light Tracing + Photon Mapping",
+             "Always use both Light Tracing and Photon Mapping"),
+            ('LIGHT_TRACING', "Light Tracing",
+             "Use Light Tracing only (diffuse caustics and volume light shafts)"),
+            ('PHOTON_MAPPING', "Photon Mapping",
+             "Use Photon Mapping only (caustics seen through glass or water)"),
+        ),
+        default='AUTO',
+        update=_bidirectional_mode_update,
     )
     # Automatic: while on, the fields are hidden and chosen automatically; while off, the panel is back for
     # fine control (scene/integrator.cpp, integrator/path_trace_work_gpu.cpp).
@@ -909,10 +964,20 @@ class NeuralRenderRenderSettings(bpy.types.PropertyGroup):
         default=1000000,
     )
     bidirectional_photon_strength: FloatProperty(
-        name="Caustic Strength",
+        name="Strength",
         description="Multiplier on the caustics, from light tracing and from photon mapping (1 is "
-        "physically correct)",
-        min=0.0, soft_max=4.0,
+        "physically correct; higher values allow stylized brightening)",
+        min=0.0, soft_max=10.0, max=1000.0,
+        default=1.0,
+    )
+    # Stronger and wider caustics without more photons (kernel/integrator/photon_map.h,
+    # shade_surface.h).
+    bidirectional_caustic_spread: FloatProperty(
+        name="Caustic Spread",
+        description="Widens the caustics, from photon mapping (a wider gather) and from light tracing "
+        "(spread over the nearby pixels), keeping their light. 1 is physically correct; the bounces "
+        "and the time stay the same",
+        min=0.1, soft_max=10.0, max=100.0,
         default=1.0,
     )
     use_bidirectional_light_tracing: BoolProperty(
@@ -932,9 +997,149 @@ class NeuralRenderRenderSettings(bpy.types.PropertyGroup):
     )
     bidirectional_max_light_bounces: IntProperty(
         name="Light Bounces",
-        description="Maximum number of bounces of the paths that start at the lights",
-        min=0, max=1024,
+        description="Maximum number of bounces of the paths that start at the lights (photons and "
+        "light tracing); the Light Paths bounces stop them too",
+        min=0, soft_max=32, max=4096,
         default=8,
+    )
+    use_bidirectional_photon_cache: BoolProperty(
+        name="Keep Photon Map",
+        description="Reuse the built photon map while only the camera moves; rebuilds automatically "
+        "when objects, lights, or materials change",
+        default=True,
+    )
+    # Caustics Override: settings for the look rather than physics, such as clearer fold lines
+    # (kernel/integrator/photon_map.h, shade_surface.h).
+    use_bidirectional_extensions: BoolProperty(
+        name="Override",
+        description="Change the look of the caustics from photon mapping (strength, fold lines, "
+        "glow, color split), away from the physically correct result. Off keeps it physically "
+        "correct",
+        default=False,
+    )
+    bidirectional_line_boost: FloatProperty(
+        name="Line Boost",
+        description="Brightens the caustics where the light crowds most (the fold lines and the "
+        "focus), leaving the rest as it is. 0 is physically correct",
+        min=0.0, soft_max=4.0, max=16.0,
+        default=0.0,
+    )
+    bidirectional_sharpness: FloatProperty(
+        name="Sharpness",
+        description="Thinner fold lines (and more noise). 0 is physically correct",
+        min=0.0, max=1.0,
+        default=0.0,
+        subtype='FACTOR',
+    )
+    bidirectional_glow: FloatProperty(
+        name="Glow",
+        description="Adds a soft glow around the caustics, this many times their light, without "
+        "blurring the fold lines. 0 is physically correct",
+        min=0.0, soft_max=2.0, max=100.0,
+        default=0.0,
+    )
+    # Splitting the caustics into red, green and blue, apart from the materials' own dispersion (photon_map.h).
+    bidirectional_dispersion: FloatProperty(
+        name="Dispersion",
+        description="Splits the caustics into red, green and blue through glass, apart from the "
+        "dispersion of the material: blue bends more, red less. 0 is physically correct",
+        min=0.0, soft_max=1.0, max=5.0,
+        default=0.0,
+        subtype='FACTOR',
+    )
+    bidirectional_glow_radius: FloatProperty(
+        name="Glow Radius",
+        description="Width of the glow, in photon radii",
+        min=1.0, soft_max=32.0, max=256.0,
+        default=8.0,
+    )
+    caustics_unidir_mode: EnumProperty(
+        name="Method",
+        description="Unidirectional (camera-side) caustics method used when Bidirectional is off",
+        items=(
+            ('MNEE', "MNEE (Shadow Caustics)",
+             "Blender's deterministic Manifold Next Event Estimation (smooth refractive casters)", 0),
+            ('SMS', "SMS (Specular Manifold Sampling)",
+             "Stochastic multi-seed Specular Manifold Sampling: supports reflective + refractive "
+             "caustics, ripples/bump, glossy caustics, dispersion, and extended bounces", 1),
+        ),
+        default='SMS',
+    )
+    # MNEE and SMS each have their own detailed settings (kernel/integrator/mnee.h).
+    # The defaults are the values the kernel had built in before.
+    sms_max_iterations: IntProperty(
+        name="Max Iterations",
+        description="Newton iterations of each specular manifold walk of SMS. More finds caustics "
+        "through harder shapes and takes longer",
+        min=4, soft_max=64, max=128,
+        default=24,
+    )
+    sms_cone_angle: FloatProperty(
+        name="Cone Angle",
+        description="Widest angle around the direction to the light in which SMS starts its walks "
+        "(the narrow cone is about a third of it). Wider finds off-axis and reflective caustics",
+        min=0.05, max=1.57,
+        default=0.70,
+        subtype='ANGLE',
+    )
+    sms_direct_ratio: FloatProperty(
+        name="Direct Seed Ratio",
+        description="Share of the SMS walks that start straight towards the light; the rest start "
+        "in the cones",
+        min=0.0, max=1.0,
+        default=0.5,
+        subtype='FACTOR',
+    )
+    mnee_max_iterations: IntProperty(
+        name="Max Iterations",
+        description="Newton iterations of each manifold walk of MNEE. More finds caustics through "
+        "harder shapes and takes longer",
+        min=4, soft_max=128, max=128,
+        default=64,
+    )
+    mnee_solver_threshold: FloatProperty(
+        name="Solver Threshold",
+        description="How close a manifold walk of MNEE has to come to a valid path to be accepted. "
+        "Larger accepts more paths, less exact",
+        min=0.0001, soft_max=0.01, max=0.05,
+        default=0.001,
+        precision=4,
+    )
+    use_fast_caustics: BoolProperty(
+        name="Fast Caustics",
+        description="Fast analytic fake dispersion caustics through refractive/glass shadows "
+        "(works in both viewport and final render, GPU and CPU)",
+        default=False,
+    )
+    fast_caustics_strength: FloatProperty(
+        name="Strength",
+        description="Brightness multiplier of Fast Caustics",
+        min=0.0, soft_max=4.0, max=16.0,
+        default=1.5,
+    )
+    fast_caustics_dispersion: FloatProperty(
+        name="Dispersion",
+        description="RGB wavelength dispersion amount for rainbow caustic rings",
+        min=0.0, soft_max=1.5, max=4.0,
+        default=0.5,
+    )
+    fast_caustics_focus: FloatProperty(
+        name="Focus",
+        description="Sharpness of the caustic ring and focal highlight",
+        min=0.0, soft_max=3.0, max=8.0,
+        default=1.2,
+    )
+    fast_caustics_folds: IntProperty(
+        name="Folds",
+        description="Number of folded caustic rings (1 = single crisp cusp line, 2-4 = multi-ring bands)",
+        min=1, max=4,
+        default=2,
+    )
+    fast_caustics_ripple: FloatProperty(
+        name="Ripple",
+        description="Smooth procedural caustic wave/web modulation for water or textured glass",
+        min=0.0, soft_max=1.0, max=2.0,
+        default=0.0,
     )
 
     use_guiding: BoolProperty(
@@ -1478,6 +1683,85 @@ class NeuralRenderMaterialSettings(bpy.types.PropertyGroup):
                     "(lower values give more accurate and detailed results, but also increased render time)",
         default=1.0,
         min=0.001, max=1000.0, soft_min=0.1, soft_max=10.0, precision=4
+    )
+
+    # Falcon Cycles-expansion: per-material Fast Caustics
+    use_fast_caustics: BoolProperty(
+        name="Fast Caustics",
+        description="Fast analytic fake dispersion caustics through refractive/glass shadows for this material "
+        "(works in both viewport and final render, GPU and CPU)",
+        default=False,
+    )
+    fast_caustics_strength: FloatProperty(
+        name="Strength",
+        description="Brightness multiplier of Fast Caustics",
+        min=0.0, soft_max=10.0, max=1000.0,
+        default=1.5,
+    )
+    fast_caustics_shadow: FloatProperty(
+        name="Shadow",
+        description="Darkness of the glass object shadow outside the caustic lines (0 = bright, 1 = dark)",
+        min=0.0, max=1.0,
+        default=0.5,
+    )
+    fast_caustics_ior: FloatProperty(
+        name="Caustics IOR",
+        description="Independent refractive index used only for Fast Caustics (separate from surface BSDF IOR)",
+        min=1.01, soft_max=4.0, max=10.0,
+        default=1.45,
+    )
+    fast_caustics_dispersion: FloatProperty(
+        name="Dispersion",
+        description="Spectral wavelength dispersion amount for rainbow caustic bands",
+        min=0.0, soft_max=3.0, max=20.0,
+        default=0.5,
+    )
+    fast_caustics_focus: FloatProperty(
+        name="Focus",
+        description="Sharpness of the caustic lines and focal highlight",
+        min=0.0, soft_max=6.0, max=50.0,
+        default=1.2,
+    )
+    fast_caustics_folds: IntProperty(
+        name="Folds",
+        description="Number of folded caustic lines (1 = single crisp cusp line, 2-8 = multi-ring bands)",
+        min=1, soft_max=4, max=8,
+        default=2,
+    )
+    fast_caustics_ripple: FloatProperty(
+        name="Ripple",
+        description="Smooth procedural caustic wave/web modulation for water or textured glass",
+        min=0.0, soft_max=3.0, max=20.0,
+        default=0.0,
+    )
+    fast_caustics_focal_distance: FloatProperty(
+        name="Focal Distance",
+        description="Distance from the glass surface where convex-lens convergence peaks and smoothly inverts "
+        "(0 disables the distance convex-lens boost)",
+        min=0.0, soft_max=20.0, max=1000.0,
+        default=0.8,
+        unit='LENGTH',
+    )
+    fast_caustics_lens_power: FloatProperty(
+        name="Convex Lens",
+        description="Strength of the distance-based convex-lens Jacobian boost (0 = off, higher = stronger focus)",
+        min=0.0, soft_max=5.0, max=50.0,
+        default=1.0,
+    )
+    fast_caustics_lens_smooth: FloatProperty(
+        name="Inversion Smooth",
+        description="SDF-style smoothing width across the focal inversion boundary (smaller = sharper cusp, "
+        "larger = softer liquid-like blend)",
+        min=0.01, soft_max=1.0, max=10.0,
+        default=0.15,
+    )
+    fast_caustics_reach: FloatProperty(
+        name="Reach",
+        description="Distance falloff scale for projected caustics (higher values carry light much farther, "
+        "beyond physical attenuation)",
+        min=0.05, soft_max=50.0, max=10000.0,
+        default=2.5,
+        unit='LENGTH',
     )
 
     @classmethod

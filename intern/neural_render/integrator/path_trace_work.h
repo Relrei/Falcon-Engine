@@ -77,7 +77,7 @@ class PathTraceWork {
    * pixels). */
   /* Falcon Cycles-expansion photon mapping (kernel/integrator/photon_map.h): the photon pass of a
    * frame, then the hash grid the camera paths gather from. Returns false when this work cannot. */
-  virtual bool render_photons(const int /*sample_offset*/)
+  virtual bool render_photons(const int /*sample_offset*/, const int /*progressive_pass*/ = 0)
   {
     return false;
   }

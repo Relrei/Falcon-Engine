@@ -5,6 +5,10 @@
 /* Copy of the regular kernels with additional shader ray-tracing kernel that takes
  * much longer to compiler. This is only loaded when needed by the scene. */
 
+/* Falcon Cycles-expansion: without the bidirectional techniques, for scenes that do not use them
+ * (KERNEL_FEATURE_NR_BIDIR). With them: kernel_shader_raytrace_bidir.cu. */
+#define __NR_SHADER_RAYTRACE_WITHOUT_BIDIR__
+
 #include "kernel/device/optix/compat.h"
 #include "kernel/device/optix/globals.h"
 

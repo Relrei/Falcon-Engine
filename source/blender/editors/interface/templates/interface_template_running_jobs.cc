@@ -6,6 +6,7 @@
  * \ingroup edinterface
  */
 
+#include <atomic>
 #include <fmt/format.h>
 
 #include "AS_asset_library.hh"
@@ -30,6 +31,18 @@
 #include "UI_interface_c.hh"
 #include "UI_interface_layout.hh"
 #include "interface_intern.hh"
+
+static std::atomic<bool> g_falcon_finish_with_denoise{false};
+
+extern "C" void falcon_request_finish_with_denoise(bool enable)
+{
+  g_falcon_finish_with_denoise.store(enable, std::memory_order_relaxed);
+}
+
+extern "C" bool falcon_is_finish_with_denoise_requested()
+{
+  return g_falcon_finish_with_denoise.load(std::memory_order_relaxed);
+}
 
 namespace blender::ui {
 
@@ -82,6 +95,7 @@ void template_running_jobs(Layout *layout, bContext *C)
   void *owner = nullptr;
   int icon = 0;
   std::function<void(bContext &)> cancel_fn = nullptr;
+  bool is_render_job = false;
   const char *op_name = nullptr;
   const char *op_description = nullptr;
 
@@ -137,6 +151,7 @@ void template_running_jobs(Layout *layout, bContext *C)
     }
     if (WM_jobs_progress_test(wm, &scene, WM_JOB_TYPE_RENDER)) {
       cancel_fn = set_global_break;
+      is_render_job = true;
       icon = ICON_SCENE;
       if (U.render_display_type != USER_RENDER_DISPLAY_NONE) {
         op_name = "RENDER_OT_view_show";
@@ -313,6 +328,23 @@ void template_running_jobs(Layout *layout, bContext *C)
                                      nullptr,
                                      TIP_("Stop this job"));
       button_func_set(but, std::move(cancel_fn));
+
+      if (is_render_job) {
+        Button *but_save = uiDefIconTextBut(
+            block,
+            ButtonType::But,
+            ICON_FILE_TICK,
+            "",
+            0,
+            0,
+            UI_UNIT_X,
+            UI_UNIT_Y,
+            nullptr,
+            TIP_("Finish render at current sample with denoise (or as-is if denoiser is off)"));
+        button_func_set(but_save, [](bContext & /*C*/) {
+          falcon_request_finish_with_denoise(true);
+        });
+      }
     }
   }
 

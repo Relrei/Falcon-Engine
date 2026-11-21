@@ -329,7 +329,7 @@ ccl_device bool integrator_init_from_bake(KernelGlobals kg,
           kg, state, DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_RAYTRACE, shader_index);
     }
     else {
-      integrator_path_init_sorted(kg, state, DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE, shader_index);
+      integrator_path_init_sorted(kg, state, integrator_shade_surface_kernel(kg, state), shader_index);
     }
 
 #ifdef __SHADOW_CATCHER__

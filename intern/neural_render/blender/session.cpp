@@ -40,7 +40,18 @@
 #include "blender/sync.h"
 #include "blender/util.h"
 
+extern "C" void falcon_request_finish_with_denoise(bool enable);
+
 CCL_NAMESPACE_BEGIN
+
+/* Neural Rendering: Persistent Data kept between the frames of an animation and freed at its end
+ * (BlenderSession::reset_session). NR_FORCE_PERSISTENT=0 leaves the scene's checkbox in charge. */
+static bool nr_manage_persistent_data()
+{
+  static const bool manage = !(std::getenv("NR_FORCE_PERSISTENT") &&
+                               std::atoi(std::getenv("NR_FORCE_PERSISTENT")) == 0);
+  return manage;
+}
 
 DeviceTypeMask BlenderSession::device_override = DEVICE_MASK_ALL;
 bool BlenderSession::headless = false;
@@ -184,6 +195,22 @@ void BlenderSession::reset_session(blender::Main &b_data, blender::Depsgraph &b_
   }
   else {
     this->b_render = RE_engine_get_render_data(b_engine.re);
+    /* Neural Rendering: Persistent Data is decided here, the scene's checkbox is not read.
+     * Between the frames of an animation it is on: without it Blender
+     * frees the engine after every frame, so the DLSS feature is made again and starts from an empty
+     * history each frame (1 spp animations boiled), and the scene is synced from scratch (the 1280x720
+     * 1 spp test: 1.23 s a frame off, 0.25 s on). A still is off, and render_frame_finish turns it off
+     * on the last frame of an animation or a cancel, so the VRAM is given back when the render ends
+     * (memory left in use could stop a heavy scene). Only the render's own copy of the
+     * settings is changed. */
+    if (nr_manage_persistent_data() && (b_engine.flag & blender::RE_ENGINE_PREVIEW) == 0) {
+      if (b_engine.flag & blender::RE_ENGINE_ANIMATION) {
+        this->b_render->mode |= blender::R_PERSISTENT_DATA;
+      }
+      else {
+        this->b_render->mode &= ~blender::R_PERSISTENT_DATA;
+      }
+    }
     width = render_resolution_x(*b_render);
     height = render_resolution_y(*b_render);
   }
@@ -363,6 +390,7 @@ void BlenderSession::clear_denoiser_history_on_cut()
 
 void BlenderSession::render(blender::Depsgraph &b_depsgraph_)
 {
+  falcon_request_finish_with_denoise(false);
   b_depsgraph = &b_depsgraph_;
 
   if (session->progress.get_cancel()) {
@@ -653,6 +681,22 @@ void BlenderSession::render(blender::Depsgraph &b_depsgraph_)
 
 void BlenderSession::render_frame_finish()
 {
+  /* Neural Rendering: the last frame of an animation, or a cancel, frees the engine as without
+   * Persistent Data (the sync and the device memory below, then Blender frees the engine and the DLSS
+   * feature with it), see reset_session. */
+  if (nr_manage_persistent_data() && !b_v3d && (b_engine.flag & blender::RE_ENGINE_PREVIEW) == 0 &&
+      (b_render->mode & blender::R_PERSISTENT_DATA))
+  {
+    const int step = max(1, b_render->frame_step);
+    const int last = b_render->sfra + ((b_render->efra - b_render->sfra) / step) * step;
+    const bool is_last = !(b_engine.flag & blender::RE_ENGINE_ANIMATION) || b_scene->r.cfra >= last;
+    if (is_last || RE_engine_test_break(&b_engine)) {
+      LOG_DEBUG << "Neural Rendering: render ends at frame " << b_scene->r.cfra
+                << ", Persistent Data off so the engine and its VRAM are freed";
+      b_render->mode &= ~blender::R_PERSISTENT_DATA;
+    }
+  }
+
   /* Processing of all layers and views is done. Clear the strings so that we can communicate
    * progress about reading files and denoising them. */
   b_rlay_name = "";

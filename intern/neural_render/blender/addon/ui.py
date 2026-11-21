@@ -60,6 +60,18 @@ class NEURAL_RENDER_PT_performance_presets(NeuralRenderPresetPanel):
     preset_add_operator = "render.neural_render_performance_preset_add"
 
 
+class NEURAL_RENDER_PT_caustics_presets(NeuralRenderPresetPanel):
+    bl_label = "Caustics Presets"
+    preset_subdir = "neural_render/caustics"
+    preset_add_operator = "render.neural_render_caustics_preset_add"
+
+
+class NEURAL_RENDER_PT_fast_caustics_presets(NeuralRenderPresetPanel):
+    bl_label = "Fast Caustics Presets"
+    preset_subdir = "neural_render/fast_caustics"
+    preset_add_operator = "material.neural_render_fast_caustics_preset_add"
+
+
 class NeuralRenderButtonsPanel:
     bl_space_type = "PROPERTIES"
     bl_region_type = "WINDOW"
@@ -284,6 +296,7 @@ class NEURAL_RENDER_RENDER_PT_sampling_viewport_denoise(NeuralRenderButtonsPanel
             col = layout.column()
             if has_dlss_gpu_devices(context):
                 col.prop(cscene, "preview_denoising_upscale_quality", text="Upscale Mode")
+                col.prop(cscene, "dlss_model")
             else:
                 draw_not_denoised(col, 'DLSS')
             return
@@ -301,6 +314,7 @@ class NEURAL_RENDER_RENDER_PT_sampling_viewport_denoise(NeuralRenderButtonsPanel
         if effective_preview_denoiser == 'DLSS':
             if has_dlss_gpu_devices(context):
                 col.prop(cscene, "preview_denoising_upscale_quality", text="Upscale Mode")
+                col.prop(cscene, "dlss_model")
             else:
                 draw_not_denoised(col, 'DLSS')
             return
@@ -404,6 +418,7 @@ class NEURAL_RENDER_RENDER_PT_sampling_render_denoise(NeuralRenderButtonsPanel, 
             if has_dlss_gpu_devices(context):
                 # Falcon Cycles-expansion: what the guide passes tell DLSS, and the history warm-up.
                 col.prop(cscene, "denoising_upscale_quality", text="Upscale Mode")
+                col.prop(cscene, "dlss_model")
                 col.prop(cscene, "dlss_glass_matte")
                 sub = col.column()
                 sub.active = not cscene.dlss_glass_matte
@@ -701,7 +716,7 @@ class NEURAL_RENDER_RENDER_PT_light_paths(NeuralRenderButtonsPanel, Panel):
 
 
 class NEURAL_RENDER_RENDER_PT_light_paths_dlss_viewport(NeuralRenderButtonsPanel, Panel):
-    # Falcon: while the checkbox is off, Falcon chooses the values:
+    # Falcon: while the checkbox is off, Falcon's own values are used for
     # the bounces of the DLSS viewport (blender/sync.h NeuralViewportLightPaths).
     bl_label = "Neural Rendering Viewport"
     bl_parent_id = "NEURAL_RENDER_RENDER_PT_light_paths"
@@ -797,10 +812,10 @@ class NEURAL_RENDER_RENDER_PT_light_paths_caustics(NeuralRenderButtonsPanel, Pan
 
 
 class NEURAL_RENDER_RENDER_PT_light_paths_bidirectional(NeuralRenderButtonsPanel, Panel):
-    """Falcon Cycles-expansion: bidirectional light transport."""
-    bl_label = "Bidirectional"
+    """Falcon Cycles-expansion: unified Caustics panel (Bidirectional or MNEE/SMS)."""
+    bl_label = "Caustics"
     bl_options = {'DEFAULT_CLOSED'}
-    bl_parent_id = "NEURAL_RENDER_RENDER_PT_light_paths"
+    bl_context = "render"
 
     # Settings of each strategy, by the identifier from _neural_render.bidirectional_strategies().
     STRATEGY_PROPS = {
@@ -816,45 +831,79 @@ class NEURAL_RENDER_RENDER_PT_light_paths_bidirectional(NeuralRenderButtonsPanel
             return _neural_render.bidirectional_strategies()
         return ()
 
-    def draw_header(self, context):
-        self.layout.prop(context.scene.cycles, "use_bidirectional", text="")
+    def draw_header_preset(self, context):
+        NEURAL_RENDER_PT_caustics_presets.draw_panel_header(self.layout)
 
     def draw(self, context):
+        # The panel holds the mode, the device (CPU, GPU, GPU+CPU) and the detailed settings. While
+        # Bidirectional is off, the photon mapping items are greyed out.
+        # SMS / MNEE work with and without Bidirectional (kernel/integrator/mnee.h), so their Method
+        # stays usable; the bidirectional items are shown, grayed and locked while it is off.
+        # Keep Photon Map is always on (blender/sync.cpp), so it is not shown.
         layout = self.layout
         layout.use_property_split = True
         layout.use_property_decorate = False
 
         cscene = context.scene.cycles
-        layout.active = cscene.use_bidirectional
+        use_bidir = cscene.use_bidirectional
 
-        # Automatic stops techniques that add next to nothing after the first sample,
-        # while keeping individual strategy toggles visible so each technique can be switched freely.
-        layout.prop(cscene, "use_bidirectional_auto")
-        col = layout.column(align=True)
-        col.active = cscene.use_bidirectional_photon_mapping
-        col.prop(cscene, "bidirectional_photons")
-        col = layout.column(align=True)
-        col.active = cscene.use_bidirectional_light_tracing or cscene.use_bidirectional_photon_mapping
-        col.prop(cscene, "bidirectional_photon_strength")
-
-        not_implemented = []
-        col = layout.column(heading="Strategies", align=True)
-        for identifier, name, implemented in self.strategies():
-            prop = self.STRATEGY_PROPS.get(identifier)
-            if prop is None:
-                continue
-            col.prop(cscene, prop, text=name)
-            if not implemented and getattr(cscene, prop):
-                not_implemented.append(name)
+        layout.prop(cscene, "use_bidirectional", text="Bidirectional")
 
         col = layout.column()
-        col.prop(cscene, "bidirectional_max_light_bounces", text="Light Bounces")
+        col.active = show_device_active(context)
+        col.prop(cscene, "device")
 
-        if cscene.use_bidirectional and not_implemented:
-            col = layout.column(align=True)
-            col.label(text="Not implemented yet, rendered without:", icon='INFO')
-            for name in not_implemented:
-                col.label(text=name)
+        layout.prop(cscene, "caustics_unidir_mode", text="Method")
+        row = layout.row()
+        row.enabled = use_bidir
+        row.prop(cscene, "bidirectional_mode", text="Mode")
+
+        header, body = layout.panel("falcon_caustics_manifold", default_closed=True)
+        header.label(text="SMS" if cscene.caustics_unidir_mode == 'SMS' else "MNEE")
+        if body:
+            col = body.column(align=True)
+            if cscene.caustics_unidir_mode == 'SMS':
+                col.prop(cscene, "sms_max_iterations")
+                col.prop(cscene, "sms_cone_angle")
+                col.prop(cscene, "sms_direct_ratio")
+            else:
+                col.prop(cscene, "mnee_max_iterations")
+                col.prop(cscene, "mnee_solver_threshold")
+            col = body.column()
+            col.prop(cscene, "blur_glossy")
+            col = body.column(heading="Caustics", align=True)
+            col.prop(cscene, "caustics_reflective", text="Reflective")
+            col.prop(cscene, "caustics_refractive", text="Refractive")
+
+        header, body = layout.panel("falcon_caustics_photon_mapping", default_closed=True)
+        header.enabled = use_bidir
+        header.label(text="Photon Mapping")
+        if body:
+            body.enabled = use_bidir
+            col = body.column(align=True)
+            col.active = cscene.use_bidirectional_photon_mapping
+            col.prop(cscene, "bidirectional_photons")
+            col = body.column()
+            col.prop(cscene, "bidirectional_max_light_bounces", text="Light Bounces")
+
+        # Override works on photon mapping only, so it is available only while photon mapping is used.
+        use_override = use_bidir and cscene.use_bidirectional_photon_mapping
+        header, body = layout.panel("falcon_caustics_override", default_closed=True)
+        header.enabled = use_override
+        header.use_property_split = False
+        header.prop(cscene, "use_bidirectional_extensions", text="Override")
+        if body:
+            body.enabled = use_override
+            col = body.column(align=True)
+            col.active = cscene.use_bidirectional_extensions
+            col.prop(cscene, "bidirectional_photon_strength", text="Strength")
+            col.prop(cscene, "bidirectional_line_boost")
+            col.prop(cscene, "bidirectional_sharpness")
+            col.separator()
+            col.prop(cscene, "bidirectional_glow")
+            col.prop(cscene, "bidirectional_glow_radius")
+            col.separator()
+            col.prop(cscene, "bidirectional_dispersion")
 
 
 class NEURAL_RENDER_RENDER_PT_light_paths_fast_gi(NeuralRenderButtonsPanel, Panel):
@@ -1170,7 +1219,10 @@ class NEURAL_RENDER_RENDER_PT_performance_final_render(NeuralRenderButtonsPanel,
 
         col = layout.column()
 
-        col.prop(rd, "use_persistent_data", text="Persistent Data")
+        # Decided by the render (blender/session.cpp): kept between the frames of an animation, freed
+        # when the render ends. The scene's checkbox is not read, so it is not shown.
+        col.label(text="Persistent Data: kept during an animation,", icon='INFO')
+        col.label(text="freed when the render ends")
 
 
 class NEURAL_RENDER_RENDER_PT_performance_viewport(NeuralRenderButtonsPanel, Panel):
@@ -2279,6 +2331,53 @@ class NEURAL_RENDER_MATERIAL_PT_settings_volume(NeuralRenderButtonsPanel, Panel)
         self.draw_shared(self, context, context.material)
 
 
+class NEURAL_RENDER_MATERIAL_PT_fast_caustics(NeuralRenderButtonsPanel, Panel):
+    """Falcon Cycles-expansion: per-material Fast Caustics."""
+    bl_label = "Fast Caustics"
+    bl_context = "material"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        mat = context.material
+        return mat and (not mat.grease_pencil) and NeuralRenderButtonsPanel.poll(context)
+
+    def draw_header(self, context):
+        mat = context.material
+        if mat:
+            self.layout.prop(mat.cycles, "use_fast_caustics", text="")
+
+    def draw_header_preset(self, context):
+        NEURAL_RENDER_PT_fast_caustics_presets.draw_panel_header(self.layout)
+
+    @staticmethod
+    def draw_shared(self, mat):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        cmat = mat.cycles
+        layout.active = cmat.use_fast_caustics
+
+        col = layout.column(align=True)
+        col.prop(cmat, "fast_caustics_strength")
+        col.prop(cmat, "fast_caustics_shadow")
+        col.prop(cmat, "fast_caustics_ior")
+        col.prop(cmat, "fast_caustics_dispersion")
+        col.prop(cmat, "fast_caustics_focus")
+        col.prop(cmat, "fast_caustics_folds")
+        col.prop(cmat, "fast_caustics_ripple")
+
+        col = layout.column(align=True)
+        col.prop(cmat, "fast_caustics_focal_distance")
+        col.prop(cmat, "fast_caustics_lens_power")
+        col.prop(cmat, "fast_caustics_lens_smooth")
+        col.prop(cmat, "fast_caustics_reach")
+
+    def draw(self, context):
+        self.draw_shared(self, context.material)
+
+
 class NEURAL_RENDER_RENDER_PT_bake(NeuralRenderButtonsPanel, Panel):
     bl_label = "Bake"
     bl_context = "render"
@@ -2766,6 +2865,8 @@ classes = (
     NEURAL_RENDER_PT_viewport_sampling_presets,
     NEURAL_RENDER_PT_integrator_presets,
     NEURAL_RENDER_PT_performance_presets,
+    NEURAL_RENDER_PT_caustics_presets,
+    NEURAL_RENDER_PT_fast_caustics_presets,
     NEURAL_RENDER_RENDER_PT_sampling,
     NEURAL_RENDER_RENDER_PT_sampling_viewport,
     NEURAL_RENDER_RENDER_PT_sampling_viewport_denoise,
@@ -2780,9 +2881,8 @@ classes = (
     NEURAL_RENDER_RENDER_PT_light_paths_max_bounces,
     NEURAL_RENDER_RENDER_PT_light_paths_dlss_viewport,
     NEURAL_RENDER_RENDER_PT_light_paths_clamping,
-    NEURAL_RENDER_RENDER_PT_light_paths_caustics,
-    NEURAL_RENDER_RENDER_PT_light_paths_bidirectional,
     NEURAL_RENDER_RENDER_PT_light_paths_fast_gi,
+    NEURAL_RENDER_RENDER_PT_light_paths_bidirectional,
     NEURAL_RENDER_RENDER_PT_volumes,
     NEURAL_RENDER_RENDER_PT_subdivision,
     NEURAL_RENDER_RENDER_PT_curves,
@@ -2849,6 +2949,7 @@ classes = (
     NEURAL_RENDER_MATERIAL_PT_settings,
     NEURAL_RENDER_MATERIAL_PT_settings_surface,
     NEURAL_RENDER_MATERIAL_PT_settings_volume,
+    NEURAL_RENDER_MATERIAL_PT_fast_caustics,
     NEURAL_RENDER_RENDER_PT_bake,
     NEURAL_RENDER_RENDER_PT_bake_influence,
     NEURAL_RENDER_RENDER_PT_bake_selected_to_active,
@@ -2858,6 +2959,7 @@ classes = (
     node_panel(NEURAL_RENDER_MATERIAL_PT_settings),
     node_panel(NEURAL_RENDER_MATERIAL_PT_settings_surface),
     node_panel(NEURAL_RENDER_MATERIAL_PT_settings_volume),
+    node_panel(NEURAL_RENDER_MATERIAL_PT_fast_caustics),
     node_panel(NEURAL_RENDER_WORLD_PT_ray_visibility),
     node_panel(NEURAL_RENDER_WORLD_PT_settings),
     node_panel(NEURAL_RENDER_WORLD_PT_settings_surface),

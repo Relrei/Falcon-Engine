@@ -691,8 +691,8 @@ static void wm_window_title_text(wmWindowManager *wm,
   /* If a project is active, display its name. */
   wm_window_title_project_append(win_title);
 
-  win_title.append(StringRef(" — Blender "));
-  win_title.append(StringRef(BKE_blender_version_string()));
+  win_title.append(StringRef(" — "));
+  win_title.append(StringRef("Falcon 5"));
 }
 
 static void wm_window_title_state_refresh(wmWindowManager *wm, wmWindow *win)

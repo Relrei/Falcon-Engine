@@ -161,6 +161,7 @@ ccl_device_forceinline bool integrate_surface_holdout(KernelGlobals kg,
   return true;
 }
 
+template<bool nr_bidir>
 ccl_device_forceinline void integrate_surface_emission(KernelGlobals kg,
                                                        IntegratorState state,
                                                        const ccl_private ShaderData *sd,
@@ -193,12 +194,14 @@ ccl_device_forceinline void integrate_surface_emission(KernelGlobals kg,
   /* Falcon Cycles-expansion: the caustics of an emissive triangle the light paths start from (a side
    * its light sampling uses, kernel/integrator/light_path_start.h light_path_mesh_sample()) are
    * theirs. */
-  if ((sd->type & PRIMITIVE_TRIANGLE) &&
-      (sd->shader_flag & ((sd->runtime_flag & SR_BACKFACING) ? SD_MIS_BACK : SD_MIS_FRONT)) &&
-      light_trace_camera_path_skips_light(
-          kg, path_flag, INTEGRATOR_STATE(state, path, nr_chain), LIGHT_TRIANGLE))
-  {
-    return;
+  if constexpr (nr_bidir) {
+    if ((sd->type & PRIMITIVE_TRIANGLE) &&
+        (sd->shader_flag & ((sd->runtime_flag & SR_BACKFACING) ? SD_MIS_BACK : SD_MIS_FRONT)) &&
+        light_trace_camera_path_skips_light(
+            kg, path_flag, INTEGRATOR_STATE(state, path, nr_chain), LIGHT_TRIANGLE))
+    {
+      return;
+    }
   }
 
   /* Evaluate emissive closure. */
@@ -365,7 +368,7 @@ integrate_direct_light_shadow_init_common(KernelGlobals kg,
 
 /* Path tracing: sample point on light and evaluate light shader, then
  * queue shadow ray to be traced. */
-template<uint64_t node_feature_mask>
+template<uint64_t node_feature_mask, bool nr_bidir>
 #if defined(__KERNEL_HIP__)
 /* Inlining the function makes gfx1102 crash rendering principled_bsdf_bevel_emission_137420.blend
  * using SDK 7.2.1. */
@@ -476,7 +479,7 @@ ccl_device
 
     /* Falcon Cycles-expansion: in an open caustic chain, leave out the share of the nearly
      * specular closures (kernel/integrator/photon_map.h). */
-    {
+    if constexpr (nr_bidir) {
       const uint32_t chain_flag = INTEGRATOR_STATE(state, path, flag);
       if ((chain_flag & PATH_RAY_NR_CAUSTIC_CHAIN) && !(chain_flag & PATH_RAY_NR_LIGHT_PATH) &&
           !(sd->shader_flag & SD_HAS_TRANSPARENT_SHADOW) && light_trace_light_supported(kg, ls.type) &&
@@ -565,7 +568,80 @@ ccl_device
   return SHADER_EVAL_OK;
 }
 
+/* Falcon Cycles-expansion light tracing (kernel/integrator/init_from_light.h): keep track of the
+ * caustic chains. The bounce number is the one before path_state_next(). False: a light path that
+ * ends here. */
+ccl_device_forceinline bool integrate_surface_caustic_chain(KernelGlobals kg,
+                                                           IntegratorState state,
+                                                           const ccl_private ShaderData *sd,
+                                                           const int label,
+                                                           const float2 bsdf_sampled_roughness)
+{
+  const bool nearly_specular = (label & LABEL_SINGULAR) ||
+                               ((label & (LABEL_GLOSSY | LABEL_TRANSMIT)) &&
+                                bsdf_sampled_roughness.x * bsdf_sampled_roughness.y <
+                                    NR_LIGHT_TRACE_SPECULAR_ALPHA_SQUARED);
+  /* A surface the shadow rays see through (the "Is Shadow Ray -> Transparent" glass of bulbs and
+   * jars): the next event estimation already brings the light through it, and its shader may
+   * show other rays something else again ("Is Reflection Ray" too in junkshop), so the light
+   * paths do not go on from it and a camera path that bounces on it is left to path tracing
+   * entirely (junkshop "Cristal": the photons through it gave its light twice, +1.4% of
+   * the image, and the ones gathered behind it +0.7%). */
+  const bool shadow_transparent = (sd->shader_flag & SD_HAS_TRANSPARENT_SHADOW) != 0;
+  uint32_t flag = INTEGRATOR_STATE(state, path, flag);
+  if (flag & PATH_RAY_NR_LIGHT_PATH) {
+    /* A light path is only of use while it stays specular (L S+, then the diffuse vertex that
+     * connects to the camera). */
+    if ((!nearly_specular || shadow_transparent) &&
+        !(kernel_data.integrator.bidirectional_pad1 & 1))
+    {
+      return false;
+    }
+    /* Per-material weight of the bidirectional caustics (Principled BSDF / "Bidirectional
+     * Caustics (BD)" node, "BD Caustics Weight"). On the specular bounces of the light paths, so it reaches light tracing and the
+     * stored photons alike. Front faces only: through a glass ball the light enters and leaves,
+     * and weighting both gave the square of the weight (3 -> 9 times). */
+    if (nearly_specular && !(sd->runtime_flag & SR_BACKFACING)) {
+      const float bd_weight = kernel_data_fetch(shaders, (sd->shader & SHADER_MASK))
+                                  .bd_caustics_weight;
+      if (bd_weight != 1.0f) {
+        if (!(bd_weight > 0.0f)) {
+          return false;
+        }
+        INTEGRATOR_STATE_WRITE(state, path, throughput) *= bd_weight;
+      }
+    }
+    flag |= PATH_RAY_NR_CAUSTIC_SPECULAR;
+  }
+  else if (!(INTEGRATOR_STATE(state, path, nr_chain) & NR_CHAIN_EVER_DIFFUSE)) {
+    /* Camera path, all bounces so far specular: the first bounce that is not opens a chain (its
+     * caustics come from light tracing on the first hit, from photon mapping after a specular
+     * prefix). Specular ones keep the prefix going. */
+    if (shadow_transparent || (!nearly_specular && !photon_map_diffuse_vertex(sd))) {
+      flag &= ~(PATH_RAY_NR_CAUSTIC_CHAIN | PATH_RAY_NR_CAUSTIC_SPECULAR);
+      INTEGRATOR_STATE_WRITE(state, path, nr_chain) = uint8_t(NR_CHAIN_EVER_DIFFUSE);
+    }
+    else if (!nearly_specular) {
+      flag = (flag | PATH_RAY_NR_CAUSTIC_CHAIN) & ~PATH_RAY_NR_CAUSTIC_SPECULAR;
+      INTEGRATOR_STATE_WRITE(state, path, nr_chain) = uint8_t(
+          NR_CHAIN_EVER_DIFFUSE |
+          ((INTEGRATOR_STATE(state, path, bounce) > 0) ? NR_CHAIN_PREFIX_SPECULAR : 0));
+    }
+    else {
+      flag &= ~(PATH_RAY_NR_CAUSTIC_CHAIN | PATH_RAY_NR_CAUSTIC_SPECULAR);
+    }
+  }
+  else if (flag & PATH_RAY_NR_CAUSTIC_CHAIN) {
+    flag = (nearly_specular && !shadow_transparent) ?
+               (flag | PATH_RAY_NR_CAUSTIC_SPECULAR) :
+               (flag & ~(PATH_RAY_NR_CAUSTIC_CHAIN | PATH_RAY_NR_CAUSTIC_SPECULAR));
+  }
+  INTEGRATOR_STATE_WRITE(state, path, flag) = flag;
+  return true;
+}
+
 /* Path tracing: bounce off or through surface with new direction. */
+template<bool nr_bidir>
 ccl_device_forceinline int integrate_surface_bsdf_bssrdf_bounce(
     KernelGlobals kg,
     IntegratorState state,
@@ -698,55 +774,13 @@ ccl_device_forceinline int integrate_surface_bsdf_bssrdf_bounce(
 #endif
   }
 
-  /* Falcon Cycles-expansion light tracing (kernel/integrator/init_from_light.h): keep track of the
-   * caustic chains. The bounce number is the one before path_state_next(). */
-  if (caustic_chains_tracked(kg) && !(label & LABEL_TRANSPARENT)) {
-    const bool nearly_specular = (label & LABEL_SINGULAR) ||
-                                 ((label & (LABEL_GLOSSY | LABEL_TRANSMIT)) &&
-                                  bsdf_sampled_roughness.x * bsdf_sampled_roughness.y <
-                                      NR_LIGHT_TRACE_SPECULAR_ALPHA_SQUARED);
-    /* A surface the shadow rays see through (the "Is Shadow Ray -> Transparent" glass of bulbs and
-     * jars): the next event estimation already brings the light through it, and its shader may
-     * show other rays something else again ("Is Reflection Ray" too in junkshop), so the light
-     * paths do not go on from it and a camera path that bounces on it is left to path tracing
-     * entirely (11-15 junkshop "Cristal": the photons through it gave its light twice, +1.4% of
-     * the image, and the ones gathered behind it +0.7%). */
-    const bool shadow_transparent = (sd->shader_flag & SD_HAS_TRANSPARENT_SHADOW) != 0;
-    uint32_t flag = INTEGRATOR_STATE(state, path, flag);
-    if (flag & PATH_RAY_NR_LIGHT_PATH) {
-      /* A light path is only of use while it stays specular (L S+, then the diffuse vertex that
-       * connects to the camera). */
-      if ((!nearly_specular || shadow_transparent) &&
-          !(kernel_data.integrator.bidirectional_pad1 & 1))
-      {
+  /* Falcon Cycles-expansion light tracing: the caustic chains (integrate_surface_caustic_chain()). */
+  if constexpr (nr_bidir) {
+    if (caustic_chains_tracked(kg) && !(label & LABEL_TRANSPARENT)) {
+      if (!integrate_surface_caustic_chain(kg, state, sd, label, bsdf_sampled_roughness)) {
         return LABEL_NONE;
       }
-      flag |= PATH_RAY_NR_CAUSTIC_SPECULAR;
     }
-    else if (!(INTEGRATOR_STATE(state, path, nr_chain) & NR_CHAIN_EVER_DIFFUSE)) {
-      /* Camera path, all bounces so far specular: the first bounce that is not opens a chain (its
-       * caustics come from light tracing on the first hit, from photon mapping after a specular
-       * prefix). Specular ones keep the prefix going. */
-      if (shadow_transparent || (!nearly_specular && !photon_map_diffuse_vertex(sd))) {
-        flag &= ~(PATH_RAY_NR_CAUSTIC_CHAIN | PATH_RAY_NR_CAUSTIC_SPECULAR);
-        INTEGRATOR_STATE_WRITE(state, path, nr_chain) = uint8_t(NR_CHAIN_EVER_DIFFUSE);
-      }
-      else if (!nearly_specular) {
-        flag = (flag | PATH_RAY_NR_CAUSTIC_CHAIN) & ~PATH_RAY_NR_CAUSTIC_SPECULAR;
-        INTEGRATOR_STATE_WRITE(state, path, nr_chain) = uint8_t(
-            NR_CHAIN_EVER_DIFFUSE |
-            ((INTEGRATOR_STATE(state, path, bounce) > 0) ? NR_CHAIN_PREFIX_SPECULAR : 0));
-      }
-      else {
-        flag &= ~(PATH_RAY_NR_CAUSTIC_CHAIN | PATH_RAY_NR_CAUSTIC_SPECULAR);
-      }
-    }
-    else if (flag & PATH_RAY_NR_CAUSTIC_CHAIN) {
-      flag = (nearly_specular && !shadow_transparent) ?
-                 (flag | PATH_RAY_NR_CAUSTIC_SPECULAR) :
-                 (flag & ~(PATH_RAY_NR_CAUSTIC_CHAIN | PATH_RAY_NR_CAUSTIC_SPECULAR));
-    }
-    INTEGRATOR_STATE_WRITE(state, path, flag) = flag;
   }
 
   path_state_next(kg, state, label, sd->runtime_flag);
@@ -944,6 +978,47 @@ ccl_device_forceinline void integrate_surface_light_trace_connect(
   const float strength = (INTEGRATOR_STATE(state, path, flag) & PATH_RAY_NR_CAUSTIC_SPECULAR) ?
                              kernel_data.integrator.nr_photon_strength :
                              1.0f;
+  /* Caustic Spread: the caustics land in the pixel of a point moved along the
+   * surface, Gaussian with sigma (spread - 1) times the photon radius like the photon gathers
+   * (photon_map.h); without photons, (spread - 1) * 2 pixels. The light is kept, the time the same. */
+  const float spread = kernel_data.integrator.nr_caustic_spread;
+  if (spread > 1.0f && (INTEGRATOR_STATE(state, path, flag) & PATH_RAY_NR_CAUSTIC_SPECULAR)) {
+    const uint h = hash_uint3(__float_as_uint(sd->P.x),
+                              __float_as_uint(sd->P.y),
+                              __float_as_uint(sd->P.z) ^ INTEGRATOR_STATE(state, path, rng_pixel));
+    const float u1 = (float(h & 0xffffu) + 0.5f) * (1.0f / 65536.0f);
+    const float u2 = float(h >> 16) * (1.0f / 65536.0f);
+    const float g = sqrtf(-2.0f * logf(u1));  /* (light paths write to scattered pixels anyway) */
+    const float c = cosf(M_2PI_F * u2), s = sinf(M_2PI_F * u2);
+    const float r = kernel_data.integrator.nr_photon_radius;
+    if (r > 0.0f) {
+      float3 T, B;
+      make_orthonormals(sd->Ng, &T, &B);
+      uint moved_pixel;
+      float3 moved_dir;
+      float moved_distance;
+      if (!(light_trace_camera_importance(kg,
+                                          sd->P + (spread - 1.0f) * r * g * (c * T + s * B),
+                                          &moved_pixel,
+                                          &moved_dir,
+                                          &moved_distance) > 0.0f))
+      {
+        return;
+      }
+      pixel = moved_pixel;
+    }
+    else {
+      const int width = int(kernel_data.cam.width);
+      const int height = int(kernel_data.cam.height);
+      const float rad = (spread - 1.0f) * 2.0f * g;
+      const int px = int(pixel % uint(width)) + int(floorf(rad * c + 0.5f));
+      const int py = int(pixel / uint(width)) + int(floorf(rad * s + 0.5f));
+      if (px < 0 || py < 0 || px >= width || py >= height) {
+        return;
+      }
+      pixel = uint(px + py * width);
+    }
+  }
   const int slice_y_start = kernel_data.integrator.nr_lt_slice_y_start;
   const int slice_y_end = kernel_data.integrator.nr_lt_slice_y_end;
   if (slice_y_end > slice_y_start) {
@@ -965,7 +1040,86 @@ ccl_device_forceinline void integrate_surface_light_trace_connect(
                                                             ~PATH_RAY_ANY_PASS;
 }
 
-template<uint64_t node_feature_mask>
+/* Falcon Cycles-expansion light tracing: a vertex of a light path. It writes nothing there, it
+ * connects to the camera once a specular bounce brought it here, then goes on while it stays
+ * specular (the bounce ends it otherwise). */
+ccl_device_forceinline int integrate_surface_light_path_vertex(
+    KernelGlobals kg,
+    IntegratorState state,
+    ccl_private ShaderData *sd,
+    ccl_global float *ccl_restrict render_buffer,
+    const uint32_t path_flag)
+{
+  if (integrate_surface_terminate(state, path_flag)) {
+    return LABEL_NONE;
+  }
+  if (sd->shader_flag & SD_HAS_TRANSPARENT_SHADOW) {
+    /* Nothing on a surface the shadow rays see through (see the bounce below). */
+  }
+  else if (kernel_data.integrator.bidirectional_pad1 & NR_BIDIR_PHOTON_PASS_FLAG) {
+    /* Photon pass of photon mapping: store, do not connect. */
+    if (path_flag & PATH_RAY_NR_CAUSTIC_SPECULAR) {
+      photon_map_store(kg, state, sd);
+    }
+  }
+  else if (((path_flag & PATH_RAY_NR_CAUSTIC_SPECULAR) && photon_map_diffuse_vertex(sd)) ||
+           (kernel_data.integrator.bidirectional_pad1 & 1))
+  {
+    integrate_surface_light_trace_connect(kg, state, sd, render_buffer);
+  }
+  /* Light Bounces of the Caustics panel (photon mapping bounces): a
+   * light path (photon pass and light tracing) stores or connects here, then stops after this many
+   * bounces. It was read nowhere before, the paths ending only by the Light Paths bounces. */
+  if (int(INTEGRATOR_STATE(state, path, bounce)) >=
+      kernel_data.integrator.bidirectional_max_light_bounces)
+  {
+    return LABEL_NONE;
+  }
+  /* Caustics Override Dispersion: the photons split into red, green and blue through glass. */
+  if ((kernel_data.integrator.bidirectional_pad1 & NR_BIDIR_PHOTON_PASS_FLAG) &&
+      kernel_data.integrator.nr_caustic_dispersion > 0.0f)
+  {
+    photon_map_disperse(kg, state, sd);
+  }
+  RNGState rng_state;
+  path_state_rng_load(state, &rng_state);
+  const int label = integrate_surface_bsdf_bssrdf_bounce<true>(kg, state, sd, &rng_state);
+  if (label & LABEL_SUBSURFACE_SCATTER) {
+    return LABEL_NONE;
+  }
+#  ifdef __VOLUME__
+  if (label & LABEL_TRANSMIT) {
+    volume_stack_enter_exit<false>(kg, state, sd);
+  }
+#  endif
+  return label;
+}
+
+/* Falcon Cycles-expansion photon mapping (kernel/integrator/photon_map.h): the caustics gathered
+ * here, into the image. */
+ccl_device_forceinline void integrate_surface_photon_gather(
+    KernelGlobals kg,
+    ConstIntegratorState state,
+    ccl_private ShaderData *sd,
+    ccl_global float *ccl_restrict render_buffer)
+{
+  const Spectrum caustics = photon_map_gather(kg, sd, INTEGRATOR_STATE(state, path, sample));
+  if (is_zero(caustics)) {
+    return;
+  }
+  film_write_surface_emission(kg, state, caustics, 1.0f, render_buffer, LIGHTGROUP_NONE);
+  /* Automatic bidirectional: what the gathers of the first sample add to the image
+   * (PathTraceWorkGPU::update_photon_auto()). Only the first sample, so the atomics do not slow
+   * the rest of the frame. */
+  if ((kernel_data.integrator.bidirectional_pad1 & NR_BIDIR_AUTO_FLAG) &&
+      INTEGRATOR_STATE(state, path, sample) == 0)
+  {
+    atomic_add_and_fetch_float((ccl_global float *)&kernel_data_array(nr_photon_counter)[1],
+                               average(INTEGRATOR_STATE(state, path, throughput) * caustics));
+  }
+}
+
+template<uint64_t node_feature_mask, bool nr_bidir>
 ccl_device int integrate_surface(KernelGlobals kg,
                                  IntegratorState state,
                                  ccl_global float *ccl_restrict render_buffer)
@@ -1022,71 +1176,30 @@ ccl_device int integrate_surface(KernelGlobals kg,
 #endif
     {
       /* Filter closures. */
-      surface_shader_prepare_closures(kg, state, &sd, path_visibility);
+      surface_shader_prepare_closures<nr_bidir>(kg, state, &sd, path_visibility);
 
-      /* Falcon Cycles-expansion light tracing: a light path writes nothing at its vertices, it
-       * connects to the camera once a specular bounce brought it here, then goes on while it stays
-       * specular (the bounce ends it otherwise). */
-      if (path_flag & PATH_RAY_NR_LIGHT_PATH) {
-        if (integrate_surface_terminate(state, path_flag)) {
-          return LABEL_NONE;
+      /* Falcon Cycles-expansion light tracing (integrate_surface_light_path_vertex()). */
+      if constexpr (nr_bidir) {
+        if (path_flag & PATH_RAY_NR_LIGHT_PATH) {
+          return integrate_surface_light_path_vertex(kg, state, &sd, render_buffer, path_flag);
         }
-        if (sd.shader_flag & SD_HAS_TRANSPARENT_SHADOW) {
-          /* Nothing on a surface the shadow rays see through (see the bounce below). */
-        }
-        else if (kernel_data.integrator.bidirectional_pad1 & NR_BIDIR_PHOTON_PASS_FLAG) {
-          /* Photon pass of photon mapping: store, do not connect. */
-          if (path_flag & PATH_RAY_NR_CAUSTIC_SPECULAR) {
-            photon_map_store(kg, state, &sd);
-          }
-        }
-        else if (((path_flag & PATH_RAY_NR_CAUSTIC_SPECULAR) && photon_map_diffuse_vertex(&sd)) ||
-                 (kernel_data.integrator.bidirectional_pad1 & 1))
+
+        integrate_surface_nr_glass_samples_mark(kg, state, &sd, render_buffer);
+
+        /* Falcon Cycles-expansion photon mapping (kernel/integrator/photon_map.h): the caustics at the
+         * first not nearly specular vertex, after a specular prefix (seen through glass), or on the
+         * first hit when light tracing is off. */
+        if (photon_mapping_active(kg) && !(sd.shader_flag & SD_HAS_TRANSPARENT_SHADOW) &&
+            photon_map_diffuse_vertex(&sd) &&
+            !(INTEGRATOR_STATE(state, path, nr_chain) & NR_CHAIN_EVER_DIFFUSE) &&
+            (INTEGRATOR_STATE(state, path, bounce) > 0 || !light_trace_active(kg)) &&
+            /* NR_LT_DEBUG & 32 / 64 (diagnostics): gather only on the first hit / only after it. */
+            !((kernel_data.integrator.bidirectional_pad1 & 32) &&
+              INTEGRATOR_STATE(state, path, bounce) > 0) &&
+            !((kernel_data.integrator.bidirectional_pad1 & 64) &&
+              INTEGRATOR_STATE(state, path, bounce) == 0))
         {
-          integrate_surface_light_trace_connect(kg, state, &sd, render_buffer);
-        }
-        RNGState rng_state;
-        path_state_rng_load(state, &rng_state);
-        const int label = integrate_surface_bsdf_bssrdf_bounce(kg, state, &sd, &rng_state);
-        if (label & LABEL_SUBSURFACE_SCATTER) {
-          return LABEL_NONE;
-        }
-#  ifdef __VOLUME__
-        if (label & LABEL_TRANSMIT) {
-          volume_stack_enter_exit<false>(kg, state, &sd);
-        }
-#  endif
-        return label;
-      }
-
-      integrate_surface_nr_glass_samples_mark(kg, state, &sd, render_buffer);
-
-      /* Falcon Cycles-expansion photon mapping (kernel/integrator/photon_map.h): the caustics at the
-       * first not nearly specular vertex, after a specular prefix (seen through glass), or on the
-       * first hit when light tracing is off. */
-      if (photon_mapping_active(kg) && !(sd.shader_flag & SD_HAS_TRANSPARENT_SHADOW) &&
-          photon_map_diffuse_vertex(&sd) &&
-          !(INTEGRATOR_STATE(state, path, nr_chain) & NR_CHAIN_EVER_DIFFUSE) &&
-          (INTEGRATOR_STATE(state, path, bounce) > 0 || !light_trace_active(kg)) &&
-          /* NR_LT_DEBUG & 32 / 64 (diagnostics): gather only on the first hit / only after it. */
-          !((kernel_data.integrator.bidirectional_pad1 & 32) &&
-            INTEGRATOR_STATE(state, path, bounce) > 0) &&
-          !((kernel_data.integrator.bidirectional_pad1 & 64) &&
-            INTEGRATOR_STATE(state, path, bounce) == 0))
-      {
-        const Spectrum caustics = photon_map_gather(kg, &sd);
-        if (!is_zero(caustics)) {
-          film_write_surface_emission(kg, state, caustics, 1.0f, render_buffer, LIGHTGROUP_NONE);
-          /* Automatic bidirectional: what the gathers of the first sample add to the image
-           * (PathTraceWorkGPU::update_photon_auto()). Only the first sample, so the atomics do not
-           * slow the rest of the frame. */
-          if ((kernel_data.integrator.bidirectional_pad1 & NR_BIDIR_AUTO_FLAG) &&
-              INTEGRATOR_STATE(state, path, sample) == 0)
-          {
-            atomic_add_and_fetch_float(
-                (ccl_global float *)&kernel_data_array(nr_photon_counter)[1],
-                average(INTEGRATOR_STATE(state, path, throughput) * caustics));
-          }
+          integrate_surface_photon_gather(kg, state, &sd, render_buffer);
         }
       }
 
@@ -1097,7 +1210,7 @@ ccl_device int integrate_surface(KernelGlobals kg,
 
       /* Write emission. */
       if (sd.runtime_flag & SR_EMISSION) {
-        integrate_surface_emission(kg, state, &sd, render_buffer);
+        integrate_surface_emission<nr_bidir>(kg, state, &sd, render_buffer);
       }
 
       /* Perform path termination. Most paths have already been terminated in
@@ -1132,7 +1245,7 @@ ccl_device int integrate_surface(KernelGlobals kg,
 #endif
     /* Direct light. */
     PROFILING_EVENT(PROFILING_SHADE_SURFACE_DIRECT_LIGHT);
-    const ShaderEvalResult result = integrate_surface_direct_light<node_feature_mask>(
+    const ShaderEvalResult result = integrate_surface_direct_light<node_feature_mask, nr_bidir>(
         kg, state, &sd, &rng_state);
     if (result == SHADER_EVAL_CACHE_MISS) {
       return LABEL_CACHE_MISS;
@@ -1147,7 +1260,7 @@ ccl_device int integrate_surface(KernelGlobals kg,
 #endif
 
     PROFILING_EVENT(PROFILING_SHADE_SURFACE_INDIRECT_LIGHT);
-    continue_path_label = integrate_surface_bsdf_bssrdf_bounce(kg, state, &sd, &rng_state);
+    continue_path_label = integrate_surface_bsdf_bssrdf_bounce<nr_bidir>(kg, state, &sd, &rng_state);
 #ifdef __VOLUME__
   }
   else {
@@ -1191,7 +1304,17 @@ ccl_device_forceinline void integrator_shade_surface(KernelGlobals kg,
                                                      IntegratorState state,
                                                      ccl_global float *ccl_restrict render_buffer)
 {
-  const int continue_path_label = integrate_surface<node_feature_mask>(kg, state, render_buffer);
+  /* Falcon Cycles-expansion: the bidirectional techniques only in the kernels other than the plain
+   * one (kernel/integrator/state_flow.h integrator_shade_surface_kernel()). */
+  constexpr bool nr_bidir = (current_kernel != DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE)
+#ifdef __NR_SHADER_RAYTRACE_WITHOUT_BIDIR__
+                           /* The OptiX shader ray-tracing module for scenes without them
+                            * (KERNEL_FEATURE_NR_BIDIR, kernel/device/optix/kernel_shader_raytrace.cu). */
+                           && (current_kernel != DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_RAYTRACE)
+#endif
+      ;
+  const int continue_path_label = integrate_surface<node_feature_mask, nr_bidir>(
+      kg, state, render_buffer);
   if (continue_path_label == LABEL_CACHE_MISS) {
     integrator_path_cache_miss_sorted(state, current_kernel);
     return;
@@ -1230,6 +1353,16 @@ ccl_device_forceinline void integrator_shade_surface(KernelGlobals kg,
 #endif
 
   integrator_shade_surface_next_kernel<current_kernel>(state);
+}
+
+/* Falcon Cycles-expansion: shade_surface with the bidirectional techniques
+ * (integrator_shade_surface_kernel()). */
+ccl_device_forceinline void integrator_shade_surface_bidir(
+    KernelGlobals kg, IntegratorState state, ccl_global float *ccl_restrict render_buffer)
+{
+  integrator_shade_surface<KERNEL_FEATURE_NODE_MASK_SURFACE & ~KERNEL_FEATURE_NODE_RAYTRACE,
+                           DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_BIDIR>(
+      kg, state, render_buffer);
 }
 
 ccl_device_forceinline void integrator_shade_surface_raytrace(

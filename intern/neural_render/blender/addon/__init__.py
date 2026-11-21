@@ -7,8 +7,8 @@ from __future__ import annotations
 bl_info = {
     "name": "Cycles-expansion",
     "author": "",
-    # Falcon Engine 0.7.1 (after the demo v0.5 and v0.6)
-    "version": (0, 7, 1),
+    # Falcon Engine 0.7.2 (after the demo v0.5 and v0.6)
+    "version": (0, 7, 2),
     "blender": (2, 80, 0),
     "description": "Neural Render renderer integration",
     "warning": "",
@@ -139,6 +139,7 @@ def register():
     from . import properties
     from . import presets
     from . import light_mixer
+    from . import fake_fast_caustics_node
     from .maketx import maketx_command
     import atexit
 
@@ -153,6 +154,7 @@ def register():
     operators.register()
     presets.register()
     light_mixer.register()
+    fake_fast_caustics_node.register()
 
     for cls in classes:
         register_class(cls)
@@ -173,6 +175,9 @@ def unregister():
     from . import operators
     from . import properties
     from . import presets
+    from . import fake_fast_caustics_node
+
+    fake_fast_caustics_node.unregister()
 
     if version_update.do_versions in bpy.app.handlers.version_update:
         bpy.app.handlers.version_update.remove(version_update.do_versions)

@@ -25,8 +25,9 @@
 
 CCL_NAMESPACE_BEGIN
 
-/* Gather only the photons whose surface normal is within about 37 degrees of the gathering one. */
-#define NR_PHOTON_NORMAL_MIN_COS 0.8f
+/* Gather only the photons whose surface normal is within about 10 degrees of the gathering one
+ * (matches LuxCore PhotonGI caustic normal angle for sharper caustic edges). */
+#define NR_PHOTON_NORMAL_MIN_COS 0.9848f
 
 /* The most photons a gather looks at (photon_map_gather()). */
 #define NR_PHOTON_GATHER_MAX 8192u
@@ -101,6 +102,41 @@ ccl_device float photon_map_nee_kept_share(KernelGlobals kg,
 }
 
 /* Photon pass: store a photon at this nearly diffuse vertex of a light path. */
+/* Caustics Override Dispersion (red, green and blue split, apart from the materials' dispersion):
+ * each light path of the photon pass carries one of red, green and blue, chosen from its pixel and
+ * sample, so the same along the path. */
+ccl_device_inline int photon_map_dispersion_channel(ConstIntegratorState state)
+{
+  return int(hash_uint2(INTEGRATOR_STATE(state, path, rng_pixel),
+                        INTEGRATOR_STATE(state, path, sample) ^ 0x2c1b3c6du) %
+             3u);
+}
+
+/* The refracting closures of this vertex of a light path of the photon pass bend the path's
+ * channel more or less: the index of refraction minus 1 times 1 - 0.2 Dispersion for red, as it is
+ * for green, 1 + 0.2 Dispersion for blue (the closure IOR is already 1 / IOR on a back face). */
+ccl_device_inline void photon_map_disperse(KernelGlobals kg,
+                                           ConstIntegratorState state,
+                                           ccl_private ShaderData *sd)
+{
+  const float scale = 1.0f + 0.2f * kernel_data.integrator.nr_caustic_dispersion *
+                                 float(photon_map_dispersion_channel(state) - 1);
+  for (int c = 0; c < sd->num_closure; c++) {
+    ccl_private ShaderClosure *sc = &sd->closure[c];
+    if (!(CLOSURE_IS_GLASS(sc->type) || CLOSURE_IS_REFRACTION(sc->type))) {
+      continue;
+    }
+    ccl_private MicrofacetBsdf *bsdf = (ccl_private MicrofacetBsdf *)sc;
+    const float eta = bsdf->ior;
+    if (eta > 1.0f) {
+      bsdf->ior = 1.0f + (eta - 1.0f) * scale;
+    }
+    else if (eta > 0.0f && eta < 1.0f) {
+      bsdf->ior = 1.0f / (1.0f + (1.0f / eta - 1.0f) * scale);
+    }
+  }
+}
+
 ccl_device_forceinline void photon_map_store(KernelGlobals kg,
                                              ConstIntegratorState state,
                                              const ccl_private ShaderData *sd)
@@ -125,7 +161,14 @@ ccl_device_forceinline void photon_map_store(KernelGlobals kg,
       return;
     }
   }
-  const float3 rgb = spectrum_to_rgb(power);
+  float3 rgb = spectrum_to_rgb(power);
+  if (kernel_data.integrator.nr_caustic_dispersion > 0.0f) {
+    /* Only the path's channel, three times: the three channels of the paths add up to white. */
+    const int channel = photon_map_dispersion_channel(state);
+    rgb = make_float3(channel == 0 ? 3.0f * rgb.x : 0.0f,
+                      channel == 1 ? 3.0f * rgb.y : 0.0f,
+                      channel == 2 ? 3.0f * rgb.z : 0.0f);
+  }
   ccl_global float4 *photon = kernel_data_array(nr_photons) + 3 * index;
   /* The geometric normal, facing where the photon came from, goes in the w of the three. */
   photon[0] = make_float4(sd->P.x, sd->P.y, sd->P.z, sd->Ng.x);
@@ -141,7 +184,7 @@ ccl_device_forceinline void photon_map_store(KernelGlobals kg,
 
 /* Camera path: the caustic radiance at this vertex from the photons around it, through its nearly
  * diffuse closures. */
-ccl_device Spectrum photon_map_gather(KernelGlobals kg, ccl_private ShaderData *sd)
+ccl_device Spectrum photon_map_gather(KernelGlobals kg, ccl_private ShaderData *sd, const uint sample)
 {
   const float r = kernel_data.integrator.nr_photon_radius;
   const uint size = uint(kernel_data.integrator.nr_photon_grid_size);
@@ -149,7 +192,43 @@ ccl_device Spectrum photon_map_gather(KernelGlobals kg, ccl_private ShaderData *
     return zero_spectrum();
   }
   const float r2 = r * r;
-  const int3 base = photon_map_cell(sd->P, r);
+  /* Caustic Spread (stronger and wider caustics with the same photons): gather around a point
+   * moved along the surface, Gaussian with sigma (spread - 1) times the radius. The same photons a
+   * gather (a wider radius took 1.6 times as long at 2); the samples average it. The move is the same
+   * for every pixel of a sample, so that neighbouring pixels read neighbouring photons (a move of
+   * its own per pixel scattered the reads: 13% slower at 2). */
+  float3 P = sd->P;
+  float spread = kernel_data.integrator.nr_caustic_spread;
+  /* Caustics Override Glow (sharp lines with a thin spread around them): besides the caustic
+   * itself, Glow times its light blurred Glow Radius photon radii wide. Each gather is one or the
+   * other, chosen per pixel (one for the whole frame flickered between them), weighted so that the
+   * samples add up to both. The fold lines are not blurred, unlike Caustic Spread. */
+  const float glow = kernel_data.integrator.nr_caustic_glow;
+  float glow_weight = 1.0f;
+  bool is_glow = false;
+  if (glow > 0.0f) {
+    const float q = clamp(glow / (1.0f + glow), 0.05f, 0.95f);
+    const float u = float(hash_uint3(__float_as_uint(sd->P.x) ^ sample,
+                                     __float_as_uint(sd->P.y),
+                                     __float_as_uint(sd->P.z) ^ 0x68bc21ebu) >>
+                          8) *
+                    (1.0f / 16777216.0f);
+    is_glow = (u < q);
+    glow_weight = is_glow ? glow / q : 1.0f / (1.0f - q);
+    if (is_glow) {
+      spread = 1.0f + kernel_data.integrator.nr_caustic_glow_radius;
+    }
+  }
+  if (spread > 1.0f) {
+    const uint h = hash_uint(sample * 0x9E3779B1u + 0x5bd1e995u);
+    const float u1 = (float(h & 0xffffu) + 0.5f) * (1.0f / 65536.0f);
+    const float u2 = float(h >> 16) * (1.0f / 65536.0f);
+    float3 T, B;
+    make_orthonormals(sd->Ng, &T, &B);
+    const float rad = (spread - 1.0f) * r * sqrtf(-2.0f * logf(u1));
+    P += rad * (cosf(M_2PI_F * u2) * T + sinf(M_2PI_F * u2) * B);
+  }
+  const int3 base = photon_map_cell(P, r);
   const ccl_global uint *cells = kernel_data_array(nr_photon_cells);
   const ccl_global float4 *photons = kernel_data_array(nr_photons);
 
@@ -180,7 +259,13 @@ ccl_device Spectrum photon_map_gather(KernelGlobals kg, ccl_private ShaderData *
   /* At most NR_PHOTON_GATHER_MAX photons are looked at: with more (the core of a focused caustic),
    * every stride-th one from a random start, weighted by the stride. Cutting the rest off lost their
    * light (11-15: the caustic seen through the window test's glass ball, 1.74 against 2.99). */
-  const uint stride = (total + NR_PHOTON_GATHER_MAX - 1) / NR_PHOTON_GATHER_MAX;
+  /* With Caustic Spread the caustics are blurred, so fewer photons a gather do: at most
+   * NR_PHOTON_GATHER_MAX / (4 spread^2), at least 256. A wider caustic has more pixels gathering, and
+   * looking at them all took 1.5 times as long at 2 (a test scene, photon mapping only). */
+  const uint gather_max = (spread > 1.0f) ?
+                              max(256u, uint(float(NR_PHOTON_GATHER_MAX) / (4.0f * spread * spread))) :
+                              NR_PHOTON_GATHER_MAX;
+  const uint stride = (total + gather_max - 1) / gather_max;
   uint next = (stride > 1) ? hash_uint3(__float_as_uint(sd->P.x),
                                         __float_as_uint(sd->P.y),
                                         __float_as_uint(sd->P.z) ^ __float_as_uint(sd->wi.x)) %
@@ -203,7 +288,7 @@ ccl_device Spectrum photon_map_gather(KernelGlobals kg, ccl_private ShaderData *
       for (; next < offset + len; next += stride) {
         const uint i = start + (next - offset);
         const float4 p = photons[3 * i];
-        const float3 d = make_float3(p.x, p.y, p.z) - sd->P;
+        const float3 d = make_float3(p.x, p.y, p.z) - P;
         if (dot(d, d) <= r2 &&
             dot(make_float3(p.w, photons[3 * i + 1].w, photons[3 * i + 2].w), sd->Ng) >=
                 NR_PHOTON_NORMAL_MIN_COS)
@@ -217,11 +302,25 @@ ccl_device Spectrum photon_map_gather(KernelGlobals kg, ccl_private ShaderData *
   if (within == 0) {
     return zero_spectrum();
   }
-  const float r_gather = (float(within) > NR_PHOTON_GATHER_K) ?
-                             r * fmaxf(sqrtf(NR_PHOTON_GATHER_K / float(within)),
-                                       NR_PHOTON_GATHER_MIN_RADIUS) :
-                             r;
+  /* Caustics Override Sharpness: a narrower gather, and a smaller narrowest one where the photons
+   * crowd, for thinner fold lines (and more noise). Not for the glow. */
+  const float sharpness = is_glow ? 0.0f : kernel_data.integrator.nr_caustic_sharpness;
+  const float r_gather = ((float(within) > NR_PHOTON_GATHER_K) ?
+                              r * fmaxf(sqrtf(NR_PHOTON_GATHER_K / float(within)),
+                                        NR_PHOTON_GATHER_MIN_RADIUS * (1.0f - 0.75f * sharpness)) :
+                              r) *
+                         (1.0f - 0.6f * sharpness);
   const float r2_gather = r_gather * r_gather;
+  /* Caustics Override Line Boost: brighter where the photons crowd more than NR_PHOTON_GATHER_K in
+   * the frame's radius (the fold lines and the focus), by the photon density to the power of half
+   * the boost; the rest stays as it is. Not for the glow. */
+  float line_boost = 1.0f;
+  if (!is_glow && kernel_data.integrator.nr_caustic_line_boost > 0.0f) {
+    const float crowd = float(within) * float(stride) / NR_PHOTON_GATHER_K;
+    if (crowd > 1.0f) {
+      line_boost = fminf(powf(crowd, 0.5f * kernel_data.integrator.nr_caustic_line_boost), 64.0f);
+    }
+  }
 
   next = first;
   uint offset = 0;
@@ -232,7 +331,7 @@ ccl_device Spectrum photon_map_gather(KernelGlobals kg, ccl_private ShaderData *
     for (; next < offset + len; next += stride) {
       const uint i = start + (next - offset);
       const float4 p = photons[3 * i];
-      const float3 d = make_float3(p.x, p.y, p.z) - sd->P;
+      const float3 d = make_float3(p.x, p.y, p.z) - P;
       if (dot(d, d) > r2_gather) {
         continue;
       }
@@ -260,12 +359,18 @@ ccl_device Spectrum photon_map_gather(KernelGlobals kg, ccl_private ShaderData *
         float pdf = 0.0f;
         f += bsdf_eval(kg, sd, sc, wi, &pdf) * sc->weight;
       }
+      /* Crisp overlapping caustic edge weighting (10.0 base sharpness, no extra UI knob):
+       * Jensen cone kernel (3*(1 - d/r)) combined with a sharp peak core keeps overlapping
+       * caustic ribbon edges crisp and luminous without blurring into flat discs. */
+      const float dist_ratio = sqrtf(dot(d, d) / max(r2_gather, 1e-10f));
+      const float cone_w = max(1.0f - dist_ratio, 0.0f);
+      const float edge_w = 1.65f * cone_w + 0.55f * expf(-10.0f * dist_ratio * dist_ratio);
       /* bsdf_eval() includes the cosine, which the arriving power already has. */
-      sum += f * rgb_to_spectrum(make_float3(q.x, q.y, q.z)) / fabsf(cos_in);
+      sum += f * rgb_to_spectrum(make_float3(q.x, q.y, q.z)) * (edge_w / fabsf(cos_in));
     }
     offset += len;
   }
-  sum *= float(stride);
+  sum *= float(stride) * glow_weight * line_boost;
   return sum * (kernel_data.integrator.nr_photon_inv_paths * kernel_data.integrator.nr_photon_strength /
                 (M_PI_F * r2_gather));
 }

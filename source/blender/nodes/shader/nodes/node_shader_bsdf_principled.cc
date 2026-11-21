@@ -341,6 +341,108 @@ static void node_declare(NodeDeclarationBuilder &b)
       .max(1000.0f)
       .description("Index of refraction (IOR) of the thin film");
 #define SOCK_THIN_FILM_IOR_ID 33
+
+  /* Falcon Cycles-expansion: integrated Caustics panel. Its items follow the caustics method of the
+   * render, switching with it:
+   * "Bidirectional" is set on every material by the add-on when the render's Bidirectional is
+   * switched (neural_render/fake_fast_caustics_node.py), the Fast Caustics (FFC) items are used while it is
+   * off and the bidirectional (BD) ones while it is on. Cycles reads them in
+   * intern/neural_render/blender/shader.cpp; EEVEE does not get them (node_shader_gpu_bsdf_principled). */
+  PanelDeclarationBuilder &caustics = b.add_panel("Caustics"_ustr).default_closed(true);
+  caustics.add_input<decl::Bool>("Bidirectional"_ustr)
+      .default_value(false)
+      .description(
+          "Set from the render's Caustics panel: on shows the bidirectional (BD) items, off the "
+          "Fast Caustics (FFC) ones");
+  caustics.add_input<decl::Bool>("Caustics Enabled"_ustr)
+      .default_value(false)
+      .short_label("Fast Caustics"_ustr)
+      .usage_by_bool("Bidirectional"_ustr, false)
+      .description("Enable Falcon Fast Caustics (FFC) on this material");
+  caustics.add_input<decl::Float>("Caustics Strength"_ustr)
+      .default_value(1.5f)
+      .min(0.0f)
+      .max(1000.0f)
+      .short_label("Strength"_ustr)
+      .usage_by_bool("Bidirectional"_ustr, false)
+      .description("Brightness multiplier of Fast Caustics");
+  caustics.add_input<decl::Float>("Caustics Shadow"_ustr)
+      .default_value(0.5f)
+      .min(0.0f)
+      .max(1.0f)
+      .subtype(PROP_FACTOR)
+      .short_label("Shadow"_ustr)
+      .usage_by_bool("Bidirectional"_ustr, false)
+      .description("Darkness of the glass shadow outside the caustic lines");
+  caustics.add_input<decl::Float>("Caustics IOR"_ustr)
+      .default_value(1.45f)
+      .min(1.01f)
+      .max(10.0f)
+      .usage_by_bool("Bidirectional"_ustr, false)
+      .description("Independent IOR used only for Fast Caustics");
+  caustics.add_input<decl::Float>("Caustics Dispersion"_ustr)
+      .default_value(0.5f)
+      .min(0.0f)
+      .max(20.0f)
+      .short_label("Dispersion"_ustr)
+      .usage_by_bool("Bidirectional"_ustr, false)
+      .description("Spectral wavelength dispersion amount for rainbow caustic bands");
+  caustics.add_input<decl::Float>("Caustics Focus"_ustr)
+      .default_value(1.2f)
+      .min(0.0f)
+      .max(50.0f)
+      .short_label("Focus"_ustr)
+      .usage_by_bool("Bidirectional"_ustr, false)
+      .description("Sharpness of the caustic lines and focal highlight");
+  caustics.add_input<decl::Int>("Caustics Folds"_ustr)
+      .default_value(2)
+      .min(1)
+      .max(8)
+      .short_label("Folds"_ustr)
+      .usage_by_bool("Bidirectional"_ustr, false)
+      .description("Number of folded caustic lines (1-8)");
+  caustics.add_input<decl::Float>("Caustics Ripple"_ustr)
+      .default_value(0.0f)
+      .min(0.0f)
+      .max(20.0f)
+      .short_label("Ripple"_ustr)
+      .usage_by_bool("Bidirectional"_ustr, false)
+      .description("Smooth procedural caustic wave/web modulation");
+  caustics.add_input<decl::Float>("Focal Distance"_ustr)
+      .default_value(0.8f)
+      .min(0.0f)
+      .max(1000.0f)
+      .subtype(PROP_DISTANCE)
+      .usage_by_bool("Bidirectional"_ustr, false)
+      .description("Distance where convex-lens convergence peaks and smoothly inverts");
+  caustics.add_input<decl::Float>("Convex Lens"_ustr)
+      .default_value(1.0f)
+      .min(0.0f)
+      .max(50.0f)
+      .usage_by_bool("Bidirectional"_ustr, false)
+      .description("Strength of the distance-based convex-lens Jacobian boost");
+  caustics.add_input<decl::Float>("Inversion Smooth"_ustr)
+      .default_value(0.15f)
+      .min(0.01f)
+      .max(10.0f)
+      .usage_by_bool("Bidirectional"_ustr, false)
+      .description("Smoothing width across the focal inversion boundary");
+  caustics.add_input<decl::Float>("Reach"_ustr)
+      .default_value(2.5f)
+      .min(0.05f)
+      .max(10000.0f)
+      .subtype(PROP_DISTANCE)
+      .usage_by_bool("Bidirectional"_ustr, false)
+      .description("Distance falloff scale for projected caustics");
+  caustics.add_input<decl::Float>("BD Caustics Weight"_ustr)
+      .default_value(1.0f)
+      .min(0.0f)
+      .max(100.0f)
+      .short_label("Caustics Weight"_ustr)
+      .usage_by_bool("Bidirectional"_ustr, true)
+      .description(
+          "Multiplier on the bidirectional caustics (light tracing and photon mapping) of the light "
+          "that passes through or reflects off this material. 1 is physically correct");
 }
 
 static void node_shader_init_principled(bNodeTree * /*ntree*/, bNode *node)
@@ -467,6 +569,12 @@ static int node_shader_gpu_bsdf_principled(GPUMaterial *mat,
   }
 
   float use_multi_scatter = (node->custom1 == SHD_GLOSSY_MULTI_GGX) ? 1.0f : 0.0f;
+
+  /* Falcon Cycles-expansion: the Caustics panel (after Thin Film IOR) is for Cycles only; the GLSL
+   * function does not take it. */
+  for (int i = SOCK_THIN_FILM_IOR_ID + 1; !in[i].end; i++) {
+    in[i].type = GPU_NONE;
+  }
 
   return GPU_stack_link(mat,
                         node,

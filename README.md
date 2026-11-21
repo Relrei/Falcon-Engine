@@ -1,4 +1,4 @@
-# Falcon Engine v0.7.1
+# Falcon Engine v0.7.2
 
 これは半年前（2026年5月ごろ）に GTR（車）のシーンのレンダリングで40時間かかったことをきっかけに、レンダリングをどうにか速くできないかと個人的に開発を始めました。
 本ビルドは今のところ Linux を優先して開発を進めており、順次 Windows にも対応する予定です。一部機能は NVIDIA 専用ですが、macOS も対応する予定はあるものの、当分先になると思います…。
@@ -61,6 +61,7 @@ NVIDIA・DLSS・OptiX・CUDA は NVIDIA Corporation の商標です。Blender �
 
 | バージョン | 公開日 | ベース | 主な変更点 |
 |---|---|---|---|
+| [v0.7.2](../../releases/tag/Falcon-Engine-v0.7.2) | 2026-11-21 | Blender 5.3.0 | Caustics パネルの整理（Device・Method・Mode）、Override（フォトンマッピングの見た目調整と RGB 分散）、Fast Caustics と専用マテリアルノード、SMS、GPU のフォトンマッピング修正、DLSS の Model 選択、アニメーション最終レンダーで DLSS の履歴を引き継ぐように修正 |
 | [v0.7.1](../../releases/tag/Falcon-Engine-v0.7.1) | 2026-11-18 | Blender 5.3.0 | 双方向パストレーシングの Automatic で、コースティクスの無いシーンでも遅くなっていた不具合を修正 |
 | [v0.7.0](../../releases/tag/Falcon-Engine-v0.7.0) | 2026-11-17 | Blender 5.3.0 | Blender 5.3.0 ベースで最初の正式ソース公開。Cycles-expansion・双方向パストレーシング・Neural Rendering・Light Mixer・Unlimited・Falcon Launcher 連携を搭載 |
 | [v0.6-demo](../../releases/tag/v0.6-demo) | 2026-09-30 | Blender 5.2.2 | デモ版最終更新。VSE の GPU プレビュー改善と fast path 音声・画質修正、DLSS UI・アニメーション修正、集光フォトン焼きのクラッシュ修正 |

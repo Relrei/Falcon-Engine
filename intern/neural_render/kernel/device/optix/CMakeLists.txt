@@ -14,6 +14,7 @@ set(SRC_KERNEL_DEVICE_OPTIX
   kernel.cu
   kernel_mnee.cu
   kernel_shader_raytrace.cu
+  kernel_shader_raytrace_bidir.cu
 )
 
 if(WITH_CYCLES_OSL)
@@ -117,6 +118,11 @@ if(WITH_CYCLES_CUDA_BINARIES AND WITH_CYCLES_DEVICE_OPTIX)
     kernel_optix_shader_raytrace
     "${cuda_nvcc_executable}" "${cuda_version}"
     "kernel_shader_raytrace.cu"
+    "--keep-device-functions")
+  nr_optix_kernel_add(
+    kernel_optix_shader_raytrace_bidir
+    "${cuda_nvcc_executable}" "${cuda_version}"
+    "kernel_shader_raytrace_bidir.cu"
     "--keep-device-functions")
   if(WITH_CYCLES_OSL)
     nr_optix_kernel_add(

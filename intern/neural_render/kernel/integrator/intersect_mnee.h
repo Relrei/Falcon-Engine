@@ -112,7 +112,7 @@ ccl_device void integrator_intersect_mnee(KernelGlobals kg, IntegratorState stat
   integrator_path_next_sorted(kg,
                               state,
                               DEVICE_KERNEL_INTEGRATOR_INTERSECT_MNEE,
-                              DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE,
+                              integrator_shade_surface_kernel(kg, state),
                               shader);
 }
 

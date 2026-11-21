@@ -86,10 +86,31 @@ class Integrator : public Node {
   /* Photon mapping: light paths of the photon pass (and the most photons kept), strength. */
   NODE_SOCKET_API(int, bidirectional_photons)
   NODE_SOCKET_API(float, bidirectional_photon_strength)
+  NODE_SOCKET_API(float, bidirectional_caustic_spread)
+  /* Caustics Override: fold lines brighter (Line Boost) and narrower (Sharpness), and a soft glow
+   * of Glow times the light, Glow Radius photon radii wide (kernel/integrator/photon_map.h). */
+  NODE_SOCKET_API(float, bidirectional_line_boost)
+  NODE_SOCKET_API(float, bidirectional_sharpness)
+  NODE_SOCKET_API(float, bidirectional_glow)
+  NODE_SOCKET_API(float, bidirectional_glow_radius)
+  NODE_SOCKET_API(float, bidirectional_dispersion)
   NODE_SOCKET_API(bool, use_bidirectional_light_tracing)
   NODE_SOCKET_API(bool, use_bidirectional_photon_mapping)
   NODE_SOCKET_API(bool, use_bidirectional_manifold)
   NODE_SOCKET_API(int, bidirectional_max_light_bounces)
+  NODE_SOCKET_API(bool, use_bidirectional_photon_cache)
+  NODE_SOCKET_API(bool, use_fast_caustics)
+  NODE_SOCKET_API(float, fast_caustics_strength)
+  NODE_SOCKET_API(float, fast_caustics_dispersion)
+  NODE_SOCKET_API(float, fast_caustics_focus)
+  NODE_SOCKET_API(int, fast_caustics_folds)
+  NODE_SOCKET_API(float, fast_caustics_ripple)
+  NODE_SOCKET_API(bool, use_sms_caustics)
+  NODE_SOCKET_API(int, sms_max_iterations)
+  NODE_SOCKET_API(float, sms_cone_angle)
+  NODE_SOCKET_API(float, sms_direct_ratio)
+  NODE_SOCKET_API(int, mnee_max_iterations)
+  NODE_SOCKET_API(float, mnee_solver_threshold)
 
   NODE_SOCKET_API(bool, caustics_reflective)
   NODE_SOCKET_API(bool, caustics_refractive)
@@ -146,6 +167,7 @@ class Integrator : public Node {
   NODE_SOCKET_API(bool, denoise_use_gpu);
   NODE_SOCKET_API(DenoiserQuality, denoiser_quality);
   NODE_SOCKET_API(float, denoiser_upscale_factor);
+  NODE_SOCKET_API(int, denoiser_dlss_preset);
 
   enum : uint32_t {
     AO_PASS_MODIFIED = (1 << 0),
@@ -164,6 +186,8 @@ class Integrator : public Node {
   ~Integrator() override;
 
   void device_update(Device *device, DeviceScene *dscene, Scene *scene);
+  /* Falcon: only the next pixel jitter and the seed it scrambles (Scene::update_camera_resolution()). */
+  void device_update_pixel_jitter(DeviceScene *dscene);
   void device_free(Device *device, DeviceScene *dscene, bool force_free = false);
 
   void tag_update(Scene *scene, const uint32_t flag);

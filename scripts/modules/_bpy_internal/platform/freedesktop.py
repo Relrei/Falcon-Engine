@@ -59,6 +59,10 @@ BLENDER_DIR = ""
 
 # These files are included along side a portable Blender installation.
 BLENDER_DESKTOP = "blender.desktop"
+# Falcon: the name written into the user's/system's `applications` directory.
+# Kept apart from `blender.desktop` so registering Falcon does not overwrite the
+# entry of an official Blender installed on the same machine.
+BLENDER_DESKTOP_INSTALLED = "falcon-v5-blend.desktop"
 # The target binary.
 BLENDER_FILENAME = "blender"
 # The target binary (thumbnailer).
@@ -177,7 +181,7 @@ def handle_desktop_file(do_register: bool, all_users: bool) -> str | None:
     dirpath_dst = os.path.join(base_dir, "applications")
 
     filepath_desktop_src = os.path.join(BLENDER_DIR, filename)
-    filepath_desktop_dst = os.path.join(dirpath_dst, filename)
+    filepath_desktop_dst = os.path.join(dirpath_dst, BLENDER_DESKTOP_INSTALLED)
 
     if VERBOSE:
         sys.stdout.write("- {:s} desktop-file: {:s}\n".format(
@@ -340,7 +344,7 @@ def handle_mime_association_default(do_register: bool, all_users: bool) -> str |
     cmd = (
         XDG_MIME_PROG,
         "default",
-        BLENDER_DESKTOP,
+        BLENDER_DESKTOP_INSTALLED,
         BLENDER_MIME,
     )
     subprocess.check_output(cmd)

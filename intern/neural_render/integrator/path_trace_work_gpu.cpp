@@ -102,6 +102,10 @@ PathTraceWorkGPU::PathTraceWorkGPU(Device *device,
                                                "integrator_shader_raytrace_sort_counter",
                                                MEM_READ_WRITE,
                                                MEM_FLAG_NO_HOST_FALLBACK),
+      integrator_shader_bidir_sort_counter_(device,
+                                            "integrator_shader_bidir_sort_counter",
+                                            MEM_READ_WRITE,
+                                            MEM_FLAG_NO_HOST_FALLBACK),
       integrator_shader_sort_prefix_sum_(
           device, "integrator_shader_sort_prefix_sum", MEM_READ_WRITE, MEM_FLAG_NO_HOST_FALLBACK),
       integrator_shader_sort_partition_key_offsets_(device,
@@ -154,7 +158,9 @@ void PathTraceWorkGPU::alloc_integrator_soa()
    * total state count. This is the number of states which keeps the device occupied
    * with work without losing performance. The renderer will add more work (when
    * available) when the number of active paths falls below this value. */
-  min_num_active_main_paths_ = max_num_paths_ / 4;
+  /* Falcon multi-sample wavefront saturation: refill camera paths aggressively when active paths
+   * drop below half capacity so GPU SMs stay busy during divergent glass/refraction & adaptive tails. */
+  min_num_active_main_paths_ = max_num_paths_ / 2;
 
   /* Allocate a device only memory buffer before for each struct member, and then
    * write the pointers into a struct that resides in constant memory.
@@ -283,6 +289,7 @@ void PathTraceWorkGPU::alloc_integrator_sorting()
     integrator_state_gpu_.sort_key_counter[DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE] = nullptr;
     integrator_state_gpu_.sort_key_counter[DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_RAYTRACE] =
         nullptr;
+    integrator_state_gpu_.sort_key_counter[DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_BIDIR] = nullptr;
   }
   else {
     /* Allocate arrays for shader sorting. */
@@ -300,11 +307,18 @@ void PathTraceWorkGPU::alloc_integrator_sorting()
       integrator_shader_raytrace_sort_counter_.alloc(sort_buckets);
       integrator_shader_raytrace_sort_counter_.zero_to_device();
     }
+    /* Falcon Cycles-expansion: any scene may turn on the bidirectional techniques. */
+    if (integrator_shader_bidir_sort_counter_.size() < sort_buckets) {
+      integrator_shader_bidir_sort_counter_.alloc(sort_buckets);
+      integrator_shader_bidir_sort_counter_.zero_to_device();
+    }
 
     integrator_state_gpu_.sort_key_counter[DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE] =
         (int *)integrator_shader_sort_counter_.device_pointer;
     integrator_state_gpu_.sort_key_counter[DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_RAYTRACE] =
         (use_raytrace) ? (int *)integrator_shader_raytrace_sort_counter_.device_pointer : nullptr;
+    integrator_state_gpu_.sort_key_counter[DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_BIDIR] =
+        (int *)integrator_shader_bidir_sort_counter_.device_pointer;
   }
 }
 
@@ -378,7 +392,9 @@ void PathTraceWorkGPU::render_samples(RenderStatistics &statistics,
    * add more work (because tiles are smaller, so there is higher chance that more paths will
    * become busy after adding new tiles). This is especially important for the shadow catcher which
    * schedules work in halves of available number of paths. */
-  work_tile_scheduler_.set_max_num_path_states(max_num_paths_ / 8);
+  /* Falcon multi-sample wavefront batching: allow larger multi-sample tile dispatches (max/4)
+   * to launch multiple samples per pixel concurrently with fewer host/queue sync stalls. */
+  work_tile_scheduler_.set_max_num_path_states(max_num_paths_ / 4);
   work_tile_scheduler_.set_accelerated_rt(
       (device_->get_bvh_layout_mask(device_scene_->data.kernel_features) & BVH_LAYOUT_OPTIX) != 0);
   work_tile_scheduler_.reset(effective_buffer_params_,
@@ -574,18 +590,27 @@ void PathTraceWorkGPU::update_light_guide(const int start_sample)
   write_global(queue_.get(), cdf);
 }
 
-bool PathTraceWorkGPU::render_photons(const int sample_offset)
+bool PathTraceWorkGPU::render_photons(const int sample_offset, const int progressive_pass)
 {
   KernelIntegrator &kintegrator = device_scene_->data.integrator;
   const int capacity = kintegrator.nr_photon_capacity;
   /* A new frame: photon mapping stopped by the automatic bidirectional is back on (the storage is
    * only there while the scene asks for photon mapping). */
-  if (photon_auto_stopped_ && capacity > 0) {
-    kintegrator.bidirectional_strategies |= BIDIR_STRATEGY_PHOTON_MAPPING;
-    device_->const_copy_to("data", &device_scene_->data, sizeof(device_scene_->data));
+  if (progressive_pass == 0) {
+    if (photon_auto_stopped_ && capacity > 0) {
+      kintegrator.bidirectional_strategies |= BIDIR_STRATEGY_PHOTON_MAPPING;
+      device_->const_copy_to("data", &device_scene_->data, sizeof(device_scene_->data));
+    }
+    photon_auto_stopped_ = false;
   }
-  photon_auto_stopped_ = false;
   if (!(kintegrator.bidirectional_strategies & BIDIR_STRATEGY_PHOTON_MAPPING) || capacity <= 0) {
+    return false;
+  }
+  /* Optional Keep Photon Map: reuse existing photon map across camera-only moves. */
+  if (progressive_pass == 0 && (kintegrator.bidirectional_pad1 & NR_BIDIR_PHOTON_CACHE_FLAG) &&
+      device_scene_->nr_photon_built_version == device_scene_->nr_photon_scene_version &&
+      kintegrator.nr_photon_count > 0)
+  {
     return false;
   }
   const double t0 = time_dt();
@@ -616,7 +641,10 @@ bool PathTraceWorkGPU::render_photons(const int sample_offset)
   size_t found = 0;
   while (rounds < NR_PHOTON_MAX_ROUNDS && !is_cancel_requested()) {
     /* Other random numbers than the camera and light paths of the frame (sample offset). */
-    render_samples(statistics, 0, samples, sample_offset + (1 << 22) + rounds * samples);
+    render_samples(statistics,
+                   0,
+                   samples,
+                   sample_offset + (1 << 22) + progressive_pass * 131071 + rounds * samples);
     rounds++;
     read_global(queue_.get(), counter);
     found = size_t(counter.data()[0]);
@@ -634,15 +662,9 @@ bool PathTraceWorkGPU::render_photons(const int sample_offset)
   }
 
   device_vector<float4> &photons = device_scene_->nr_photons;
-  read_global(queue_.get(), photons);
   const int stored = int(min(found, size_t(capacity)));
 
-  /* Automatic: a scene with very few caustic photons (11-15 pavillon: 114, from the sun through the
-   * glass) gets round spots of one photon each from them and almost nothing else, the camera paths
-   * keep its caustics then. The photons found, not the ones kept: a small storage keeps a part of
-   * many, which still help (11-15: the window test with 1000 kept of 20478, RMSE 3.17 without, 1.39
-   * with). A count, not the photons a gather finds: about 1.7 of them hurt pavillon (RMSE 0.0129
-   * to 0.0158 with 1530 photons), 0.66 still helped the window. */
+  /* Automatic: a scene with very few caustic photons gets round spots of one photon each. */
   const bool too_few = (kintegrator.bidirectional_pad1 & NR_BIDIR_AUTO_FLAG) &&
                        found < size_t(NR_PHOTON_AUTO_MIN_COUNT);
   const int count = too_few ? 0 : stored;
@@ -651,18 +673,37 @@ bool PathTraceWorkGPU::render_photons(const int sample_offset)
              << " photons: photon mapping off for this frame";
   }
 
-  /* The gather radius: about 64 photons in a gather where the photons are (their count over the area
-   * of the two largest extents of where most are, 5th to 95th percentile per axis), at most 1% of
-   * that diagonal, so the caustics keep their shape whatever the scale of the scene. The gathers
-   * narrow it where the photons crowd (photon_map_gather()); widening it 4 times changed nothing
-   * there (11-15: the window, mesh emission, junkshop and classroom tests the same to 3 digits). */
+  /* Falcon GPU offload: estimate gather radius from at most 4096 strided photons (64 KB) instead
+   * of downloading all 48 MB of nr_photons to host RAM. */
   float radius = 0.0f;
   float per_gather = 0.0f;
+  device_vector<uint> &cells = device_scene_->nr_photon_cells;
+  const uint grid = uint(kintegrator.nr_photon_grid_size);
+
   if (count > 0) {
-    const int step = max(1, count / 65536);
+    const int sample_count = min(count, 4096);
+    const int stride = max(1, count / sample_count);
+    device_vector<float4> sample_buf(device_, "nr_photon_sample", MEM_READ_WRITE);
+    sample_buf.alloc(sample_count);
+    sample_buf.zero_to_device();
+    {
+      device_ptr d_photons = photons.device_pointer;
+      device_ptr d_samples = sample_buf.device_pointer;
+      int cnt = count;
+      int scnt = sample_count;
+      int st = stride;
+      const DeviceKernelArguments args(&d_photons, &d_samples, &cnt, &scnt, &st);
+      queue_->enqueue(DEVICE_KERNEL_PHOTON_GRID_SAMPLE, sample_count, args);
+    }
+    queue_->copy_from_device(sample_buf);
+    queue_->synchronize();
+
     vector<float> axis[3];
-    for (int i = 0; i < count; i += step) {
-      const float4 p = photons.data()[3 * i];
+    axis[0].reserve(sample_count);
+    axis[1].reserve(sample_count);
+    axis[2].reserve(sample_count);
+    for (int i = 0; i < sample_count; i++) {
+      const float4 p = sample_buf.data()[i];
       axis[0].push_back(p.x);
       axis[1].push_back(p.y);
       axis[2].push_back(p.z);
@@ -679,38 +720,73 @@ bool PathTraceWorkGPU::render_photons(const int sample_offset)
     const float area = max(extents[1] * extents[2], 1e-8f);
     const float density_radius = sqrtf(64.0f * area / (M_PI_F * float(count)));
     radius = max(min(0.01f * sqrtf(diag2), density_radius), 1e-4f);
-    /* The photons a gather finds on average at that radius: 64 unless the 1% bound narrowed it. */
-    per_gather = 64.0f * sqr(radius / density_radius);
-  }
-
-  /* Sort the photons into the hash grid (cells of the radius): counting sort by cell hash. */
-  device_vector<uint> &cells = device_scene_->nr_photon_cells;
-  const uint grid = uint(kintegrator.nr_photon_grid_size);
-  memset(cells.data(), 0, (size_t(grid) + 1) * sizeof(uint));
-  vector<uint> hashes(count);
-  for (int i = 0; i < count; i++) {
-    const float4 p = photons.data()[3 * i];
-    const uint h = (uint(int(floorf(p.x / radius))) * 73856093u ^
-                    uint(int(floorf(p.y / radius))) * 19349663u ^
-                    uint(int(floorf(p.z / radius))) * 83492791u) %
-                   grid;
-    hashes[i] = h;
-    cells.data()[h + 1]++;
-  }
-  for (uint h = 0; h < grid; h++) {
-    cells.data()[h + 1] += cells.data()[h];
-  }
-  vector<float4> sorted(size_t(3) * count);
-  vector<uint> fill(cells.data(), cells.data() + grid);
-  for (int i = 0; i < count; i++) {
-    const uint dst = fill[hashes[i]]++;
-    for (int k = 0; k < 3; k++) {
-      sorted[size_t(3) * dst + k] = photons.data()[size_t(3) * i + k];
+    if (progressive_pass == 0 || !(device_scene_->nr_photon_base_radius > 0.0f)) {
+      device_scene_->nr_photon_base_radius = radius;
     }
+    if (progressive_pass > 0) {
+      const float base_r = device_scene_->nr_photon_base_radius;
+      const float min_r = max(base_r * 0.15f, 0.003f);
+      radius = max(base_r * powf(0.96f, float(progressive_pass)), min_r);
+    }
+    per_gather = 64.0f * sqr(radius / density_radius);
+
+    /* 100% VRAM-resident GPU counting sort into the hash grid (zero PCIe photon transfer). */
+    const int num_cells = int(grid) + 1;
+    device_only_memory<uint> hashes_buf(device_, "nr_photon_hashes");
+    device_only_memory<int> counts_buf(device_, "nr_photon_counts");
+    device_only_memory<uint> cursors_buf(device_, "nr_photon_cursors");
+    device_only_memory<float4> sorted_buf(device_, "nr_photon_sorted");
+    hashes_buf.alloc_to_device(count);
+    counts_buf.alloc_to_device(num_cells);
+    cursors_buf.alloc_to_device(num_cells);
+    sorted_buf.alloc_to_device(size_t(3) * count);
+    queue_->zero_to_device(counts_buf);
+
+    device_ptr d_photons = photons.device_pointer;
+    device_ptr d_hashes = hashes_buf.device_pointer;
+    device_ptr d_counts = counts_buf.device_pointer;
+    device_ptr d_cells = cells.device_pointer;
+    device_ptr d_cursors = cursors_buf.device_pointer;
+    device_ptr d_sorted = sorted_buf.device_pointer;
+
+    {
+      int cnt = count;
+      float inv_r = 1.0f / radius;
+      int g = int(grid);
+      const DeviceKernelArguments args(&d_photons, &d_hashes, &d_counts, &cnt, &inv_r, &g);
+      queue_->enqueue(DEVICE_KERNEL_PHOTON_GRID_COUNT, count, args);
+    }
+    /* The prefix sum zeroes the counts it reads (kernel/device/gpu/parallel_prefix_sum.h), so the
+     * counts are made again for the cursors: summing the zeroed counts left every cursor at 0, and
+     * the scatter wrote the photons of all the cells over each other, the gathers then finding
+     * next to nothing (no photon mapping caustics on the GPU). */
+    for (int pass = 0; pass < 2; pass++) {
+      if (pass == 1) {
+        int cnt = count;
+        float inv_r = 1.0f / radius;
+        int g = int(grid);
+        const DeviceKernelArguments args(&d_photons, &d_hashes, &d_counts, &cnt, &inv_r, &g);
+        queue_->enqueue(DEVICE_KERNEL_PHOTON_GRID_COUNT, count, args);
+      }
+      int ncells = num_cells;
+      const DeviceKernelArguments args_sum(&d_counts, pass == 0 ? &d_cells : &d_cursors, &ncells);
+      queue_->enqueue(DEVICE_KERNEL_PREFIX_SUM, 1, args_sum);
+    }
+    {
+      int cnt = count;
+      const DeviceKernelArguments args(&d_photons, &d_sorted, &d_hashes, &d_cursors, &cnt);
+      queue_->enqueue(DEVICE_KERNEL_PHOTON_GRID_SCATTER, count, args);
+    }
+    {
+      int cnt = count;
+      const DeviceKernelArguments args(&d_sorted, &d_photons, &cnt);
+      queue_->enqueue(DEVICE_KERNEL_PHOTON_GRID_COPY, count, args);
+    }
+    queue_->synchronize();
   }
-  std::copy(sorted.begin(), sorted.end(), photons.data());
-  write_global(queue_.get(), photons);
-  write_global(queue_.get(), cells);
+  else {
+    cells.zero_to_device();
+  }
 
   kintegrator.nr_photon_count = count;
   kintegrator.nr_photon_radius = radius;
@@ -723,11 +799,12 @@ bool PathTraceWorkGPU::render_photons(const int sample_offset)
                                                    0.0f;
   device_->const_copy_to("data", &device_scene_->data, sizeof(device_scene_->data));
   queue_->synchronize();
+  device_scene_->nr_photon_built_version = device_scene_->nr_photon_scene_version;
 
-  LOG_INFO << "Cycles-expansion: photon mapping, " << count << " photons from " << paths
-           << " light paths (" << rounds << " rounds), radius " << radius << " (about "
-           << per_gather << " photons a gather), in "
-           << time_dt() - t0 << " s";
+  LOG_INFO << "Cycles-expansion: photon mapping (pass " << progressive_pass << "), " << count
+           << " photons from " << paths << " light paths (" << rounds << " rounds), radius "
+           << radius << " (about " << per_gather << " photons a gather), in " << time_dt() - t0
+           << " s";
   return true;
 }
 
@@ -822,6 +899,9 @@ void PathTraceWorkGPU::enqueue_reset()
       integrator_shader_raytrace_sort_counter_.size() != 0)
   {
     queue_->zero_to_device(integrator_shader_raytrace_sort_counter_);
+  }
+  if (integrator_shader_bidir_sort_counter_.size() != 0) {
+    queue_->zero_to_device(integrator_shader_bidir_sort_counter_);
   }
 
   /* Tiles enqueue need to know number of active paths, which is based on this counter. Zero the
@@ -989,6 +1069,7 @@ void PathTraceWorkGPU::enqueue_path_iteration(DeviceKernel kernel, const int num
     case DEVICE_KERNEL_INTEGRATOR_SHADE_SHADOW:
     case DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE:
     case DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_RAYTRACE:
+    case DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_BIDIR:
     case DEVICE_KERNEL_INTEGRATOR_SHADE_VOLUME:
     case DEVICE_KERNEL_INTEGRATOR_SHADE_VOLUME_RAY_MARCHING:
     case DEVICE_KERNEL_INTEGRATOR_SHADE_DEDICATED_LIGHT: {
@@ -1711,13 +1792,15 @@ int PathTraceWorkGPU::shadow_catcher_count_possible_splits()
 bool PathTraceWorkGPU::kernel_uses_sorting(DeviceKernel kernel)
 {
   return (kernel == DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE ||
-          kernel == DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_RAYTRACE);
+          kernel == DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_RAYTRACE ||
+          kernel == DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_BIDIR);
 }
 
 bool PathTraceWorkGPU::kernel_creates_shadow_paths(DeviceKernel kernel)
 {
   return (kernel == DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE ||
           kernel == DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_RAYTRACE ||
+          kernel == DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_BIDIR ||
           kernel == DEVICE_KERNEL_INTEGRATOR_INTERSECT_MNEE ||
           kernel == DEVICE_KERNEL_INTEGRATOR_SHADE_VOLUME ||
           kernel == DEVICE_KERNEL_INTEGRATOR_SHADE_VOLUME_RAY_MARCHING ||
@@ -1728,7 +1811,8 @@ bool PathTraceWorkGPU::kernel_creates_ao_paths(DeviceKernel kernel)
 {
   return (device_scene_->data.kernel_features & KERNEL_FEATURE_AO) &&
          (kernel == DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE ||
-          kernel == DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_RAYTRACE);
+          kernel == DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_RAYTRACE ||
+          kernel == DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_BIDIR);
 }
 
 bool PathTraceWorkGPU::kernel_is_shadow_path(DeviceKernel kernel)

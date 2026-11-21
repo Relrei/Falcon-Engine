@@ -417,7 +417,7 @@ static ui::Block *wm_block_splash_create(bContext *C, ARegion *region, void * /*
     button_func_set(but, [block](bContext &C) { wm_block_splash_close(&C, block); });
 
     wm_block_splash_add_label(block,
-                              BKE_blender_version_string(),
+                              "Falcon 5",
                               splash_width - 8.0 * UI_SCALE_FAC,
                               splash_height - 13.0 * UI_SCALE_FAC);
   }

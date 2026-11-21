@@ -85,6 +85,13 @@ CCL_NAMESPACE_BEGIN
 /* Gaussian splats. */
 #define KERNEL_FEATURE_GSPLATS (1ULL << 32ULL)
 
+/* Falcon Cycles-expansion: the bidirectional techniques or the Neural Rendering glass samples are
+ * on, so light paths can reach the shader ray-tracing kernel. OptiX then loads the shader
+ * ray-tracing module with them (kernel_shader_raytrace_bidir.cu); without them it loads the
+ * smaller one, which compiles in much less time the first time (15.4 MB -> 10.0 MB of
+ * PTX). */
+#define KERNEL_FEATURE_NR_BIDIR (1ULL << 33ULL)
+
 /* Shader node feature mask, to specialize shader evaluation for kernels. */
 
 #define KERNEL_FEATURE_NODE_MASK_SURFACE_LIGHT \

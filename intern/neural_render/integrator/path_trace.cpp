@@ -217,6 +217,17 @@ void PathTrace::render_pipeline(RenderWork render_work)
     render_scheduler_.set_limit_samples_per_update(limit);
   }
 
+  /* Falcon Cycles-expansion progressive photon mapping traces new photons every 8 samples (below);
+   * an offline render took the samples after the first in one go, so its photon map was traced
+   * once and its noise stayed in the image as flat blotches with hard edges, like
+   * flat paint. The works end at the next
+   * multiple of 8 samples. */
+  if (device_scene_->data.integrator.nr_photon_capacity > 0) {
+    const int next_start = render_scheduler_.get_num_rendered_samples() +
+                           render_work.path_trace.num_samples;
+    render_scheduler_.set_limit_samples_per_update(8 - (next_start % 8));
+  }
+
   /* Falcon Cycles-expansion: light-side data of the bidirectional strategies (light subpaths,
    * photon map, ...) before the camera paths of this iteration. */
   BidirectionalContext bidirectional_context;
@@ -495,11 +506,13 @@ void PathTrace::path_trace(RenderWork &render_work)
                              params.width == device_scene_->data.cam.width &&
                              params.height == device_scene_->data.cam.height;
     if (!whole_frame) {
-      static bool warned = false;
-      if (!warned) {
-        LOG_WARNING << "Cycles-expansion: bidirectional light tracing needs the whole frame "
-                       "(no render region, no tiles); its caustics are missing";
-        warned = true;
+      if (render_work.resolution_divider == 1) {
+        static bool warned = false;
+        if (!warned) {
+          LOG_WARNING << "Cycles-expansion: bidirectional light tracing needs the whole frame "
+                         "(no render region, no tiles); its caustics are missing";
+          warned = true;
+        }
       }
     }
     else if (std::getenv("NR_LT_DEBUG") && (std::atoi(std::getenv("NR_LT_DEBUG")) & 16)) {
@@ -519,13 +532,26 @@ void PathTrace::path_trace(RenderWork &render_work)
 
   thread_capture_fp_settings();
 
-  /* Falcon Cycles-expansion photon mapping: run the photon pass once at the start of a frame on
-   * the primary device (GPU first in GPU+CPU), then sync the sorted photon map to all devices. */
-  if (render_work.path_trace.start_sample == 0 && num_works > 0 &&
+  /* Falcon Cycles-expansion progressive photon mapping: run the photon pass at the start of a
+   * frame and every 8 samples with a shrinking gather radius, then sync to all devices. */
+  /* A Neural viewport frame starts at sample 0 again while nothing changed; the photon map is kept
+   * then (Integrator::device_update_pixel_jitter()) and its passes go on over the frames. */
+  const int photon_sample = render_work.path_trace.total_start_sample;
+  /* A full Integrator::device_update() without a reset (a setting of the integrator) cleared the
+   * photon map: start again from the first pass instead of going on without photons. */
+  const KernelIntegrator &photon_kintegrator = device_scene_->data.integrator;
+  const bool photons_cleared = photon_kintegrator.nr_photon_capacity > 0 &&
+                               photon_kintegrator.nr_photon_radius == 0.0f;
+  if (photon_sample == 0 || photons_cleared) {
+    last_photon_progressive_pass_ = -1;
+  }
+  const int photon_pass = photons_cleared ? 0 : photon_sample / 8;
+  if (photon_pass > last_photon_progressive_pass_ && num_works > 0 &&
       !path_trace_works_[0]->get_device()->have_error())
   {
     const bool ran_photons = path_trace_works_[0]->render_photons(
-        render_work.path_trace.sample_offset);
+        render_work.path_trace.sample_offset, photon_pass);
+    last_photon_progressive_pass_ = photon_pass;
     if (ran_photons && num_works > 1) {
       device_scene_->nr_photons.copy_to_device();
       device_scene_->nr_photon_cells.copy_to_device();

@@ -41,7 +41,7 @@ class PathTraceWorkCPU : public PathTraceWork {
                       const int samples_num,
                       const int sample_offset) override;
 
-  bool render_photons(const int sample_offset) override;
+  bool render_photons(const int sample_offset, const int progressive_pass = 0) override;
   void update_photon_auto(const int start_sample, const int num_samples) override;
   bool render_light_paths(RenderStatistics &statistics,
                           const int start_sample,

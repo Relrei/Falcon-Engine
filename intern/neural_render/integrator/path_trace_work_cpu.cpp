@@ -619,16 +619,24 @@ void PathTraceWorkCPU::update_light_guide(const int start_sample)
   }
 }
 
-bool PathTraceWorkCPU::render_photons(const int sample_offset)
+bool PathTraceWorkCPU::render_photons(const int sample_offset, const int progressive_pass)
 {
   KernelIntegrator &kintegrator = device_scene_->data.integrator;
   const int capacity = kintegrator.nr_photon_capacity;
-  if (photon_auto_stopped_ && capacity > 0) {
-    kintegrator.bidirectional_strategies |= BIDIR_STRATEGY_PHOTON_MAPPING;
-    device_->const_copy_to("data", &device_scene_->data, sizeof(device_scene_->data));
+  if (progressive_pass == 0) {
+    if (photon_auto_stopped_ && capacity > 0) {
+      kintegrator.bidirectional_strategies |= BIDIR_STRATEGY_PHOTON_MAPPING;
+      device_->const_copy_to("data", &device_scene_->data, sizeof(device_scene_->data));
+    }
+    photon_auto_stopped_ = false;
   }
-  photon_auto_stopped_ = false;
   if (!(kintegrator.bidirectional_strategies & BIDIR_STRATEGY_PHOTON_MAPPING) || capacity <= 0) {
+    return false;
+  }
+  if (progressive_pass == 0 && (kintegrator.bidirectional_pad1 & NR_BIDIR_PHOTON_CACHE_FLAG) &&
+      device_scene_->nr_photon_built_version == device_scene_->nr_photon_scene_version &&
+      kintegrator.nr_photon_count > 0)
+  {
     return false;
   }
   const double t0 = time_dt();
@@ -651,7 +659,8 @@ bool PathTraceWorkCPU::render_photons(const int sample_offset)
   size_t found = 0;
   while (rounds < max_rounds && !is_cancel_requested()) {
     RenderStatistics statistics;
-    const int round_offset = sample_offset + (1 << 22) + rounds * samples;
+    const int round_offset = sample_offset + (1 << 22) + progressive_pass * 131071 +
+                             rounds * samples;
     const int64_t full_width = effective_buffer_params_.full_width;
     const int64_t full_height = effective_buffer_params_.full_height;
     const int64_t total_pixels_num = full_width * full_height;
@@ -724,6 +733,14 @@ bool PathTraceWorkCPU::render_photons(const int sample_offset)
     const float area = max(extents[1] * extents[2], 1e-8f);
     const float density_radius = sqrtf(64.0f * area / (M_PI_F * float(count)));
     radius = max(min(0.01f * sqrtf(diag2), density_radius), 1e-4f);
+    if (progressive_pass == 0 || !(device_scene_->nr_photon_base_radius > 0.0f)) {
+      device_scene_->nr_photon_base_radius = radius;
+    }
+    if (progressive_pass > 0) {
+      const float base_r = device_scene_->nr_photon_base_radius;
+      const float min_r = max(base_r * 0.15f, 0.003f);
+      radius = max(base_r * powf(0.96f, float(progressive_pass)), min_r);
+    }
   }
 
   device_vector<uint> &cells = device_scene_->nr_photon_cells;
@@ -759,10 +776,11 @@ bool PathTraceWorkCPU::render_photons(const int sample_offset)
                                         float(double(found) / double(stored) / double(paths)) :
                                         0.0f;
   device_->const_copy_to("data", &device_scene_->data, sizeof(device_scene_->data));
+  device_scene_->nr_photon_built_version = device_scene_->nr_photon_scene_version;
 
-  LOG_INFO << "Cycles-expansion (CPU): photon mapping, " << count << " photons from " << paths
-           << " light paths (" << rounds << " rounds), radius " << radius << ", in "
-           << time_dt() - t0 << " s";
+  LOG_INFO << "Cycles-expansion (CPU): photon mapping (pass " << progressive_pass << "), " << count
+           << " photons from " << paths << " light paths (" << rounds << " rounds), radius "
+           << radius << ", in " << time_dt() - t0 << " s";
   return true;
 }
 

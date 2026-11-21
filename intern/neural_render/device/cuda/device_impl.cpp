@@ -500,7 +500,7 @@ void CUDADevice::reserve_local_memory(const uint64_t kernel_features)
     /* Use the biggest kernel for estimation. */
     const DeviceKernel test_kernel = (kernel_features & KERNEL_FEATURE_NODE_RAYTRACE) ?
                                          DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_RAYTRACE :
-                                         DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE;
+                                         DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_BIDIR;
 
     /* Launch kernel, using just 1 block appears sufficient to reserve memory for all
      * multiprocessors. It would be good to do this in parallel for the multi GPU case

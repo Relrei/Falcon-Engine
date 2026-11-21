@@ -158,7 +158,7 @@ ccl_device_forceinline void integrator_split_shadow_catcher(
         kg, state, DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_RAYTRACE, shader);
   }
   else {
-    integrator_path_init_sorted(kg, state, DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE, shader);
+    integrator_path_init_sorted(kg, state, integrator_shade_surface_kernel(kg, state), shader);
   }
 }
 
@@ -188,7 +188,7 @@ ccl_device_forceinline void integrator_intersect_next_kernel_after_shadow_catche
   }
   else {
     integrator_path_next_sorted(
-        kg, state, current_kernel, DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE, shader);
+        kg, state, current_kernel, integrator_shade_surface_kernel(kg, state), shader);
   }
 }
 
@@ -271,7 +271,7 @@ ccl_device_forceinline void integrator_intersect_next_kernel(
         }
         else {
           integrator_path_next_sorted(
-              kg, state, current_kernel, DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE, shader);
+              kg, state, current_kernel, integrator_shade_surface_kernel(kg, state), shader);
         }
 
 #ifdef __SHADOW_CATCHER__
@@ -330,7 +330,7 @@ ccl_device_forceinline void integrator_intersect_next_kernel_after_volume(
     }
     else {
       integrator_path_next_sorted(
-          kg, state, current_kernel, DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE, shader);
+          kg, state, current_kernel, integrator_shade_surface_kernel(kg, state), shader);
     }
 
 #ifdef __SHADOW_CATCHER__

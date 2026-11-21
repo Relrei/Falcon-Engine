@@ -12,6 +12,11 @@
 #include "util/log.h"
 #include "util/time.h"
 
+extern "C" {
+void falcon_request_finish_with_denoise(bool enable);
+bool falcon_is_finish_with_denoise_requested();
+}
+
 CCL_NAMESPACE_BEGIN
 
 /* --------------------------------------------------------------------
@@ -408,6 +413,9 @@ RenderWork RenderScheduler::get_render_work()
   render_work.path_trace.start_sample = get_start_sample_to_path_trace();
   render_work.path_trace.num_samples = get_num_samples_to_path_trace();
   render_work.path_trace.sample_offset = get_sample_offset();
+  render_work.path_trace.total_start_sample = (neural_ && is_denoiser_interactive()) ?
+                                                  state_.total_rendered_samples :
+                                                  render_work.path_trace.start_sample;
 
   render_work.init_render_buffers = (render_work.path_trace.start_sample == get_sample_offset());
 
@@ -1362,6 +1370,14 @@ bool RenderScheduler::work_report_reset_average(const RenderWork &render_work)
 
 void RenderScheduler::check_time_limit_reached()
 {
+  if (background_ && state_.num_rendered_samples > 0 && falcon_is_finish_with_denoise_requested())
+  {
+    falcon_request_finish_with_denoise(false);
+    state_.time_limit_reached = true;
+    state_.end_render_time = time_dt();
+    return;
+  }
+
   if (time_limit_ == 0.0) {
     /* No limit is enforced. */
     return;

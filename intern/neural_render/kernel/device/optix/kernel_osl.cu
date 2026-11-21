@@ -52,6 +52,15 @@ extern "C" __global__ void __raygen__kernel_optix_integrator_shade_surface()
   integrator_shade_surface(nullptr, path_index, kernel_params.render_buffer);
 }
 
+extern "C" __global__ void __raygen__kernel_optix_integrator_shade_surface_bidir()
+{
+  const int global_index = optixGetLaunchIndex().x;
+  const int path_index = (kernel_params.path_index_array) ?
+                             kernel_params.path_index_array[global_index] :
+                             global_index;
+  integrator_shade_surface_bidir(nullptr, path_index, kernel_params.render_buffer);
+}
+
 extern "C" __global__ void __raygen__kernel_optix_integrator_shade_dedicated_light()
 {
   const int global_index = optixGetLaunchIndex().x;

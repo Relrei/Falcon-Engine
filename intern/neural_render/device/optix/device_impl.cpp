@@ -479,10 +479,13 @@ bool OptiXDevice::load_kernels(const uint64_t kernel_features)
       return false;
     }
     string shader_raytrace_ptx_data;
-    if (use_shader_raytrace &&
-        !load_optional_module(use_osl_shading ? "kernel_optix_osl_shader_raytrace" :
-                                                "kernel_optix_shader_raytrace",
-                              shader_raytrace_ptx_data))
+    /* Falcon Cycles-expansion: the module with the bidirectional techniques only when the scene
+     * uses them (KERNEL_FEATURE_NR_BIDIR); OSL has one module. */
+    const char *shader_raytrace_name = use_osl_shading ? "kernel_optix_osl_shader_raytrace" :
+                                       (kernel_features & KERNEL_FEATURE_NR_BIDIR) ?
+                                                         "kernel_optix_shader_raytrace_bidir" :
+                                                         "kernel_optix_shader_raytrace";
+    if (use_shader_raytrace && !load_optional_module(shader_raytrace_name, shader_raytrace_ptx_data))
     {
       return false;
     }
@@ -778,6 +781,10 @@ bool OptiXDevice::load_kernels(const uint64_t kernel_features)
     group_descs[PG_RGEN_SHADE_SURFACE].raygen.module = optix_module;
     group_descs[PG_RGEN_SHADE_SURFACE].raygen.entryFunctionName =
         "__raygen__kernel_optix_integrator_shade_surface";
+    group_descs[PG_RGEN_SHADE_SURFACE_BIDIR].kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
+    group_descs[PG_RGEN_SHADE_SURFACE_BIDIR].raygen.module = optix_module;
+    group_descs[PG_RGEN_SHADE_SURFACE_BIDIR].raygen.entryFunctionName =
+        "__raygen__kernel_optix_integrator_shade_surface_bidir";
     if (use_osl_volume) {
       group_descs[PG_RGEN_SHADE_VOLUME].kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
       group_descs[PG_RGEN_SHADE_VOLUME].raygen.module = osl_volume_module;
@@ -1206,6 +1213,7 @@ bool OptiXDevice::load_osl_kernels()
     pipeline_groups.push_back(groups[PG_RGEN_SHADE_LIGHT_NEE]);
     pipeline_groups.push_back(groups[PG_RGEN_SHADE_LIGHT_FORWARD]);
     pipeline_groups.push_back(groups[PG_RGEN_SHADE_SURFACE]);
+    pipeline_groups.push_back(groups[PG_RGEN_SHADE_SURFACE_BIDIR]);
     if (groups[PG_RGEN_SHADE_SURFACE_RAYTRACE] != nullptr) {
       pipeline_groups.push_back(groups[PG_RGEN_SHADE_SURFACE_RAYTRACE]);
     }

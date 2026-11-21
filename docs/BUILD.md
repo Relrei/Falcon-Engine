@@ -1,4 +1,4 @@
-# Falcon Engine v0.7.1 のビルド案内（Linux）
+# Falcon Engine v0.7.2 のビルド案内（Linux）
 
 Falcon Engine はソースコードのみで配布しています。ビルド済みのバイナリは配っていないため、ご自分の PC でビルドしてください。
 NVIDIA の部品（CUDA・OptiX・DLSS）はこのリポジトリには一切含まれていません。各自が NVIDIA の公式サイトでライセンスに同意したうえで入手します。
@@ -26,7 +26,7 @@ NVIDIA の部品（CUDA・OptiX・DLSS）はこのリポジトリには一切含
 ## 2. ビルドの流れ
 
 1. **ソースコードと事前ビルド済みライブラリの取得**
-   - GitHub（`Relrei/Falcon-Engine`）からリポジトリを取得し、リリースタグ（例: `Falcon-Engine-v0.7.1`）へ切り替えます。
+   - GitHub（`Relrei/Falcon-Engine`）からリポジトリを取得し、リリースタグ（例: `Falcon-Engine-v0.7.2`）へ切り替えます。
    - その後、Blender 標準の更新手順（`make update`）で事前ビルド済みライブラリ（`lib/linux_x64`、Git LFS 経由）を取得します。
 
 2. **CMake でビルド構成を設定**

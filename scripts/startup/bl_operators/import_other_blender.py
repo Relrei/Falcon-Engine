@@ -211,6 +211,40 @@ class PREFERENCES_UL_import_other(UIList):
             row.label(text="", icon='LINKED')
 
 
+_RENDER_DEVICE_ADDON = "neural_render"
+
+
+def _read_render_device(prefs):
+    """The compute device type and the devices in use of Falcon's engine, or None."""
+    addon = prefs.addons.get(_RENDER_DEVICE_ADDON)
+    if addon is None:
+        return None
+    ap = addon.preferences
+    try:
+        used = [(d.id, d.type) for d in ap.devices if d.use]
+    except (AttributeError, TypeError):
+        used = []
+    return getattr(ap, "compute_device_type", None), used
+
+
+def _restore_render_device(prefs, saved, errors):
+    if not saved or saved[0] in {None, 'NONE'}:
+        return
+    addon = prefs.addons.get(_RENDER_DEVICE_ADDON)
+    if addon is None:
+        return
+    ap = addon.preferences
+    device_type, used = saved
+    try:
+        ap.compute_device_type = device_type
+        ap.get_devices()
+        wanted = set(used)
+        for d in ap.devices:
+            d.use = (d.id, d.type) in wanted
+    except Exception as ex:
+        errors.append("render device: {:s}".format(str(ex)))
+
+
 class PREFERENCES_OT_import_other_blender(Operator):
     """Import add-ons, extensions and preferences from another Blender installed on this computer"""
     bl_idname = "preferences.import_other_blender"
@@ -326,6 +360,10 @@ class PREFERENCES_OT_import_other_blender(Operator):
         # Add-ons that are on now (Falcon's own, e.g. Cycles-expansion) stay on, even when the imported
         # preferences did not know them.
         enabled_before = [addon.module for addon in context.preferences.addons]
+        # The render device of Falcon's engine. Official Blender's preferences do not know `neural_render`,
+        # so the add-on is turned on again with its defaults below and the device would fall back to None
+        # (OptiX was gone after an import).
+        device_before = _read_render_device(context.preferences)
 
         # 1. Settings. Preferences go first: they decide which extension repositories exist.
         for ident, _label, rel_paths, _default in _SETTINGS:
@@ -406,6 +444,8 @@ class PREFERENCES_OT_import_other_blender(Operator):
                 missing = module not in known
             if missing:
                 addon_utils.disable(module, default_set=True)
+
+        _restore_render_device(prefs, device_before, errors)
 
         bpy.ops.wm.save_userpref()
 

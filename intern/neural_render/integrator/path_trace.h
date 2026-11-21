@@ -375,6 +375,9 @@ class PathTrace {
   struct {
     RenderBuffers *render_buffers = nullptr;
   } full_frame_state_;
+
+  /* Last progressive photon pass index executed in the current frame. */
+  int last_photon_progressive_pass_ = -1;
 };
 
 CCL_NAMESPACE_END

@@ -237,7 +237,7 @@ ccl_device_inline bool subsurface_scatter(KernelGlobals kg, IntegratorState stat
     integrator_path_next_sorted(kg,
                                 state,
                                 DEVICE_KERNEL_INTEGRATOR_INTERSECT_SUBSURFACE,
-                                DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE,
+                                integrator_shade_surface_kernel(kg, state),
                                 shader);
   }
 

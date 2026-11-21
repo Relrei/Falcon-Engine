@@ -65,6 +65,7 @@ class DLSSDenoiser : public DenoiserGPU {
   int last_width_ = 0;
   int last_height_ = 0;
   float last_upscale_factor_ = 0.0f;
+  int last_dlss_preset_ = -1;
 
   /* Neural Rendering: the next evaluation passes `Reset = 1` (DLSS-RR Integration Guide: reset
    * the history on a scene change). Set by a cut and by a newly created feature. */

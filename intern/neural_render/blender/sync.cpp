@@ -534,7 +534,21 @@ void BlenderSync::sync_integrator(blender::ViewLayer &b_view_layer,
   integrator->set_use_bidirectional(get_boolean(cscene, "use_bidirectional"));
   integrator->set_use_bidirectional_auto(get_boolean(cscene, "use_bidirectional_auto"));
   integrator->set_bidirectional_photons(get_int(cscene, "bidirectional_photons"));
-  integrator->set_bidirectional_photon_strength(get_float(cscene, "bidirectional_photon_strength"));
+  const bool use_bidir_ext = get_boolean(cscene, "use_bidirectional_extensions");
+  integrator->set_bidirectional_photon_strength(
+      use_bidir_ext ? get_float(cscene, "bidirectional_photon_strength") : 1.0f);
+  /* Caustic Spread blurred the fold lines too; Glow below took its place (sharp lines with a
+   * thin spread around them). Old files keep the value, unused. */
+  integrator->set_bidirectional_caustic_spread(1.0f);
+  integrator->set_bidirectional_line_boost(
+      use_bidir_ext ? get_float(cscene, "bidirectional_line_boost") : 0.0f);
+  integrator->set_bidirectional_sharpness(
+      use_bidir_ext ? get_float(cscene, "bidirectional_sharpness") : 0.0f);
+  integrator->set_bidirectional_glow(use_bidir_ext ? get_float(cscene, "bidirectional_glow") :
+                                                     0.0f);
+  integrator->set_bidirectional_glow_radius(get_float(cscene, "bidirectional_glow_radius"));
+  integrator->set_bidirectional_dispersion(
+      use_bidir_ext ? get_float(cscene, "bidirectional_dispersion") : 0.0f);
   integrator->set_use_bidirectional_light_tracing(
       get_boolean(cscene, "use_bidirectional_light_tracing"));
   integrator->set_use_bidirectional_photon_mapping(
@@ -542,6 +556,22 @@ void BlenderSync::sync_integrator(blender::ViewLayer &b_view_layer,
   integrator->set_use_bidirectional_manifold(get_boolean(cscene, "use_bidirectional_manifold"));
   integrator->set_bidirectional_max_light_bounces(
       get_int(cscene, "bidirectional_max_light_bounces"));
+  /* Keep Photon Map is always on; the setting is no
+   * longer shown, and old files with it off keep the map too. */
+  integrator->set_use_bidirectional_photon_cache(true);
+  const int unidir_mode = get_enum(cscene, "caustics_unidir_mode", 2, 1);
+  integrator->set_use_sms_caustics(unidir_mode == 1);
+  integrator->set_sms_max_iterations(get_int(cscene, "sms_max_iterations"));
+  integrator->set_sms_cone_angle(get_float(cscene, "sms_cone_angle"));
+  integrator->set_sms_direct_ratio(get_float(cscene, "sms_direct_ratio"));
+  integrator->set_mnee_max_iterations(get_int(cscene, "mnee_max_iterations"));
+  integrator->set_mnee_solver_threshold(get_float(cscene, "mnee_solver_threshold"));
+  integrator->set_use_fast_caustics(get_boolean(cscene, "use_fast_caustics"));
+  integrator->set_fast_caustics_strength(get_float(cscene, "fast_caustics_strength"));
+  integrator->set_fast_caustics_dispersion(get_float(cscene, "fast_caustics_dispersion"));
+  integrator->set_fast_caustics_focus(get_float(cscene, "fast_caustics_focus"));
+  integrator->set_fast_caustics_folds(get_int(cscene, "fast_caustics_folds"));
+  integrator->set_fast_caustics_ripple(get_float(cscene, "fast_caustics_ripple"));
 
   integrator->set_use_guiding(get_boolean(cscene, "use_guiding"));
   integrator->set_use_surface_guiding(get_boolean(cscene, "use_surface_guiding"));
@@ -591,6 +621,9 @@ void BlenderSync::sync_integrator(blender::ViewLayer &b_view_layer,
     integrator->set_denoiser_prefilter(denoise_params.prefilter);
     integrator->set_denoiser_quality(denoise_params.quality);
     integrator->set_denoiser_upscale_factor(denoise_params.upscale_factor);
+    /* DLSS Model (scene setting dlss_model): F, E or D, for the render and the viewport. */
+    static const int dlss_presets[] = {6, 5, 4};
+    integrator->set_denoiser_dlss_preset(dlss_presets[get_enum(cscene, "dlss_model", 3, 0)]);
   }
 
   float scrambling_distance = get_float(cscene, "scrambling_distance");

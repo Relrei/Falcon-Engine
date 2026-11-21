@@ -163,10 +163,29 @@ NODE_DEFINE(Integrator)
   SOCKET_BOOLEAN(use_bidirectional_auto, "Bidirectional Automatic", true);
   SOCKET_INT(bidirectional_photons, "Bidirectional Photons", 1000000);
   SOCKET_FLOAT(bidirectional_photon_strength, "Bidirectional Photon Strength", 1.0f);
+  SOCKET_FLOAT(bidirectional_caustic_spread, "Bidirectional Caustic Spread", 1.0f);
+  SOCKET_FLOAT(bidirectional_line_boost, "Bidirectional Line Boost", 0.0f);
+  SOCKET_FLOAT(bidirectional_sharpness, "Bidirectional Sharpness", 0.0f);
+  SOCKET_FLOAT(bidirectional_glow, "Bidirectional Glow", 0.0f);
+  SOCKET_FLOAT(bidirectional_glow_radius, "Bidirectional Glow Radius", 8.0f);
+  SOCKET_FLOAT(bidirectional_dispersion, "Bidirectional Dispersion", 0.0f);
   SOCKET_BOOLEAN(use_bidirectional_light_tracing, "Bidirectional Light Tracing", true);
   SOCKET_BOOLEAN(use_bidirectional_photon_mapping, "Bidirectional Photon Mapping", false);
   SOCKET_BOOLEAN(use_bidirectional_manifold, "Bidirectional Manifold Walks", false);
   SOCKET_INT(bidirectional_max_light_bounces, "Bidirectional Max Light Bounces", 8);
+  SOCKET_BOOLEAN(use_bidirectional_photon_cache, "Keep Photon Map", true);
+  SOCKET_BOOLEAN(use_fast_caustics, "Fast Caustics", false);
+  SOCKET_FLOAT(fast_caustics_strength, "Fast Caustics Strength", 1.5f);
+  SOCKET_FLOAT(fast_caustics_dispersion, "Fast Caustics Dispersion", 0.5f);
+  SOCKET_FLOAT(fast_caustics_focus, "Fast Caustics Focus", 1.2f);
+  SOCKET_INT(fast_caustics_folds, "Fast Caustics Folds", 2);
+  SOCKET_FLOAT(fast_caustics_ripple, "Fast Caustics Ripple", 0.0f);
+  SOCKET_BOOLEAN(use_sms_caustics, "Use SMS Caustics", true);
+  SOCKET_INT(sms_max_iterations, "SMS Max Iterations", 24);
+  SOCKET_FLOAT(sms_cone_angle, "SMS Cone Angle", 0.70f);
+  SOCKET_FLOAT(sms_direct_ratio, "SMS Direct Seed Ratio", 0.50f);
+  SOCKET_INT(mnee_max_iterations, "MNEE Max Iterations", 64);
+  SOCKET_FLOAT(mnee_solver_threshold, "MNEE Solver Threshold", 0.001f);
 
   SOCKET_BOOLEAN(use_pixel_jitter, "Use Pixel Jitter", false);
   SOCKET_INT(nr_glass_samples, "Neural Rendering Glass Samples", 0);
@@ -204,6 +223,7 @@ NODE_DEFINE(Integrator)
   SOCKET_BOOLEAN(denoise_use_gpu, "Denoise on GPU", true);
   SOCKET_ENUM(denoiser_quality, "Denoiser Quality", denoiser_quality_enum, DENOISER_QUALITY_HIGH);
   SOCKET_FLOAT(denoiser_upscale_factor, "Denoiser Upscale Factor", 1.0f);
+  SOCKET_INT(denoiser_dlss_preset, "Denoiser DLSS Preset", 6);
 
   return type;
 }
@@ -267,19 +287,37 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
    * We only need to enable transparent shadows, if we actually have
    * transparent shaders in the scene. Otherwise we can disable it
    * to improve performance a bit. */
+  bool has_fast_caustics_shader = false;
   kintegrator->transparent_shadows = false;
   for (Shader *shader : scene->shaders) {
     if (shader->reference_count() == 0) {
       continue;
     }
     /* keep this in sync with SD_HAS_TRANSPARENT_SHADOW in shader.cpp */
+    const bool fc = shader->get_use_fast_caustics() && shader->has_surface &&
+                    shader->get_use_transparent_shadow();
+    if (fc) {
+      has_fast_caustics_shader = true;
+      kintegrator->transparent_shadows = true;
+    }
     if ((shader->has_surface_transparent && shader->get_use_transparent_shadow()) ||
         shader->has_volume)
     {
       kintegrator->transparent_shadows = true;
-      break;
     }
   }
+  kintegrator->use_fast_caustics = has_fast_caustics_shader ? 1 : 0;
+  kintegrator->fast_caustics_strength = max(fast_caustics_strength, 0.0f);
+  kintegrator->fast_caustics_dispersion = max(fast_caustics_dispersion, 0.0f);
+  kintegrator->fast_caustics_focus = max(fast_caustics_focus, 0.0f);
+  kintegrator->fast_caustics_folds = clamp(fast_caustics_folds, 1, 4);
+  kintegrator->fast_caustics_ripple = max(fast_caustics_ripple, 0.0f);
+  kintegrator->use_sms_caustics = use_sms_caustics ? 1 : 0;
+  kintegrator->sms_max_iterations = clamp(sms_max_iterations, 4, 128);
+  kintegrator->sms_cone_angle = clamp(sms_cone_angle, 0.05f, 1.57f);
+  kintegrator->sms_direct_ratio = clamp(sms_direct_ratio, 0.0f, 1.0f);
+  kintegrator->mnee_max_iterations = clamp(mnee_max_iterations, 4, 128);
+  kintegrator->mnee_solver_threshold = clamp(mnee_solver_threshold, 1e-4f, 0.05f);
 
   /* TODO(sergey): Treat Gaussian splats as semi-transparent objects. */
   /* It will allow accumulation of transparency in the intersect_shadows_all(). */
@@ -333,27 +371,24 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
   const BidirectionalParams bidirectional_params = get_bidirectional_params();
   uint bidirectional_strategies = bidirectional_params.requested() &
                                   bidirectional_implemented_strategies();
-  /* Light tracing and photon mapping run in final renders on GPU, CPU, or GPU+CPU multi-device. */
+  /* Light tracing and photon mapping run in both viewport and final renders on GPU, CPU, or
+   * GPU+CPU multi-device. */
   const bool bidir_device_supported = device->info.type == DEVICE_CUDA ||
                                       device->info.type == DEVICE_OPTIX ||
                                       device->info.type == DEVICE_HIP ||
                                       device->info.type == DEVICE_CPU ||
                                       device->info.type == DEVICE_MULTI;
   if ((bidirectional_strategies & BIDIR_STRATEGY_PHOTON_MAPPING) &&
-      (!scene->params.background || !bidir_device_supported || bidirectional_photons <= 0))
+      (!bidir_device_supported || bidirectional_photons <= 0))
   {
     bidirectional_strategies &= ~BIDIR_STRATEGY_PHOTON_MAPPING;
   }
-  if ((bidirectional_strategies & BIDIR_STRATEGY_LIGHT_TRACING) &&
-      (!scene->params.background || !bidir_device_supported))
-  {
+  if ((bidirectional_strategies & BIDIR_STRATEGY_LIGHT_TRACING) && !bidir_device_supported) {
     bidirectional_strategies &= ~BIDIR_STRATEGY_LIGHT_TRACING;
   }
   kintegrator->bidirectional_strategies = int(bidirectional_strategies);
   {
-    /* Photon mapping storage, filled by the photon pass of each frame. The hash grid has a power of
-     * two cells, at least as many as photons. At least one entry each, so the kernels always get
-     * valid arrays. */
+    /* Photon mapping storage, filled by the photon pass of each frame. */
     const bool pm = (bidirectional_strategies & BIDIR_STRATEGY_PHOTON_MAPPING) != 0;
     const size_t capacity = pm ? size_t(bidirectional_photons) : 0;
     size_t grid = 1024;
@@ -386,7 +421,15 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
     kintegrator->nr_photon_radius = 0.0f;
     kintegrator->nr_photon_inv_paths = 0.0f;
     kintegrator->nr_photon_strength = max(bidirectional_photon_strength, 0.0f);
-    kintegrator->nr_photon_pad1 = 0;
+    kintegrator->nr_caustic_spread = max(bidirectional_caustic_spread, 1.0f);
+    kintegrator->nr_caustic_line_boost = max(bidirectional_line_boost, 0.0f);
+    kintegrator->nr_caustic_sharpness = clamp(bidirectional_sharpness, 0.0f, 1.0f);
+    kintegrator->nr_caustic_glow = max(bidirectional_glow, 0.0f);
+    kintegrator->nr_caustic_glow_radius = max(bidirectional_glow_radius, 1.0f);
+    kintegrator->nr_caustic_dispersion = max(bidirectional_dispersion, 0.0f);
+    kintegrator->nr_caustic_pad1 = 0.0f;
+    kintegrator->nr_caustic_pad2 = 0.0f;
+    kintegrator->nr_caustic_pad3 = 0.0f;
   }
   {
     /* The light tracing guide (kernel/integrator/init_from_light.h): one table per light for the
@@ -415,7 +458,9 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
   kintegrator->bidirectional_pad1 = (std::getenv("NR_LT_DEBUG") ?
                                          std::atoi(std::getenv("NR_LT_DEBUG")) & 0xff :
                                          0) |
-                                    (use_bidirectional_auto ? NR_BIDIR_AUTO_FLAG : 0);
+                                    (use_bidirectional_auto ? NR_BIDIR_AUTO_FLAG : 0) |
+                                    (use_bidirectional_photon_cache ? NR_BIDIR_PHOTON_CACHE_FLAG :
+                                                                      0);
   kintegrator->bidirectional_pad2 = (bidirectional_strategies & BIDIR_STRATEGY_LIGHT_TRACING) ?
                                        int(min(kintegrator->num_lights, NR_LIGHT_GUIDE_MAX_LIGHTS) *
                                            NR_LIGHT_GUIDE_CELLS) +
@@ -540,6 +585,26 @@ void Integrator::device_update(Device *device, DeviceScene *dscene, Scene *scene
   clear_modified();
 }
 
+/* Falcon: the DLSS viewport moves the pixel jitter every frame. Upstream does that with a full
+ * device_update(), which here also frees and clears the photon map, so with DLSS every frame
+ * started the photon passes over from the heavy first one and copied 48 MB to the device twice
+ * (about 150 ms a frame in a small scene, frames up to about 1200 ms).
+ * When nothing else changed, only the jitter and the seed are moved on, as device_update() does. */
+void Integrator::device_update_pixel_jitter(DeviceScene *dscene)
+{
+  KernelIntegrator *kintegrator = &dscene->data.integrator;
+  if (use_custom_pixel_jitter_sample) {
+    kintegrator->seed = hash_uint2(seed, pixel_jitter_frame);
+    kintegrator->pixel_jitter = make_float2(custom_pixel_jitter_sample[0],
+                                            custom_pixel_jitter_sample[1]);
+    ++pixel_jitter_frame;
+  }
+  else {
+    kintegrator->seed = hash_uint3(seed, pixel_jitter_state.a2, pixel_jitter_state.a3);
+    kintegrator->pixel_jitter = pixel_jitter_state.next();
+  }
+}
+
 void Integrator::device_free(Device * /*unused*/, DeviceScene *dscene, bool force_free)
 {
   dscene->sample_pattern_lut.free_if_need_realloc(force_free);
@@ -598,6 +663,14 @@ uint64_t Integrator::get_kernel_features() const
 
   if (get_use_light_tree()) {
     kernel_features |= KERNEL_FEATURE_LIGHT_TREE;
+  }
+
+  /* Falcon Cycles-expansion: as device_update() decides the light paths, before the device
+   * leaves out what it cannot run (asking for a little more only loads the larger module). */
+  if ((get_bidirectional_params().requested() & bidirectional_implemented_strategies()) ||
+      get_adaptive_sampling().nr_glass_sample != 0)
+  {
+    kernel_features |= KERNEL_FEATURE_NR_BIDIR;
   }
 
   return kernel_features;
@@ -703,6 +776,7 @@ DenoiseParams Integrator::get_denoise_params() const
   denoise_params.prefilter = denoiser_prefilter;
   denoise_params.quality = denoiser_quality;
   denoise_params.upscale_factor = denoiser_upscale_factor;
+  denoise_params.dlss_preset = denoiser_dlss_preset;
 
   if (scene_has_shadow_catcher_) {
     /* Disable upscaling with shadow catcher, since not all passes required for shadow catcher

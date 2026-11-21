@@ -43,7 +43,8 @@
 
 // NOLINTBEGIN
 #define MNEE_MAX_ITERATIONS 64
-#define MNEE_MAX_INTERSECTION_COUNT 10
+#define SMS_MAX_ITERATIONS 24
+#define MNEE_MAX_INTERSECTION_COUNT 8
 #define MNEE_SOLVER_THRESHOLD 0.001f
 #define MNEE_MINIMUM_STEP_SIZE 0.0001f
 #define MNEE_MAX_CAUSTIC_CASTERS 6
@@ -275,19 +276,25 @@ bool mnee_compute_constraint_derivatives(const int vertex_count,
     ilo = 1.f / ilo;
     wo *= ilo;
 
-    /* Invert ior if coming from inside. */
+    /* Invert ior if coming from inside (refraction only; eta == 1.0f marks SMS reflection). */
+    const bool is_reflection = (v.eta == 1.0f);
     float eta = v.eta;
-    if (dot(wi, v.ng) < .0f) {
+    if (!is_reflection && dot(wi, v.ng) < .0f) {
       eta = 1.f / eta;
     }
+    const float h_sign = is_reflection ? 1.f : -1.f;
 
     /* Half vector. */
-    float3 H = -(wi + eta * wo);
-    const float ilh = 1.f / len(H);
+    float3 H = h_sign * (wi + eta * wo);
+    const float len_H = len(H);
+    if (len_H < MNEE_MIN_DISTANCE) {
+      return false;
+    }
+    const float ilh = 1.f / len_H;
     H *= ilh;
 
-    ilo *= eta * ilh;
-    ili *= ilh;
+    ilo *= (-h_sign) * eta * ilh;
+    ili *= (-h_sign) * ilh;
 
     /* Local shading frame. */
     const float dp_du_dot_n = dot(v.dp_du, v.n);
@@ -428,7 +435,14 @@ ccl_device_inline bool mnee_newton_solver(KernelGlobals kg,
   float beta = .1f;
   bool reduce_stepsize = false;
   bool resolve_constraint = true;
-  for (int iteration = 0; iteration < MNEE_MAX_ITERATIONS; iteration++) {
+  /* Falcon Cycles-expansion: the iterations and the threshold from the render's Caustics panel
+   * (MNEE and SMS each have their own settings). */
+  const bool use_sms_solver = (kernel_data.integrator.use_sms_caustics != 0);
+  const int max_iterations = use_sms_solver ? kernel_data.integrator.sms_max_iterations :
+                                              kernel_data.integrator.mnee_max_iterations;
+  const float solver_threshold = use_sms_solver ? MNEE_SOLVER_THRESHOLD :
+                                                  kernel_data.integrator.mnee_solver_threshold;
+  for (int iteration = 0; iteration < max_iterations; iteration++) {
     if (resolve_constraint) {
       /* Calculate constraint and its derivatives for vertices. */
       if (!mnee_compute_constraint_derivatives(
@@ -444,7 +458,7 @@ ccl_device_inline bool mnee_newton_solver(KernelGlobals kg,
       }
 
       /* Return if solve successful. */
-      if (constraint_norm < MNEE_SOLVER_THRESHOLD) {
+      if (constraint_norm < solver_threshold) {
         return true;
       }
 
@@ -538,7 +552,9 @@ ccl_device_inline bool mnee_newton_solver(KernelGlobals kg,
         const float3 wo = (vi == vertex_count - 1) ? light_fixed_direction ? ls->D : ls->P - tv.p :
                                                      tentative[vi + 1].p - tv.p;
 
-        if (dot(tv.n, wi) * dot(tv.n, wo) >= 0.f) {
+        const bool invalid_side = (tv.eta == 1.0f) ? (dot(tv.n, wi) * dot(tv.n, wo) <= 0.f) :
+                                                     (dot(tv.n, wi) * dot(tv.n, wo) >= 0.f);
+        if (invalid_side) {
           reduce_stepsize = true;
           break;
         }
@@ -621,40 +637,47 @@ ccl_device_inline float2 mnee_sample_bsdf_dh(ClosureType type,
 ccl_device_inline Spectrum mnee_eval_bsdf_contribution(KernelGlobals kg,
                                                        ccl_private ShaderClosure *closure,
                                                        const float3 wi,
-                                                       const float3 wo)
+                                                       const float3 wo,
+                                                       const bool is_reflection)
 {
   ccl_private MicrofacetBsdf *bsdf = (ccl_private MicrofacetBsdf *)closure;
 
   const float cosNI = dot(bsdf->N, wi);
   const float cosNO = dot(bsdf->N, wo);
 
-  const float3 Ht = normalize(-(bsdf->ior * wo + wi));
+  const float3 Ht = is_reflection ? normalize(wi + wo) : normalize(-(bsdf->ior * wo + wi));
   const float cosHI = dot(Ht, wi);
 
   const float alpha2 = bsdf->alpha_x * bsdf->alpha_y;
   const float cosThetaM = dot(bsdf->N, Ht);
+  if (fabsf(cosNI) < 1e-5f || fabsf(cosThetaM) < 1e-5f) {
+    return zero_spectrum();
+  }
 
   /* Now calculate G1(i, m) and G1(o, m). */
   float G;
-  if (bsdf->type == CLOSURE_BSDF_MICROFACET_BECKMANN_REFRACTION_ID) {
+  if (bsdf->type == CLOSURE_BSDF_MICROFACET_BECKMANN_REFRACTION_ID ||
+      bsdf->type == CLOSURE_BSDF_MICROFACET_BECKMANN_ID)
+  {
     G = bsdf_G<MicrofacetType::BECKMANN>(alpha2, cosNI, cosNO);
   }
-  else { /* bsdf->type == CLOSURE_BSDF_MICROFACET_GGX_REFRACTION_ID assumed */
+  else { /* GGX assumed */
     G = bsdf_G<MicrofacetType::GGX>(alpha2, cosNI, cosNO);
   }
 
   const FresnelCoeff fresnel = microfacet_fresnel(kg, bsdf, cosHI, nullptr);
 
   /*
-   * bsdf_do = (1 - F) * D_do * G * |h.wi| / (n.wi * n.wo)
+   * bsdf_do = (1 - F) * D_do * G * |h.wi| / (n.wi * n.wo)   [or F for reflection]
    *  pdf_dh = D_dh * cosThetaM
    *    D_do = D_dh * |dh/do|
    *
    * contribution = bsdf_do * |do/dh| * |n.wo / n.h| / pdf_dh
-   *              = (1 - F) * G * |h.wi / (n.wi * n.h^2)|
+   *              = F_or_T * G * |h.wi / (n.wi * n.h^2)|
    */
   /* TODO: energy compensation for multi-GGX. */
-  return bsdf->weight * fresnel.transmittance * G * fabsf(cosHI / (cosNI * sqr(cosThetaM)));
+  const Spectrum fresnel_term = is_reflection ? fresnel.reflectance : fresnel.transmittance;
+  return bsdf->weight * fresnel_term * G * fabsf(cosHI / (cosNI * sqr(cosThetaM)));
 }
 
 /* Compute transfer matrix determinant |T1| = |dx1/dxn| (and |dh/dx| in the process) */
@@ -709,11 +732,13 @@ ccl_device_inline bool mnee_compute_transfer_matrix(const ccl_private ShaderData
   const float ili = 1.f / len(wi);
   wi *= ili;
 
-  /* Invert ior if coming from inside. */
+  /* Invert ior if coming from inside (refraction only; eta == 1.0f marks SMS reflection). */
+  const bool is_reflection = (m.eta == 1.0f);
   float eta = m.eta;
-  if (dot(wi, m.ng) < .0f) {
+  if (!is_reflection && dot(wi, m.ng) < .0f) {
     eta = 1.f / eta;
   }
+  const float h_sign = is_reflection ? 1.f : -1.f;
 
   float dxn_dwn;
   float4 dc_dlight;
@@ -723,11 +748,15 @@ ccl_device_inline bool mnee_compute_transfer_matrix(const ccl_private ShaderData
     const float3 wo = ls->D;
 
     /* Half vector. */
-    float3 H = -(wi + eta * wo);
-    const float ilh = 1.f / len(H);
+    float3 H = h_sign * (wi + eta * wo);
+    const float len_H = len(H);
+    if (len_H < MNEE_MIN_DISTANCE) {
+      return false;
+    }
+    const float ilh = 1.f / len_H;
     H *= ilh;
 
-    const float ilo = -eta * ilh;
+    const float ilo = h_sign * eta * ilh;
 
     const float cos_theta = dot(wo, m.n);
     const float sin_theta = sin_from_cos(cos_theta);
@@ -755,11 +784,15 @@ ccl_device_inline bool mnee_compute_transfer_matrix(const ccl_private ShaderData
     wo *= ilo;
 
     /* Half vector. */
-    float3 H = -(wi + eta * wo);
-    const float ilh = 1.f / len(H);
+    float3 H = h_sign * (wi + eta * wo);
+    const float len_H = len(H);
+    if (len_H < MNEE_MIN_DISTANCE) {
+      return false;
+    }
+    const float ilh = 1.f / len_H;
     H *= ilh;
 
-    ilo *= eta * ilh;
+    ilo *= (-h_sign) * eta * ilh;
 
     float3 dH_du = (dp_du - wo * dot(wo, dp_du)) * ilo;
     float3 dH_dv = (dp_dv - wo * dot(wo, dp_dv)) * ilo;
@@ -929,7 +962,8 @@ ccl_device_inline ShaderEvalResult mnee_path_contribution(KernelGlobals kg,
     /* Evaluate product term inside eq.6 at solution interface. vi
      * divided by corresponding sampled pdf:
      * fr(vi)_do / pdf_dh(vi) x |do/dh| x |n.wo / n.h| */
-    const Spectrum bsdf_contribution = mnee_eval_bsdf_contribution(kg, v.bsdf, wi, wo);
+    const Spectrum bsdf_contribution = mnee_eval_bsdf_contribution(
+        kg, v.bsdf, wi, wo, v.eta == 1.0f);
     *throughput *= bsdf_contribution;
   }
 
@@ -959,161 +993,18 @@ ccl_device_inline ShaderEvalResult kernel_path_mnee_sample(KernelGlobals kg,
    * this seed point), building an array of manifold vertices.
    */
 
-  /* Setup probe ray. */
-  Ray probe_ray;
-  probe_ray.self.object = sd->object;
-  probe_ray.self.prim = sd->prim;
-  probe_ray.self.light_object = ls->object;
-  probe_ray.self.light_prim = ls->prim;
-  probe_ray.P = sd->P;
-  probe_ray.tmin = 0.0f;
+  /* Setup base direction toward light sample. */
+  float base_tmax;
+  float3 base_dir;
   if (ls->t == FLT_MAX) {
     /* Distant light. */
-    probe_ray.D = ls->D;
-    probe_ray.tmax = ls->t;
+    base_dir = ls->D;
+    base_tmax = ls->t;
   }
   else {
     /* Other lights, avoid self-intersection. */
-    probe_ray.D = ls->P - probe_ray.P;
-    probe_ray.D = normalize_len(probe_ray.D, &probe_ray.tmax);
+    base_dir = normalize_len(ls->P - sd->P, &base_tmax);
   }
-  probe_ray.dP = differential_make_compact(sd->dP);
-  probe_ray.dD = differential_zero_compact();
-  probe_ray.time = sd->time;
-  Intersection probe_isect;
-
-  ManifoldVertex vertices[MNEE_MAX_CAUSTIC_CASTERS];
-
-  int vertex_count = 0;
-  bool has_dispersion = false;
-  for (int isect_count = 0; isect_count < MNEE_MAX_INTERSECTION_COUNT; isect_count++) {
-    const bool hit = scene_intersect(kg, &probe_ray, PATH_RAY_VISIBILITY_TRANSMIT, &probe_isect);
-    if (!hit) {
-      break;
-    }
-
-    const uint object_flags = intersection_get_object_flags(kg, &probe_isect);
-    if (object_flags & SD_OBJECT_CAUSTICS_CASTER) {
-
-      /* Do we have enough slots. */
-      if (vertex_count >= MNEE_MAX_CAUSTIC_CASTERS) {
-        return SHADER_EVAL_EMPTY;
-      }
-
-      /* Reject caster if it is not a triangles mesh. */
-      if (!(probe_isect.type & PRIMITIVE_TRIANGLE)) {
-        return SHADER_EVAL_EMPTY;
-      }
-
-      ccl_private ManifoldVertex &mv = vertices[vertex_count++];
-
-      /* Setup shader data on caustic caster and evaluate context. */
-      shader_setup_from_ray(kg, sd_mnee, &probe_ray, &probe_isect);
-
-#ifdef __SPECTRAL__
-      shader_setup_wavelength(kg, sd_mnee, state);
-#endif
-
-      /* Reject caster if smooth normals are not available: Manifold exploration assumes local
-       * differential geometry can be created at any point on the surface which is not possible if
-       * normals are not smooth. */
-      if (!(sd_mnee->shader & SHADER_SMOOTH_NORMAL)) {
-        return SHADER_EVAL_EMPTY;
-      }
-
-      /* Last bool argument is the MNEE flag (for TINY_MAX_CLOSURE cap in kernel_shader.h). */
-      surface_shader_eval<KERNEL_FEATURE_NODE_MASK_SURFACE_SHADOW>(
-          kg, state, sd_mnee, nullptr, PATH_RAY_VISIBILITY_DIFFUSE, PATH_RAY_FLAG_NONE, true);
-      if (sd_mnee->runtime_flag & SR_CACHE_MISS) {
-        return SHADER_EVAL_CACHE_MISS;
-      }
-
-#if defined(__KERNEL_ONEAPI__)
-      /* FIXME: Temporary workaround for a bug in the oneAPI + Embree backend that sometimes sets
-       * the SR_BSDF_HAS_DISPERSION flag when calling `surface_shader_eval` inside the MNEE code
-       * path. This happens even in scenes where no material uses dispersion. This workaround
-       * disables dispersion support + MNEE for all oneAPI backends. Proper fix should be on the
-       * oneAPI side. */
-      sd_mnee->runtime_flag &= ~SR_BSDF_HAS_DISPERSION;
-#endif
-
-      /* Query before #mnee_setup_manifold_vertex resets the runtime flag. */
-      if (sd_mnee->runtime_flag & SR_BSDF_HAS_DISPERSION) {
-        has_dispersion = true;
-      }
-
-      /* Get and sample refraction bsdf */
-      bool found_refractive_microfacet_bsdf = false;
-      for (int ci = 0; ci < sd_mnee->num_closure; ci++) {
-        ccl_private ShaderClosure *bsdf = &sd_mnee->closure[ci];
-        if (CLOSURE_IS_REFRACTION(bsdf->type) || CLOSURE_IS_GLASS(bsdf->type)) {
-          /* Note that Glass closures are treated as refractive further below. */
-
-          found_refractive_microfacet_bsdf = true;
-          ccl_private MicrofacetBsdf *microfacet_bsdf = (ccl_private MicrofacetBsdf *)bsdf;
-
-          /* Figure out appropriate index of refraction ratio. */
-          const float eta = (sd_mnee->runtime_flag & SR_BACKFACING) ? 1.0f / microfacet_bsdf->ior :
-                                                                      microfacet_bsdf->ior;
-
-          float2 h = zero_float2();
-          if (microfacet_bsdf->alpha_x > 0.f && microfacet_bsdf->alpha_y > 0.f) {
-            /* Sample transmissive microfacet bsdf. */
-            const float2 bsdf_uv = path_state_rng_2D(kg, rng_state, PRNG_SURFACE_BSDF);
-            h = mnee_sample_bsdf_dh(bsdf->type,
-                                    microfacet_bsdf->alpha_x,
-                                    microfacet_bsdf->alpha_y,
-                                    bsdf_uv.x,
-                                    bsdf_uv.y);
-          }
-
-          /* Setup differential geometry on vertex. */
-          mnee_setup_manifold_vertex(kg, &mv, bsdf, eta, h, &probe_ray, &probe_isect, sd_mnee);
-          break;
-        }
-      }
-      if (!found_refractive_microfacet_bsdf) {
-        return SHADER_EVAL_EMPTY;
-      }
-    }
-
-    probe_ray.self.object = probe_isect.object;
-    probe_ray.self.prim = probe_isect.prim;
-    probe_ray.tmin = intersection_t_offset(probe_isect.t);
-  };
-
-  /* Mark the manifold walk invalid to keep mollification on by default. */
-  INTEGRATOR_STATE_WRITE(state, path, mnee) &= ~PATH_MNEE_VALID;
-
-  if (vertex_count == 0) {
-    return SHADER_EVAL_EMPTY;
-  }
-
-  /* Check whether the transmission depth limit is reached before continuing. */
-  if ((INTEGRATOR_STATE(state, path, transmission_bounce) + vertex_count - 1) >=
-      kernel_data.integrator.max_transmission_bounce)
-  {
-    return SHADER_EVAL_EMPTY;
-  }
-
-  /* Check whether the diffuse depth limit is reached before continuing. */
-  if ((INTEGRATOR_STATE(state, path, diffuse_bounce) + 1) >=
-      kernel_data.integrator.max_diffuse_bounce)
-  {
-    return SHADER_EVAL_EMPTY;
-  }
-
-  /* Check whether the overall depth limit is reached before continuing. */
-  if ((INTEGRATOR_STATE(state, path, bounce) + vertex_count) >= kernel_data.integrator.max_bounce)
-  {
-    return SHADER_EVAL_EMPTY;
-  }
-
-  /* Mark the manifold walk valid to turn off mollification regardless of how successful the walk
-   * is: this is noticeable when another mnee is performed deeper in the path, for an internally
-   * reflected ray for example. If mollification was active for the reflection, a clear
-   * discontinuity is visible between direct and indirect contributions */
-  INTEGRATOR_STATE_WRITE(state, path, mnee) |= PATH_MNEE_VALID;
 
   /* Distant light. */
   bool light_fixed_direction = (ls->t == FLT_MAX);
@@ -1125,37 +1016,224 @@ ccl_device_inline ShaderEvalResult kernel_path_mnee_sample(KernelGlobals kg,
     }
   }
 
-  /* 2. Walk on the specular manifold to find vertices on the casters that satisfy snell's law for
-   * each interface. */
-  if (mnee_newton_solver(kg, sd, sd_mnee, ls, light_fixed_direction, vertex_count, vertices)) {
-    /* 3. If a solution exists, calculate contribution of the corresponding path */
-    ShaderEvalResult result = mnee_path_contribution(kg,
-                                                     state,
-                                                     sd,
-                                                     sd_mnee,
-                                                     ls,
-                                                     light_fixed_direction,
-                                                     vertex_count,
-                                                     vertices,
-                                                     throughput,
-                                                     r_receiver_wo);
+  const bool use_sms = (kernel_data.integrator.use_sms_caustics != 0);
+  /* Stochastic single-seed SMS per sample: avoids 4x sequential ray/Newton warp divergence on GPU
+   * while covering both direct refractive paths (50%) and off-axis / reflective paths (50%)
+   * across samples. */
+  float3 sms_t1, sms_t2;
+  make_orthonormals(base_dir, &sms_t1, &sms_t2);
+  const float2 sms_rng = use_sms ? path_state_rng_2D(kg, rng_state, PRNG_SURFACE_BSDF) :
+                                   zero_float2();
+  /* Direct seeds by the share set in the Caustics panel (default 0.5); of the rest, 60% in the
+   * narrow cone and 40% in the wide one (as before). */
+  const float sms_direct = kernel_data.integrator.sms_direct_ratio;
+  const int sms_mode = (!use_sms || sms_rng.x < sms_direct) ?
+                           0 :
+                           (sms_rng.x < sms_direct + (1.0f - sms_direct) * 0.6f ? 1 : 2);
 
-    /* TODO: Cache misses are not handled correctly.
-     * - PATH_MNEE_VALID flag is not handled properly
-     * - AOVs and other passes have already been written at this point
-     * MNEE should be moved into its own kernel to solve this problem. */
-    if (result != SHADER_EVAL_OK) {
-      return result;
+  /* Mark the manifold walk invalid to keep mollification on by default. */
+  INTEGRATOR_STATE_WRITE(state, path, mnee) &= ~PATH_MNEE_VALID;
+
+  for (int seed_idx = 0; seed_idx < 1; seed_idx++) {
+    /* Setup probe ray for this sample. */
+    Ray probe_ray;
+    probe_ray.self.object = sd->object;
+    probe_ray.self.prim = sd->prim;
+    probe_ray.self.light_object = ls->object;
+    probe_ray.self.light_prim = ls->prim;
+    probe_ray.P = sd->P;
+    probe_ray.tmin = 0.0f;
+    if (sms_mode == 0) {
+      probe_ray.D = base_dir;
+      probe_ray.tmax = base_tmax;
     }
+    else {
+      /* Wide cone from the Caustics panel (default 0.70 rad), the narrow one in the same ratio as
+       * before (0.25 / 0.70). */
+      const float sms_cone = kernel_data.integrator.sms_cone_angle;
+      const float max_angle = (sms_mode == 1) ? sms_cone * (0.25f / 0.70f) : sms_cone;
+      const float u1 = fractf(sms_rng.x * 3.17f);
+      const float u2 = sms_rng.y;
+      const float theta = max_angle * sqrtf(u1);
+      const float phi = M_2PI_F * u2;
+      float sin_p, cos_p;
+      fast_sincosf(phi, &sin_p, &cos_p);
+      const float sin_t = sinf(theta);
+      const float cos_t = cosf(theta);
+      const float3 cand = normalize(cos_t * base_dir + sin_t * (cos_p * sms_t1 + sin_p * sms_t2));
+      if (dot(cand, sd->N) <= 0.0f) {
+        probe_ray.D = base_dir;
+        probe_ray.tmax = base_tmax;
+      }
+      else {
+        probe_ray.D = cand;
+        probe_ray.tmax = (base_tmax == FLT_MAX) ? FLT_MAX : base_tmax * 2.0f;
+      }
+    }
+    probe_ray.dP = differential_make_compact(sd->dP);
+    probe_ray.dD = differential_zero_compact();
+    probe_ray.time = sd->time;
+    Intersection probe_isect;
+
+    ManifoldVertex vertices[MNEE_MAX_CAUSTIC_CASTERS];
+
+    int vertex_count = 0;
+    bool has_dispersion = false;
+    bool seed_failed = false;
+    for (int isect_count = 0; isect_count < MNEE_MAX_INTERSECTION_COUNT; isect_count++) {
+      const bool hit = scene_intersect(kg, &probe_ray, PATH_RAY_VISIBILITY_TRANSMIT, &probe_isect);
+      if (!hit) {
+        break;
+      }
+
+      const uint object_flags = intersection_get_object_flags(kg, &probe_isect);
+      if (object_flags & SD_OBJECT_CAUSTICS_CASTER) {
+        /* Do we have enough slots. */
+        if (vertex_count >= MNEE_MAX_CAUSTIC_CASTERS) {
+          seed_failed = true;
+          break;
+        }
+
+        /* Reject caster if it is not a triangles mesh. */
+        if (!(probe_isect.type & PRIMITIVE_TRIANGLE)) {
+          seed_failed = true;
+          break;
+        }
+
+        ccl_private ManifoldVertex &mv = vertices[vertex_count++];
+
+        /* Setup shader data on caustic caster and evaluate context. */
+        shader_setup_from_ray(kg, sd_mnee, &probe_ray, &probe_isect);
 
 #ifdef __SPECTRAL__
-    if (has_dispersion && !(INTEGRATOR_STATE(state, path, flag) & PATH_RAY_SPECTRAL)) {
-      *throughput *= dispersion_throughput_weight(kg, sd_mnee->rand_wavelength);
-    }
+        shader_setup_wavelength(kg, sd_mnee, state);
 #endif
 
-    r_vertex_count = vertex_count;
-    return SHADER_EVAL_OK;
+        /* Reject caster if smooth normals are not available. */
+        if (!(sd_mnee->shader & SHADER_SMOOTH_NORMAL)) {
+          seed_failed = true;
+          break;
+        }
+
+        /* Last bool argument is the MNEE flag (for TINY_MAX_CLOSURE cap in kernel_shader.h). */
+        surface_shader_eval<KERNEL_FEATURE_NODE_MASK_SURFACE_SHADOW>(
+            kg, state, sd_mnee, nullptr, PATH_RAY_VISIBILITY_DIFFUSE, PATH_RAY_FLAG_NONE, true);
+        if (sd_mnee->runtime_flag & SR_CACHE_MISS) {
+          return SHADER_EVAL_CACHE_MISS;
+        }
+
+#if defined(__KERNEL_ONEAPI__)
+        sd_mnee->runtime_flag &= ~SR_BSDF_HAS_DISPERSION;
+#endif
+
+        /* Query before #mnee_setup_manifold_vertex resets the runtime flag. */
+        if (sd_mnee->runtime_flag & SR_BSDF_HAS_DISPERSION) {
+          has_dispersion = true;
+        }
+
+        /* Get and sample refractive (MNEE/SMS) or reflective (SMS) microfacet bsdf. */
+        bool found_specular_bsdf = false;
+        for (int ci = 0; ci < sd_mnee->num_closure; ci++) {
+          ccl_private ShaderClosure *bsdf = &sd_mnee->closure[ci];
+          const bool is_refr = CLOSURE_IS_REFRACTION(bsdf->type) || CLOSURE_IS_GLASS(bsdf->type);
+          const bool is_refl = use_sms && kernel_data.integrator.caustics_reflective &&
+                               CLOSURE_IS_BSDF_GLOSSY(bsdf->type);
+          if (is_refr || is_refl) {
+            found_specular_bsdf = true;
+            ccl_private MicrofacetBsdf *microfacet_bsdf = (ccl_private MicrofacetBsdf *)bsdf;
+
+            /* Figure out appropriate index of refraction ratio (eta == 1.0f marks reflection). */
+            float eta = 1.0f;
+            if (is_refr) {
+              eta = (sd_mnee->runtime_flag & SR_BACKFACING) ? 1.0f / microfacet_bsdf->ior :
+                                                              microfacet_bsdf->ior;
+            }
+
+            float2 h = zero_float2();
+            if (microfacet_bsdf->alpha_x > 0.f && microfacet_bsdf->alpha_y > 0.f) {
+              /* Sample microfacet bsdf. */
+              const float2 bsdf_uv = path_state_rng_2D(kg, rng_state, PRNG_SURFACE_BSDF);
+              h = mnee_sample_bsdf_dh(bsdf->type,
+                                      microfacet_bsdf->alpha_x,
+                                      microfacet_bsdf->alpha_y,
+                                      bsdf_uv.x,
+                                      bsdf_uv.y);
+            }
+
+            /* Setup differential geometry on vertex. */
+            mnee_setup_manifold_vertex(kg, &mv, bsdf, eta, h, &probe_ray, &probe_isect, sd_mnee);
+            break;
+          }
+        }
+        if (!found_specular_bsdf) {
+          seed_failed = true;
+          break;
+        }
+      }
+
+      probe_ray.self.object = probe_isect.object;
+      probe_ray.self.prim = probe_isect.prim;
+      probe_ray.tmin = intersection_t_offset(probe_isect.t);
+    }
+
+    if (seed_failed || vertex_count == 0) {
+      continue;
+    }
+
+    /* Check whether the transmission depth limit is reached before continuing. */
+    if ((INTEGRATOR_STATE(state, path, transmission_bounce) + vertex_count - 1) >=
+        kernel_data.integrator.max_transmission_bounce)
+    {
+      continue;
+    }
+
+    /* Check whether the diffuse depth limit is reached before continuing. */
+    if ((INTEGRATOR_STATE(state, path, diffuse_bounce) + 1) >=
+        kernel_data.integrator.max_diffuse_bounce)
+    {
+      continue;
+    }
+
+    /* Check whether the overall depth limit is reached before continuing. */
+    if ((INTEGRATOR_STATE(state, path, bounce) + vertex_count) >=
+        kernel_data.integrator.max_bounce)
+    {
+      continue;
+    }
+
+    INTEGRATOR_STATE_WRITE(state, path, mnee) |= PATH_MNEE_VALID;
+
+    /* 2. Walk on the specular manifold to find vertices on the casters that satisfy Snell's law
+     * (refraction) or law of reflection (SMS reflective) for each interface. */
+    if (mnee_newton_solver(kg, sd, sd_mnee, ls, light_fixed_direction, vertex_count, vertices)) {
+      /* 3. If a solution exists, calculate contribution of the corresponding path */
+      ShaderEvalResult result = mnee_path_contribution(kg,
+                                                       state,
+                                                       sd,
+                                                       sd_mnee,
+                                                       ls,
+                                                       light_fixed_direction,
+                                                       vertex_count,
+                                                       vertices,
+                                                       throughput,
+                                                       r_receiver_wo);
+
+      if (result == SHADER_EVAL_CACHE_MISS) {
+        return result;
+      }
+      if (result != SHADER_EVAL_OK) {
+        continue;
+      }
+
+#ifdef __SPECTRAL__
+      if (has_dispersion && !(INTEGRATOR_STATE(state, path, flag) & PATH_RAY_SPECTRAL)) {
+        *throughput *= dispersion_throughput_weight(kg, sd_mnee->rand_wavelength);
+      }
+#endif
+
+      r_vertex_count = vertex_count;
+      return SHADER_EVAL_OK;
+    }
   }
 
   return SHADER_EVAL_EMPTY;

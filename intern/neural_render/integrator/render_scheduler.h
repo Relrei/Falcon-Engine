@@ -31,6 +31,9 @@ class RenderWork {
     int start_sample = 0;
     int num_samples = 0;
     int sample_offset = 0;
+    /* Falcon: the samples rendered since the last reset, over all the frames of a Neural viewport
+     * (a frame starts again at start_sample 0). The photon passes go on by this. */
+    int total_start_sample = 0;
   } path_trace;
 
   struct {

@@ -140,6 +140,7 @@ ccl_device_inline void surface_shader_prepare_guiding(KernelGlobals kg,
 }
 #endif
 
+template<bool nr_bidir>
 ccl_device_inline void surface_shader_prepare_closures(KernelGlobals kg,
                                                        ConstIntegratorState state,
                                                        ccl_private ShaderData *sd,
@@ -197,10 +198,13 @@ ccl_device_inline void surface_shader_prepare_closures(KernelGlobals kg,
    * that light tracing or photon mapping takes. Those decide which bounces are nearly specular
    * from the roughness; blurred, the camera path would keep the caustics they give too (11-15
    * junkshop, Filter Glossy 0.5: the caustics seen through its jars twice, +0.7% of the image). */
-  const uint32_t nr_flag = INTEGRATOR_STATE(state, path, flag);
-  const bool nr_no_blur = (nr_flag & PATH_RAY_NR_LIGHT_PATH) ||
-                          ((nr_flag & PATH_RAY_NR_CAUSTIC_CHAIN) &&
-                           caustics_taken(kg, INTEGRATOR_STATE(state, path, nr_chain)));
+  bool nr_no_blur = false;
+  if constexpr (nr_bidir) {
+    const uint32_t nr_flag = INTEGRATOR_STATE(state, path, flag);
+    nr_no_blur = (nr_flag & PATH_RAY_NR_LIGHT_PATH) ||
+                 ((nr_flag & PATH_RAY_NR_CAUSTIC_CHAIN) &&
+                  caustics_taken(kg, INTEGRATOR_STATE(state, path, nr_chain)));
+  }
   if (kernel_data.integrator.filter_glossy != FLT_MAX && !nr_no_blur
 #ifdef __MNEE__
       && !(INTEGRATOR_STATE(state, path, mnee) & PATH_MNEE_VALID)

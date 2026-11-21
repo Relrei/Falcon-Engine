@@ -88,6 +88,21 @@ class Shader : public Node {
   /* displacement */
   NODE_SOCKET_API(DisplacementMethod, displacement_method)
 
+  /* Falcon Cycles-expansion: per-material Fast Caustics */
+  NODE_SOCKET_API(bool, use_fast_caustics)
+  NODE_SOCKET_API(float, fast_caustics_strength)
+  NODE_SOCKET_API(float, fast_caustics_dispersion)
+  NODE_SOCKET_API(float, fast_caustics_focus)
+  NODE_SOCKET_API(int, fast_caustics_folds)
+  NODE_SOCKET_API(float, fast_caustics_ripple)
+  NODE_SOCKET_API(float, fast_caustics_shadow)
+  NODE_SOCKET_API(float, fast_caustics_focal_distance)
+  NODE_SOCKET_API(float, fast_caustics_lens_power)
+  NODE_SOCKET_API(float, fast_caustics_lens_smooth)
+  NODE_SOCKET_API(float, fast_caustics_reach)
+  NODE_SOCKET_API(float, fast_caustics_ior)
+  NODE_SOCKET_API(float, bd_caustics_weight)
+
   float prev_volume_step_rate;
   bool prev_has_surface_shadow_transparency;
 

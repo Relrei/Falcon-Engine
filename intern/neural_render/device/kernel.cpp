@@ -17,6 +17,7 @@ bool device_kernel_has_shading(DeviceKernel kernel)
           kernel == DEVICE_KERNEL_INTEGRATOR_SHADE_LIGHT_FORWARD ||
           kernel == DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE ||
           kernel == DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_RAYTRACE ||
+          kernel == DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_BIDIR ||
           kernel == DEVICE_KERNEL_INTEGRATOR_SHADE_VOLUME ||
           kernel == DEVICE_KERNEL_INTEGRATOR_SHADE_VOLUME_RAY_MARCHING ||
           kernel == DEVICE_KERNEL_INTEGRATOR_SHADE_SHADOW ||
@@ -80,6 +81,8 @@ const char *device_kernel_as_string(DeviceKernel kernel)
       return "integrator_shade_surface";
     case DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_RAYTRACE:
       return "integrator_shade_surface_raytrace";
+    case DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_BIDIR:
+      return "integrator_shade_surface_bidir";
     case DEVICE_KERNEL_INTEGRATOR_SHADE_VOLUME:
       return "integrator_shade_volume";
     case DEVICE_KERNEL_INTEGRATOR_SHADE_VOLUME_RAY_MARCHING:
@@ -192,6 +195,16 @@ const char *device_kernel_as_string(DeviceKernel kernel)
     /* Generic */
     case DEVICE_KERNEL_PREFIX_SUM:
       return "prefix_sum";
+
+    /* Falcon Cycles-expansion: GPU photon map hash-grid sort. */
+    case DEVICE_KERNEL_PHOTON_GRID_SAMPLE:
+      return "photon_grid_sample";
+    case DEVICE_KERNEL_PHOTON_GRID_COUNT:
+      return "photon_grid_count";
+    case DEVICE_KERNEL_PHOTON_GRID_SCATTER:
+      return "photon_grid_scatter";
+    case DEVICE_KERNEL_PHOTON_GRID_COPY:
+      return "photon_grid_copy";
 
     case DEVICE_KERNEL_NUM:
       break;

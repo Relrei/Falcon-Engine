@@ -48,6 +48,23 @@ ccl_device_forceinline bool integrator_shadow_path_is_terminated(ConstIntegrator
   return INTEGRATOR_STATE(state, shadow_path, queued_kernel) == 0;
 }
 
+/* Falcon Cycles-expansion: the surface shading kernel a path goes on to. The bidirectional
+ * techniques (light tracing and photon mapping: the light paths, the caustic chains of the camera
+ * paths, the photon gathers) and the Neural Rendering glass samples are only in
+ * DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_BIDIR, so that with them off the camera paths run the
+ * shade_surface of the official Cycles (with the code in it, shade_surface was 20% slower
+ * with bidirectional off, BMW27 3.83 -> 4.59 s). The raytrace kernel keeps them as well. */
+ccl_device_forceinline DeviceKernel integrator_shade_surface_kernel(KernelGlobals kg,
+                                                                    ConstIntegratorState state)
+{
+  const bool bidir = (kernel_data.integrator.bidirectional_strategies &
+                      (BIDIR_STRATEGY_LIGHT_TRACING | BIDIR_STRATEGY_PHOTON_MAPPING)) ||
+                     kernel_data.integrator.nr_glass_samples != 0 ||
+                     (INTEGRATOR_STATE(state, path, flag) & PATH_RAY_NR_LIGHT_PATH);
+  return bidir ? DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE_BIDIR :
+                 DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE;
+}
+
 ccl_device_inline void write_optical_depth(KernelGlobals kg,
                                            IntegratorState state,
                                            ccl_global float *ccl_restrict render_buffer)

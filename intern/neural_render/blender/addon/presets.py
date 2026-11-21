@@ -112,11 +112,72 @@ class AddPresetPerformance(AddPresetBase, Operator):
     preset_subdir = "neural_render/performance"
 
 
+class AddPresetCaustics(AddPresetBase, Operator):
+    '''Add a Caustics Preset'''
+    bl_idname = "render.neural_render_caustics_preset_add"
+    bl_label = "Add Caustics Preset"
+    preset_menu = "NEURAL_RENDER_PT_caustics_presets"
+
+    preset_defines = [
+        "cycles = bpy.context.scene.cycles"
+    ]
+
+    preset_values = [
+        "cycles.use_bidirectional",
+        "cycles.bidirectional_mode",
+        "cycles.bidirectional_photons",
+        "cycles.use_bidirectional_extensions",
+        "cycles.bidirectional_photon_strength",
+        "cycles.bidirectional_line_boost",
+        "cycles.bidirectional_sharpness",
+        "cycles.bidirectional_glow",
+        "cycles.bidirectional_glow_radius",
+        "cycles.bidirectional_dispersion",
+        "cycles.bidirectional_max_light_bounces",
+        "cycles.caustics_unidir_mode",
+        "cycles.blur_glossy",
+        "cycles.caustics_reflective",
+        "cycles.caustics_refractive",
+    ]
+
+    preset_subdir = "neural_render/caustics"
+
+
+class AddPresetFastCaustics(AddPresetBase, Operator):
+    '''Add a Material Fast Caustics Preset'''
+    bl_idname = "material.neural_render_fast_caustics_preset_add"
+    bl_label = "Add Fast Caustics Preset"
+    preset_menu = "NEURAL_RENDER_PT_fast_caustics_presets"
+
+    preset_defines = [
+        "cmat = bpy.context.material.cycles"
+    ]
+
+    preset_values = [
+        "cmat.use_fast_caustics",
+        "cmat.fast_caustics_strength",
+        "cmat.fast_caustics_shadow",
+        "cmat.fast_caustics_ior",
+        "cmat.fast_caustics_dispersion",
+        "cmat.fast_caustics_focus",
+        "cmat.fast_caustics_folds",
+        "cmat.fast_caustics_ripple",
+        "cmat.fast_caustics_focal_distance",
+        "cmat.fast_caustics_lens_power",
+        "cmat.fast_caustics_lens_smooth",
+        "cmat.fast_caustics_reach",
+    ]
+
+    preset_subdir = "neural_render/fast_caustics"
+
+
 classes = (
     AddPresetIntegrator,
     AddPresetSampling,
     AddPresetViewportSampling,
     AddPresetPerformance,
+    AddPresetCaustics,
+    AddPresetFastCaustics,
 )
 
 

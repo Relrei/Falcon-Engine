@@ -1770,6 +1770,132 @@ void BlenderSync::sync_materials(blender::Depsgraph &b_depsgraph,
       shader->set_volume_step_rate(get_float(cmat, "volume_step_rate"));
       shader->set_displacement_method(get_displacement_method(b_mat));
 
+      /* Falcon Cycles-expansion: per-material Fast Caustics */
+      shader->set_use_fast_caustics(get_boolean(cmat, "use_fast_caustics"));
+      shader->set_fast_caustics_strength(get_float(cmat, "fast_caustics_strength"));
+      shader->set_fast_caustics_dispersion(get_float(cmat, "fast_caustics_dispersion"));
+      shader->set_fast_caustics_focus(get_float(cmat, "fast_caustics_focus"));
+      shader->set_fast_caustics_folds(get_int(cmat, "fast_caustics_folds"));
+      shader->set_fast_caustics_ripple(get_float(cmat, "fast_caustics_ripple"));
+      shader->set_fast_caustics_shadow(get_float(cmat, "fast_caustics_shadow"));
+      shader->set_fast_caustics_focal_distance(get_float(cmat, "fast_caustics_focal_distance"));
+      shader->set_fast_caustics_lens_power(get_float(cmat, "fast_caustics_lens_power"));
+      shader->set_fast_caustics_lens_smooth(get_float(cmat, "fast_caustics_lens_smooth"));
+      shader->set_fast_caustics_reach(get_float(cmat, "fast_caustics_reach"));
+      shader->set_fast_caustics_ior(get_float(cmat, "fast_caustics_ior"));
+
+      /* Falcon Cycles-expansion: the Caustics items of the nodes override the panel above.
+       * - "Fake Fast Caustics (FFC)" node group and Principled BSDF: the Fast Caustics items
+       *   (Principled only while its "Caustics Enabled" is on).
+       * - "Bidirectional Caustics (BD)" node group and Principled BSDF: "BD Caustics Weight".
+       * The first node of each kind in the material is used; for the weight a BD node goes before
+       * a Principled BSDF. */
+      shader->set_bd_caustics_weight(1.0f);
+      if (b_mat.nodetree) {
+        using blender::operator""_ustr;
+        bool ffc_found = false;
+        bool bd_found = false;
+        bool bd_from_group = false;
+        for (const blender::bNode *b_node : b_mat.nodetree->all_nodes()) {
+          if (b_node->is_muted()) {
+            continue;
+          }
+          const bool is_group = b_node->is_group() && b_node->id;
+          const blender::StringRef group_name = is_group ? blender::StringRef(b_node->id->name + 2) :
+                                                           blender::StringRef();
+          const bool is_ffc_group = is_group && group_name.startswith("Fake Fast Caustics (FFC)");
+          const bool is_bd_group = is_group && group_name.startswith("Bidirectional Caustics (BD)");
+          const bool is_principled = b_node->is_type("ShaderNodeBsdfPrincipled"_ustr);
+          if (!is_ffc_group && !is_bd_group && !is_principled) {
+            continue;
+          }
+
+          /* Bidirectional weight. */
+          if ((is_bd_group && !bd_from_group) || (is_principled && !bd_found)) {
+            for (const blender::bNodeSocket *sock : b_node->input_sockets()) {
+              if (sock->default_value && sock->type == blender::SOCK_FLOAT &&
+                  blender::StringRef(sock->name) == "BD Caustics Weight")
+              {
+                shader->set_bd_caustics_weight(
+                    static_cast<const blender::bNodeSocketValueFloat *>(sock->default_value)
+                        ->value);
+                bd_found = true;
+                bd_from_group = is_bd_group;
+                break;
+              }
+            }
+          }
+
+          /* Fast Caustics. */
+          if (ffc_found || !(is_ffc_group || is_principled)) {
+            continue;
+          }
+          bool ffc_enabled = is_ffc_group;
+          for (const blender::bNodeSocket *sock : b_node->input_sockets()) {
+            if (sock->default_value && sock->type == blender::SOCK_BOOLEAN &&
+                blender::StringRef(sock->name) == "Caustics Enabled")
+            {
+              ffc_enabled =
+                  static_cast<const blender::bNodeSocketValueBoolean *>(sock->default_value)
+                      ->value != 0;
+              break;
+            }
+          }
+          if (is_principled && !ffc_enabled) {
+            continue;
+          }
+          ffc_found = true;
+          for (const blender::bNodeSocket *sock : b_node->input_sockets()) {
+            if (!sock->default_value) {
+              continue;
+            }
+            const blender::StringRef sname(sock->name);
+            if (sock->type == blender::SOCK_FLOAT) {
+              const float val =
+                  static_cast<const blender::bNodeSocketValueFloat *>(sock->default_value)->value;
+              if (sname == "Caustics Strength") {
+                shader->set_fast_caustics_strength(val);
+              }
+              else if (sname == "Caustics Shadow") {
+                shader->set_fast_caustics_shadow(val);
+              }
+              else if (sname == "Caustics Dispersion") {
+                shader->set_fast_caustics_dispersion(val);
+              }
+              else if (sname == "Caustics Focus") {
+                shader->set_fast_caustics_focus(val);
+              }
+              else if (sname == "Caustics Ripple") {
+                shader->set_fast_caustics_ripple(val);
+              }
+              else if (sname == "Focal Distance") {
+                shader->set_fast_caustics_focal_distance(val);
+              }
+              else if (sname == "Convex Lens") {
+                shader->set_fast_caustics_lens_power(val);
+              }
+              else if (sname == "Inversion Smooth") {
+                shader->set_fast_caustics_lens_smooth(val);
+              }
+              else if (sname == "Reach") {
+                shader->set_fast_caustics_reach(val);
+              }
+              else if (sname == "Caustics IOR") {
+                shader->set_fast_caustics_ior(val);
+              }
+            }
+            else if (sock->type == blender::SOCK_INT) {
+              const int val =
+                  static_cast<const blender::bNodeSocketValueInt *>(sock->default_value)->value;
+              if (sname == "Caustics Folds") {
+                shader->set_fast_caustics_folds(val);
+              }
+            }
+          }
+          shader->set_use_fast_caustics(ffc_enabled && shader->get_fast_caustics_strength() > 0.0f);
+        }
+      }
+
       shader->set_graph(std::move(graph));
 
       /* By simplifying the shader graph as soon as possible, some

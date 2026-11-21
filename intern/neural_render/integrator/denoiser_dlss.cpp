@@ -369,7 +369,8 @@ bool DLSSDenoiser::denoise_create_if_needed(DenoiseContext &context)
 {
   const bool recreate_denoiser = last_width_ != context.denoised_buffer_params.width ||
                                  last_height_ != context.denoised_buffer_params.height ||
-                                 last_upscale_factor_ != context.denoise_params.upscale_factor;
+                                 last_upscale_factor_ != context.denoise_params.upscale_factor ||
+                                 last_dlss_preset_ != context.denoise_params.dlss_preset;
   if (handle_ != nullptr && !recreate_denoiser) {
     return true;
   }
@@ -437,6 +438,18 @@ bool DLSSDenoiser::denoise_create_if_needed(DenoiseContext &context)
   }
   params->Set(NVSDK_NGX_Parameter_PerfQualityValue, perf_quality_value);
 
+  /* The model (Falcon DLSS Model: F by default, E and D to choose),
+   * for every quality mode. Nothing was set before, which is the default behavior (as F). */
+  {
+    const unsigned int preset = (unsigned int)context.denoise_params.dlss_preset;
+    params->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_DLAA, preset);
+    params->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraQuality, preset);
+    params->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Quality, preset);
+    params->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Balanced, preset);
+    params->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_Performance, preset);
+    params->Set(NVSDK_NGX_Parameter_RayReconstruction_Hint_Render_Preset_UltraPerformance, preset);
+  }
+
   params->Set(NVSDK_NGX_Parameter_DLSS_Denoise_Mode, NVSDK_NGX_DLSS_Denoise_Mode_DLUnified);
   params->Set(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags,
               NVSDK_NGX_DLSS_Feature_Flags_IsHDR | NVSDK_NGX_DLSS_Feature_Flags_MVLowRes |
@@ -482,6 +495,7 @@ bool DLSSDenoiser::denoise_create_if_needed(DenoiseContext &context)
   last_width_ = context.denoised_buffer_params.width;
   last_height_ = context.denoised_buffer_params.height;
   last_upscale_factor_ = context.denoise_params.upscale_factor;
+  last_dlss_preset_ = context.denoise_params.dlss_preset;
   /* Neural Rendering: a new feature has no history to keep. */
   pending_reset_ = true;
 
